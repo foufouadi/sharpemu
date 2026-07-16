@@ -1273,13 +1273,6 @@ public static class KernelPthreadCompatExports
 
         if (pointedHandle != 0)
         {
-            if (_mutexStates.TryGetValue(pointedHandle, out state))
-            {
-                _mutexStates.TryAdd(mutexAddress, state);
-                resolvedAddress = pointedHandle;
-                return true;
-            }
-
             resolvedAddress = pointedHandle;
             return false;
         }
