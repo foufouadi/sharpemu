@@ -42,12 +42,25 @@ internal sealed unsafe partial class WindowsFaultHandling : IHostFaultHandling
         // survived inside the emulator. Continue the handler search without touching
         // managed code; the CLR's own VEH handles its exceptions. MSVC C++ exceptions
         // (Vulkan drivers, host CRT) are excluded too: the managed handler only ever
-        // returned CONTINUE_SEARCH for them.
+        // returned CONTINUE_SEARCH for them. The benign debug codes (OutputDebugString
+        // ANSI/wide, MSVC SetThreadName) are here for the same reason: drivers and injected
+        // overlay hooks raise them from inside host calls made by cooperative managed code
+        // (e.g. a graphics hook active during vkQueuePresentKHR); their raisers wrap
+        // RaiseException in __try/__except, so CONTINUE_SEARCH hands the exception straight
+        // back to them.
         //
         // FastFail (0xC0000409) is logged from this native path only: managed VEH never
         // sees it (tLT18–21 silent exits after TBB AV recovery).
         ReadOnlySpan<uint> nonManagedExceptionCodes =
-            [WindowsFaultCodes.ClrManagedException, 0xE06D7363u, WindowsFaultCodes.FastFail, WindowsFaultCodes.StackOverflow];
+        [
+            WindowsFaultCodes.ClrManagedException,
+            WindowsFaultCodes.MsvcCppException,
+            WindowsFaultCodes.FastFail,
+            WindowsFaultCodes.StackOverflow,
+            WindowsFaultCodes.DbgPrintExceptionC,
+            WindowsFaultCodes.DbgPrintExceptionWideC,
+            WindowsFaultCodes.MsVcThreadNameException,
+        ];
         EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [rcx] (ExceptionRecord*)
         EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x00);                                   // mov eax, [rax] (ExceptionCode)
         var passJumpOffsets = stackalloc int[nonManagedExceptionCodes.Length];
@@ -217,6 +230,25 @@ internal sealed unsafe partial class WindowsFaultHandling : IHostFaultHandling
 
             code[passJumpOffsets[i]] = checked((byte)(passOffset - (passJumpOffsets[i] + 1)));
         }
+        // Faults whose RIP sits in JIT or system code (>= 0x7FF0'00000000) must never
+        // enter the managed handler: the faulting thread is in cooperative GC mode
+        // inside managed code, and the reverse-P/Invoke entry itself would FailFast
+        // ("attempted to call a UnmanagedCallersOnly method from managed code" with no
+        // printable frames — observed on the Vulkan presenter thread right after the
+        // first presented guest frame / first translated draw). CONTINUE_SEARCH hands the
+        // fault to the CLR's own VEH, which surfaces a normal AccessViolationException with
+        // a stack trace. Guest code, return sentinels and emitted stubs all live at low
+        // addresses and keep the managed handler (lazy commit, sentinel recovery).
+        EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08); // mov rax, [rcx+8] (ContextRecord*)
+        EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x80);                                   // mov rax, [rax+0xF8] (Rip)
+        EmitUInt32(code, ref offset, 0xF8u);
+        EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xBA);                                                                     // mov r10, imm64
+        *(ulong*)(code + offset) = 0x00007FF000000000UL;
+        offset += sizeof(ulong);
+        EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xD0);                                   // cmp rax, r10
+        EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x83);                                                                     // jae pass (backwards)
+        *(int*)(code + offset) = passOffset - (offset + sizeof(int));
+        offset += sizeof(int);
         EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x54); // push r12
         EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x55); // push r13
         EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov r12, rsp
