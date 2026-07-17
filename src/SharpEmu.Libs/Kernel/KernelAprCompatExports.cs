@@ -74,6 +74,17 @@ public static class KernelAprCompatExports
         var waitArg1 = ctx[CpuRegister.Rsi];
         var waitArg2 = ctx[CpuRegister.Rdx];
 
+        // id -1 waits for every outstanding submission. Submissions complete
+        // synchronously inside the submit exports (CompleteCommandBuffer), so
+        // there is never anything left to wait for. Ghost of Yotei gates its
+        // shader-cache pipeline on this returning success.
+        if (submissionId == uint.MaxValue)
+        {
+            _submittedCommandBuffers.Clear();
+            TraceApr(ctx, "wait_all", submissionId, 0, waitArg1, waitArg2);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         if (!_submittedCommandBuffers.TryRemove(submissionId, out var submission))
         {
             TraceAprWaitFailure(ctx, "wait_missing", submissionId, commandBuffer: 0, waitArg1, waitArg2);
