@@ -251,6 +251,17 @@ public sealed partial class DirectExecutionBackend
 			}
 			return null;
 		}
+		// A brand-new worker's raw OS thread has never made a reverse-P/Invoke
+		// transition into the CLR: its first RunPrologue call forces the CLR to
+		// attach it (allocate a Thread object, etc.), which is measurably more
+		// expensive/rare-path than a steady-state call. Doing that attach here,
+		// synchronously and alone -- before this worker is ever exposed to
+		// concurrent load from the rest of the guest thread pool -- keeps that
+		// one-time cost off the hot, highly-concurrent path where it has been
+		// observed to coincide with a CLR "attempted to call a
+		// UnmanagedCallersOnly method from managed code" fatal (PROGRESS.md).
+		// Best-effort: failure here just means the attach happens later as before.
+		worker.WarmUp(_activeCpuContext);
 		lock (_nativeWorkerGate)
 		{
 			if (_nativeWorkersDisposed)
@@ -424,8 +435,8 @@ public sealed partial class DirectExecutionBackend
 				return false;
 			}
 
-			var prologuePtr = (nint)(delegate* unmanaged<nint, nint>)&RunPrologue;
-			var epiloguePtr = (nint)(delegate* unmanaged<nint, int, void>)&RunEpilogue;
+			var prologuePtr = Marshal.GetFunctionPointerForDelegate(RunPrologueDelegateInstance);
+			var epiloguePtr = Marshal.GetFunctionPointerForDelegate(RunEpilogueDelegateInstance);
 			var executorHandle = GCHandle.ToIntPtr(_selfHandle);
 			nint workHandle;
 			nint doneHandle;
@@ -662,6 +673,38 @@ public sealed partial class DirectExecutionBackend
 			return _runNativeResult;
 		}
 
+		// Drives one throwaway RunPrologue/RunEpilogue cycle (entryStub=0, so the
+		// loop stub's `test rax,rax; je skipEntry` skips calling any guest code)
+		// purely to force this worker's first-ever CLR thread attach to happen
+		// here, in isolation, right after creation. Best-effort: never throws,
+		// caller does not gate worker availability on this succeeding.
+		public void WarmUp(CpuContext? context)
+		{
+			if (context is null)
+			{
+				return;
+			}
+			_runContext = context;
+			_runState = null;
+			_runGuestThreadHandle = 0;
+			_runSentinelRip = 0;
+			_runReturnSlotAddress = 0;
+			_runHostRspSlot = 0;
+			_runEntryStub = 0;
+			_runAffinityMask = 0;
+			_runPrologueFailed = true;
+			_runYieldRequested = false;
+			_runYieldReason = null;
+			_runForcedExit = false;
+			SignalWorkAvailable();
+			WaitWorkCompleted();
+			_runContext = null;
+			if (LogThreadMode)
+			{
+				TraceThreadMode($"worker_warmup tid={_nativeThreadId} failed={_runPrologueFailed}");
+			}
+		}
+
 		private void SignalWorkAvailable()
 		{
 			if (_workAvailable is not null)
@@ -684,7 +727,25 @@ public sealed partial class DirectExecutionBackend
 			_ = PosixHostStubs.WaitWorkerEvent(_doneSemaphore, -1);
 		}
 
-		[UnmanagedCallersOnly]
+		private delegate nint RunPrologueDelegate(nint executorHandle);
+
+		private delegate void RunEpilogueDelegate(nint executorHandle, int nativeResult);
+
+		// [UnmanagedCallersOnly] deliberately avoided here: that attribute compiles to
+		// the CLR's fast reverse-P/Invoke entry (JIT_ReversePInvokeEnter/Rare), which on
+		// a raw CreateThread thread making frequent, highly concurrent transitions has
+		// been observed to hit "Invalid Program: attempted to call a UnmanagedCallersOnly
+		// method from managed code" (ReversePInvokeBadTransition) -- the exact fatal this
+		// worker design exists to avoid (see file header). Import dispatch and the VEH
+		// handler thunk both already use Marshal.GetFunctionPointerForDelegate's older,
+		// more tolerant reverse-P/Invoke stub and have never been observed to trip this;
+		// the prologue/epilogue are switched to the same mechanism for the same reason.
+		// GCHandle-pinned below so the delegate (and its thunk) outlive every worker.
+		private static readonly RunPrologueDelegate RunPrologueDelegateInstance = RunPrologue;
+		private static readonly RunEpilogueDelegate RunEpilogueDelegateInstance = RunEpilogue;
+		private static readonly GCHandle RunPrologueDelegateHandle = GCHandle.Alloc(RunPrologueDelegateInstance);
+		private static readonly GCHandle RunEpilogueDelegateHandle = GCHandle.Alloc(RunEpilogueDelegateInstance);
+
 		private static nint RunPrologue(nint executorHandle)
 		{
 			try
@@ -706,7 +767,6 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
-		[UnmanagedCallersOnly]
 		private static void RunEpilogue(nint executorHandle, int nativeResult)
 		{
 			try

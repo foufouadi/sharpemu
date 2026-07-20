@@ -27,6 +27,8 @@ public sealed partial class DirectExecutionBackend
 	private static int _auxiliaryThreadExecuteFaultSkips;
 	private nint _workerAbortStack;
 	private const uint WorkerAbortStackSize = 0x10000u;
+	private static ulong _yoteiSndSynthInitTableBuffer;
+	private static int _yoteiSndSynthInitTableRecoveries;
 
 	private unsafe void SetupExceptionHandler()
 	{
@@ -155,6 +157,11 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverYoteiSndSynthInitNullTable(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -322,6 +329,27 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine(
 						$"[LOADER][INFO]     [rsp{relativeText}] " +
 						$"@0x{stackAddr:X16} = 0x{value:X16}{symbolText}");
+				}
+			}
+
+			if (Environment.GetEnvironmentVariable("SHARPEMU_FAULT_PROBE_ADDRS") is { Length: > 0 } probeAddrs)
+			{
+				Console.Error.WriteLine("[LOADER][INFO]   Fault probe qwords:");
+				foreach (var token in probeAddrs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+				{
+					if (!ulong.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out ulong probeAddr))
+					{
+						Console.Error.WriteLine($"[LOADER][WARNING]     probe '{token}': not a hex address");
+						continue;
+					}
+					if (TryReadHostQword(probeAddr, out ulong probeValue))
+					{
+						Console.Error.WriteLine($"[LOADER][INFO]     [0x{probeAddr:X12}] = 0x{probeValue:X16}");
+					}
+					else
+					{
+						Console.Error.WriteLine($"[LOADER][INFO]     [0x{probeAddr:X12}] = <unreadable>");
+					}
 				}
 			}
 
@@ -677,6 +705,108 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return true;
+	}
+
+	private unsafe static bool TryRecoverYoteiSndSynthInitNullTable(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		// TEMPORARY, title-specific workaround -- not a general fix. Remove
+		// once the real cause of the NULL malloc below is found and fixed at
+		// the allocator level; SHARPEMU_DISABLE_YOTEI_SND_SYNTHINIT_WORKAROUND=1
+		// disables it for anyone re-investigating that root cause.
+		//
+		// Ghost of Yotei (PPSA26344): snd_SynthInit() (Scream audio engine)
+		// mallocs its Rack Unit table (14848 bytes) into the guest global
+		// 0x80434FD90. That malloc(0x80756a0b0, the guest's mspace_malloc)
+		// returns NULL despite a measured-healthy heap (510 MB free top
+		// chunk, valid magic/lock) -- root cause not yet found, see
+		// PROGRESS.md "14e session". The table stays NULL and the init loop
+		// at 0x801334F30 crashes dereferencing table[18] here. Without this,
+		// the title crashes outright during audio bring-up and never reaches
+		// the menu at all.
+		//
+		// This is scoped as tightly as a workaround can be: it only fires
+		// for the exact instruction bytes at the exact RIP where this one
+		// crash happens (verified byte-for-byte against the decrypted eboot),
+		// on a read fault. No other title's code can coincidentally match
+		// both the address and the opcode bytes. It does not touch the
+		// generic allocator: it only backs one guest global with real,
+		// zeroed, guest-addressable memory so the game's own logic
+		// (already written to tolerate empty table entries -- see the
+		// bounds-guard analysis in PROGRESS.md) continues normally.
+		//
+		// IMPORTANT: fixing the backing memory alone is not enough. The
+		// faulting instruction is `mov r13, [rax+rdx+0x20]`, and RAX was
+		// loaded from the global earlier in the function, *before* this
+		// fault -- it is already sitting in the CPU context as NULL.
+		// Patching only the memory and resuming at the same RIP re-executes
+		// the identical instruction with the identical stale NULL RAX, so it
+		// faults again, forever, on that exact same instruction (proven live
+		// with WinDbg: the calling function is entered exactly once for the
+		// whole run, yet this RIP re-faults thousands of times per session --
+		// it is not a guest polling loop, it is this recovery resuming into
+		// a register it never repaired). RAX must be patched directly too.
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_YOTEI_SND_SYNTHINIT_WORKAROUND"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // read access only
+			rip != 0x80026A522UL)
+		{
+			return false;
+		}
+
+		// mov r13, [rax+rdx+0x20] -- byte-exact signature read from the
+		// decrypted eboot at this address; see PROGRESS.md for the dump.
+		byte[] actual = new byte[5];
+		if (!TryReadHostBytes(rip, actual) ||
+			actual[0] != 0x4C || actual[1] != 0x8B || actual[2] != 0x6C || actual[3] != 0x10 || actual[4] != 0x20)
+		{
+			return false;
+		}
+
+		if (_yoteiSndSynthInitTableBuffer == 0)
+		{
+			// The observed id was 18, but this instruction is hit ~350K times over
+			// a long run (many distinct ids over time, not a fixed small "rack"
+			// count as the "Rack Unit" naming suggested) -- sized generously so no
+			// id in a long session ever reads past the buffer into unmapped memory.
+			const int entryStride = 0x3D0;
+			const int entryCount = 65536;
+			void* buffer = VirtualAlloc(null, (nuint)(entryStride * entryCount), 4096u | 8192u, 4u);
+			if (buffer == null)
+			{
+				return false;
+			}
+			_yoteiSndSynthInitTableBuffer = (ulong)buffer;
+		}
+
+		if (!TryWriteHostQword(0x80434FD90UL, _yoteiSndSynthInitTableBuffer))
+		{
+			return false;
+		}
+
+		// Repair the register the faulting instruction actually reads --
+		// see the comment above. Without this, only *future* entries into
+		// the function would benefit from the memory fix; this one, already
+		// mid-execution with NULL cached in RAX, would keep re-faulting.
+		WriteCtxU64(contextRecord, CTX_RAX, _yoteiSndSynthInitTableBuffer);
+
+		var recovery = Interlocked.Increment(ref _yoteiSndSynthInitTableRecoveries);
+		if (recovery > 16 && (recovery & (recovery - 1)) != 0)
+		{
+			return true; // throttle: first 16, then only powers of 2 -- this fires per id, not per boot
+		}
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Yotei snd_SynthInit NULL-table workaround #{recovery}: " +
+			$"backed guest global 0x80434FD90 with host buffer 0x{_yoteiSndSynthInitTableBuffer:X16} " +
+			$"guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+			"(malloc(14848) returned NULL from a healthy heap; root cause open, see PROGRESS.md)");
+		Console.Error.Flush();
+		return true; // do not touch RIP: re-execute the same instruction, it now reads valid memory
 	}
 
 	private static bool IsBenignHostDebugException(uint exceptionCode)
@@ -1257,6 +1387,24 @@ public sealed partial class DirectExecutionBackend
 		try
 		{
 			value = (ulong)Marshal.ReadInt64((nint)address);
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static bool TryWriteHostQword(ulong address, ulong value)
+	{
+		if (!OperatingSystem.IsWindows())
+		{
+			return false;
+		}
+
+		try
+		{
+			Marshal.WriteInt64((nint)address, unchecked((long)value));
 			return true;
 		}
 		catch

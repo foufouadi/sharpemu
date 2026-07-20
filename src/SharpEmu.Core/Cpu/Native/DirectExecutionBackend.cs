@@ -359,6 +359,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _logImportPeriodic;
 
+	private static ulong[]? _watchGuestQwordAddrs;
+
+	private static ulong[]? _watchGuestQwordValues;
+
 	private bool _logImportFrames;
 
 	private bool _logImportRecent;
@@ -880,6 +884,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const uint ThreadSuspendResume = 0x0002u;
 
+	private const uint ThreadQueryLimitedInformation = 0x0800u;
+
+	private const uint StillActiveExitCode = 259u;
+
 	private const int Win64ContextSize = 0x4D0;
 
 	private const int Win64ContextFlagsOffset = 0x30;
@@ -1232,6 +1240,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_contextualUnresolvedReturnSites.Clear();
 		_stallWatchdogTriggered = 0;
 		_stallWatchdogStop = false;
+		_lastFlipStallLogTimestamp = 0;
+		_flipStallPrevImportCounts.Clear();
+		_flipStallPrevMainRip = 0;
 		_readyDispatchStop = false;
 		_patchedEa020eLookupCall = false;
 		MarkExecutionProgress();
@@ -3951,7 +3962,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
 			}
+		}
+
+		if (wakeCount == 0)
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] cooperative_block_wake_no_match wake_key={wakeKey}");
 		}
 
 		if (wakeCount != 0)
@@ -4002,6 +4020,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		if (guestThreadHandle == 0 || continuation.Rip < 65536 || continuation.Rsp == 0)
 		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] cooperative_block_register_dropped reason=invalid_args " +
+				$"guest_handle=0x{guestThreadHandle:X16} rip=0x{continuation.Rip:X16} rsp=0x{continuation.Rsp:X16} wake_key={wakeKey}");
 			return;
 		}
 
@@ -4009,6 +4030,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			if (!_guestThreads.TryGetValue(guestThreadHandle, out var thread))
 			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] cooperative_block_register_dropped reason=unknown_thread " +
+					$"guest_handle=0x{guestThreadHandle:X16} wake_key={wakeKey}");
 				return;
 			}
 
@@ -5596,11 +5620,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
 						if (_logGuestThreads)
-						Console.Error.WriteLine(
-							$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
-							$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
-							$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
-							$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
+								$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
+								$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+								$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						}
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
@@ -5625,7 +5651,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (_logGuestThreads)
 			{
 				Console.Error.WriteLine(
-					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"}");
+					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"} " +
+					$"exit=0x{thread.ExitValue:X16} lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+					$"lastRet=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
 			}
 		}
 		finally
@@ -6389,6 +6417,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine("[LOADER][INFO] Sentinel probe returned.");
 			}
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
+			Volatile.Write(ref _mainEntryHostThreadId, unchecked((int)GetCurrentThreadId()));
+			_bootTimestamp = Stopwatch.GetTimestamp();
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
 			int num6 = -1;
@@ -6475,32 +6505,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static long _lastFlipStallLogTimestamp;
 
-	private static double GetFlipStallLogThresholdSeconds()
-	{
-		if (double.TryParse(
-			Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_THRESHOLD_SECONDS"),
-			System.Globalization.NumberStyles.Float,
-			System.Globalization.CultureInfo.InvariantCulture,
-			out var result))
-		{
-			return Math.Max(0, result);
-		}
-		return 10;
-	}
-
-	private static double GetFlipStallLogIntervalSeconds()
-	{
-		if (double.TryParse(
-			Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_INTERVAL_SECONDS"),
-			System.Globalization.NumberStyles.Float,
-			System.Globalization.CultureInfo.InvariantCulture,
-			out var result))
-		{
-			return Math.Max(0.1, result);
-		}
-		return 5;
-	}
-
 	private static int GetStallWatchdogSeconds()
 	{
 		if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_STALL_WATCHDOG_SECONDS"), out var result))
@@ -6508,6 +6512,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return Math.Max(0, result);
 		}
 		return 20;
+	}
+
+	// Flip-stall diagnostics: imports can keep advancing (real thread work)
+	// while no new frame ever presents (a GPU/AGC sync gap, not a kernel-wait
+	// lost wakeup) — the import-progress watchdog above is blind to that
+	// symptom by design. Once no flip has landed for this many seconds, start
+	// logging an enriched snapshot (GPU wait registry + per-thread progress
+	// deltas) on the interval below, so the log captures a timeline through
+	// the stall instead of a single dump 4+ minutes in. Zero disables it.
+	private static double GetFlipStallLogThresholdSeconds()
+	{
+		if (double.TryParse(
+				Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_SECONDS"),
+				System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture,
+				out var result))
+		{
+			return Math.Max(0, result);
+		}
+		return 30;
+	}
+
+	private static double GetFlipStallLogIntervalSeconds()
+	{
+		if (double.TryParse(
+				Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_INTERVAL_SECONDS"),
+				System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture,
+				out var result))
+		{
+			return Math.Max(1, result);
+		}
+		return 7;
 	}
 
 
@@ -7693,6 +7730,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	private unsafe static bool TryReadGuestMemoryDirect(ulong address, out ulong value)
+	{
+		value = 0;
+		if (address == 0)
+		{
+			return false;
+		}
+
+		try
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
 
 	private static uint TlsAlloc() =>
 		OperatingSystem.IsWindows() ? Win32TlsAlloc() : PosixHostStubs.TlsAlloc();
@@ -7739,9 +7794,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private unsafe static bool SetThreadContext(nint hThread, void* lpContext) =>
 		OperatingSystem.IsWindows() && Win32SetThreadContext(hThread, lpContext);
 
-	private const uint ThreadQueryLimitedInformation = 0x0800u;
-	private const uint StillActiveExitCode = 0x103u;
-
 	private static bool GetExitCodeThread(nint hThread, out uint exitCode)
 	{
 		if (!OperatingSystem.IsWindows())
@@ -7754,23 +7806,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool CloseHandle(nint hObject) =>
 		OperatingSystem.IsWindows() && Win32CloseHandle(hObject);
-
-	// Direct execution maps guest virtual addresses 1:1 onto host address
-	// space, so these are plain pointer dereferences -- wrapped in try/catch
-	// since diagnostic callers probe addresses that may be unmapped.
-	private static unsafe bool TryReadGuestMemoryDirect(ulong address, out ulong value)
-	{
-		try
-		{
-			value = *(ulong*)address;
-			return true;
-		}
-		catch
-		{
-			value = 0;
-			return false;
-		}
-	}
 
 	[DllImport("kernel32.dll", EntryPoint = "TlsAlloc")]
 	private static extern uint Win32TlsAlloc();
@@ -7825,13 +7860,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private unsafe static extern bool Win32SetThreadContext(nint hThread, void* lpContext);
 
-	[DllImport("kernel32.dll", EntryPoint = "GetExitCodeThread", SetLastError = true)]
-	[return: MarshalAs(UnmanagedType.Bool)]
-	private static extern bool Win32GetExitCodeThread(nint hThread, out uint lpExitCode);
-
 	[DllImport("kernel32.dll", EntryPoint = "CloseHandle", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool Win32CloseHandle(nint hObject);
+
+	[DllImport("kernel32.dll", EntryPoint = "GetExitCodeThread", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private static extern bool Win32GetExitCodeThread(nint hThread, out uint lpExitCode);
 
 	/// <summary>
 	/// Set when <see cref="Dispose"/> intentionally left the native session

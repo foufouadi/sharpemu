@@ -454,6 +454,41 @@ public sealed partial class DirectExecutionBackend
 				cpuContext[CpuRegister.Rsi],
 				cpuContext[CpuRegister.Rdx]);
 		}
+		if (_watchGuestQwordAddrs is null)
+		{
+			var watchSpec = Environment.GetEnvironmentVariable("SHARPEMU_WATCH_GUEST_QWORDS");
+			if (string.IsNullOrEmpty(watchSpec))
+			{
+				_watchGuestQwordAddrs = Array.Empty<ulong>();
+			}
+			else
+			{
+				var parsed = new List<ulong>();
+				foreach (var token in watchSpec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+				{
+					if (ulong.TryParse(token, System.Globalization.NumberStyles.HexNumber, null, out ulong addr))
+					{
+						parsed.Add(addr);
+					}
+				}
+				_watchGuestQwordAddrs = parsed.ToArray();
+				_watchGuestQwordValues = new ulong[parsed.Count];
+			}
+		}
+		if (_watchGuestQwordAddrs.Length != 0)
+		{
+			for (int wi = 0; wi < _watchGuestQwordAddrs.Length; wi++)
+			{
+				if (TryReadHostQword(_watchGuestQwordAddrs[wi], out ulong watchValue) && watchValue != _watchGuestQwordValues![wi])
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] watch-qword [0x{_watchGuestQwordAddrs[wi]:X12}] 0x{_watchGuestQwordValues[wi]:X16} -> 0x{watchValue:X16} " +
+						$"at Import#{num} nid={importStubEntry.Nid} ret=0x{num7:X16} managed={Environment.CurrentManagedThreadId}");
+					Console.Error.Flush();
+					_watchGuestQwordValues[wi] = watchValue;
+				}
+			}
+		}
 		if (importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] memset#{num}: dst=0x{cpuContext[CpuRegister.Rdi]:X16} val=0x{cpuContext[CpuRegister.Rsi] & 0xFF:X2} len=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
