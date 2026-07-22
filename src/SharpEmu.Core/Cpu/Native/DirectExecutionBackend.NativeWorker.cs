@@ -773,6 +773,7 @@ public sealed partial class DirectExecutionBackend
 				backend.ApplyGuestThreadAffinity(_runAffinityMask);
 			}
 			_runPrologueFailed = false;
+			ArmJobManagerPushBackBreakpointOnCurrentThread();
 			if (LogThreadMode)
 			{
 				TraceThreadMode(

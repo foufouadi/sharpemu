@@ -871,6 +871,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const int Win64ContextFlagsOffset = 0x30;
 
+	// CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS — the minimum flag set for
+	// Get/SetThreadContext to touch Dr0-Dr7 without disturbing the rest of
+	// the (possibly currently-running) thread's register state.
+	private const uint ContextAmd64DebugRegistersInteger = 0x00100010u;
+
+	private const uint ThreadSetContext = 0x0010u;
+
+	// Offsets into the Win64 CONTEXT struct (winnt.h layout, x64): the six
+	// debug registers (Dr0,Dr1,Dr2,Dr3,Dr6,Dr7 — no Dr4/Dr5 field exists)
+	// sit right after ContextFlags(4)/MxCsr(4)/6 segment WORDs(12)/EFlags(4)
+	// = 0x30 + 0x18 = 0x48, six consecutive qwords ending at Dr7=0x70.
+	private const int Win64ContextDr0Offset = 0x48;
+	private const int Win64ContextDr2Offset = Win64ContextDr0Offset + 16; // 0x58
+	private const int Win64ContextDr3Offset = Win64ContextDr0Offset + 24; // 0x60
+	private const int Win64ContextDr6Offset = 0x68;
+	private const int Win64ContextDr7Offset = 0x70;
+	private const int Win64ContextEFlagsOffset = 0x44;
+
 	private readonly record struct HostThreadContextSnapshot(
 		bool IsValid,
 		ulong Rip,
@@ -6484,6 +6502,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					LogStallWatchdogSnapshot();
 					Console.Error.Flush();
 				}
+				MaybeLogFlipStallSnapshot();
+				MaybeLogDcbSubmitWentQuiet();
+				// Unlike the checks above, the JobManager gate force-patch
+				// must not wait for a genuine stall: Yotei's menu keeps
+				// flipping frames (just with an empty/underpopulated
+				// G-buffer), so a stall threshold is never reached here.
+				// LogJobManagerAsyncSlotGate self-gates on its own env var
+				// and is idempotent (forces the byte at most once), so
+				// ticking it every iteration is safe and cheap when the
+				// flag isn't set.
+				LogJobManagerAsyncSlotGate();
 				long num2 = Stopwatch.GetTimestamp() - Volatile.Read(ref _lastProgressTimestamp);
 				if (num2 < num)
 				{
@@ -6847,6 +6876,703 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		catch
 		{
+		}
+	}
+
+	// Distinct from LogStallWatchdogSnapshot above: that one fires once, right
+	// before the import-progress watchdog kills the process. This one starts
+	// logging as soon as flips stop landing (imports may still be advancing
+	// normally) and repeats on an interval, so a run that "just runs slow"
+	// produces a visible timeline instead of silence until a fixed exit
+	// timeout. See FlipProgressTracker's doc comment for why this needs to be
+	// a separate signal from import progress.
+	private void MaybeLogFlipStallSnapshot()
+	{
+		var secondsSinceFlip = FlipProgressTracker.SecondsSinceLastFlip();
+		if (secondsSinceFlip is not { } stalledSeconds ||
+			stalledSeconds < GetFlipStallLogThresholdSeconds())
+		{
+			return;
+		}
+
+		var nowTicks = Stopwatch.GetTimestamp();
+		var intervalTicks = (long)(GetFlipStallLogIntervalSeconds() * Stopwatch.Frequency);
+		if (nowTicks - Volatile.Read(ref _lastFlipStallLogTimestamp) < intervalTicks)
+		{
+			return;
+		}
+
+		Volatile.Write(ref _lastFlipStallLogTimestamp, nowTicks);
+		LogFlipStallSnapshot(stalledSeconds);
+	}
+
+	// _guestThreadGate (LockGate) backs almost every guest-thread-state
+	// operation AND is taken on every single import dispatch via
+	// DeliverPendingGuestExceptionAtSafePoint — so a caller stuck holding it
+	// (an infinite loop, a deadlock, a slow scan under the lock) would freeze
+	// every other thread's next import call at the exact same generic
+	// checkpoint, regardless of which NID they were dispatching. The
+	// diagnostic fields for this already existed (_gateOwnerSite etc, "read
+	// lock-free by the stall watchdog's periodic snapshot" per their own
+	// comment) but were never actually wired to any log line until now.
+	private void LogGuestThreadGateOwner()
+	{
+		var site = _gateOwnerSite;
+		if (site is null)
+		{
+			return;
+		}
+
+		var ownerManagedThreadId = Volatile.Read(ref _gateOwnerManagedThreadId);
+		var heldSeconds = (Stopwatch.GetTimestamp() - Volatile.Read(ref _gateAcquireTimestamp)) / (double)Stopwatch.Frequency;
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall guest_thread_gate: held_by_site={site} owner_managed_tid={ownerManagedThreadId} " +
+			$"held_for={heldSeconds:F1}s");
+	}
+
+	// Set once, right before guest entry starts, so every stall-watchdog log
+	// can report a "seconds since boot" figure comparable across events with
+	// very different rates.
+	private static long _bootTimestamp;
+
+	private static double ElapsedSecondsSinceBoot() =>
+		_bootTimestamp == 0
+			? 0
+			: (Stopwatch.GetTimestamp() - _bootTimestamp) / (double)Stopwatch.Frequency;
+
+	// Fires exactly once, the instant sceAgcDriverSubmitDcb activity has been
+	// silent for a while after having been active — catches the freeze
+	// moment itself (with full thread state, right when it happens) instead
+	// of waiting for the flip-stall watchdog's own periodic snapshot, which
+	// is too coarse-grained to see what every thread was doing right as
+	// everything went idle together.
+	private const double DcbSubmitQuietThresholdSeconds = 3.0;
+
+	private static readonly bool _watchDcbSubmitEnabled =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_WATCH_DCB_SUBMIT"),
+			"1",
+			StringComparison.Ordinal);
+
+	// -1 = "never dumped yet"; otherwise the submit count observed at the
+	// last dump. Comparing against the LIVE count (not a one-shot flag)
+	// lets the watcher re-arm itself after any quiet spell that turns out
+	// to be transient (e.g. a normal pause between boot-time submissions
+	// and the real per-frame loop starting) and still catch the true final
+	// freeze later.
+	private static long _dcbSubmitCountAtLastDump = -1;
+
+	private void MaybeLogDcbSubmitWentQuiet()
+	{
+		if (!_watchDcbSubmitEnabled)
+		{
+			return;
+		}
+
+		var (count, secondsSinceLastSubmit) = AgcExports.DcbSubmitHeartbeat();
+		if (secondsSinceLastSubmit < 0 || secondsSinceLastSubmit < DcbSubmitQuietThresholdSeconds)
+		{
+			return;
+		}
+
+		if (Interlocked.Read(ref _dcbSubmitCountAtLastDump) == count)
+		{
+			return;
+		}
+
+		if (Interlocked.Exchange(ref _dcbSubmitCountAtLastDump, count) == count)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] --- sceAgcDriverSubmitDcb went quiet (t={ElapsedSecondsSinceBoot():F1}s, " +
+			$"{secondsSinceLastSubmit:F1}s since last submit, {count} total submits ever) — " +
+			"full snapshot at the freeze moment ---");
+		LogFlipStallSnapshot(secondsSinceLastSubmit);
+	}
+
+	// Re-ported from the 2026-07-20 investigation (commit b622b96 on the
+	// backup branch fix/yotei-boot-deadlock-backup-preclean), which found
+	// [singleton+0x500] (a reentrancy guard checked at 0x8012C2E7C before
+	// the game calls into 0x8012C6B70 to populate CJobManager's async-
+	// completion slot) permanently stuck at 0xFF on every run -- never 0,
+	// never 1, no static writer of 0xFF/-1 found anywhere in the image.
+	// Forcing it to 0 exactly once was confirmed live to work (the byte
+	// really does flip 0xFF -> 0x00) but did NOT change the red-screen
+	// symptom at the time -- ruled out as root cause THEN. That test
+	// predates this session's GDS/DS_APPEND work and the three SPIR-V
+	// shader-compile fixes (see HIZ_INVESTIGATION.md run #7): the G-buffer
+	// literally never got a single real write back then, so this gate
+	// being open or closed couldn't have mattered downstream either way.
+	// Now that the G-buffer does get written, re-testing whether this gate
+	// still doesn't matter -- or suddenly does -- is the obvious next
+	// step. Opt-in: SHARPEMU_FORCE_JOBMANAGER_GATE=1.
+	private const ulong JobManagerReadyGateByteAddress = 0x8052AF040UL;
+
+	private static readonly bool _forceJobManagerGateEnabled =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_FORCE_JOBMANAGER_GATE"),
+			"1",
+			StringComparison.Ordinal);
+
+	private static int _jobManagerGateForced;
+
+	private unsafe void LogJobManagerAsyncSlotGate()
+	{
+		if (!_forceJobManagerGateEnabled)
+		{
+			return;
+		}
+
+		try
+		{
+			var gateByte = *(byte*)JobManagerReadyGateByteAddress;
+			if (gateByte == 0xFF &&
+				Interlocked.CompareExchange(ref _jobManagerGateForced, 1, 0) == 0)
+			{
+				*(byte*)JobManagerReadyGateByteAddress = 0;
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] JobManagerGate forced: ready_byte 0xFF -> 0x00 (t={ElapsedSecondsSinceBoot():F1}s)");
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	// Re-ported from the same 2026-07-20 investigation (b622b96 on
+	// fix/yotei-boot-deadlock-backup-preclean) as LogJobManagerAsyncSlotGate
+	// above, but this is the OTHER half: forcing the ready-byte gate did
+	// NOT unblock the JobWorker stall (re-confirmed this session, see
+	// HIZ_INVESTIGATION.md run #8), so the next question is whether
+	// anything ever actually calls push_back into CJobManager's own
+	// pending-job container at all. An execute breakpoint on the shared
+	// push_back template's entry (Dr0), filtered by the container `this`
+	// pointer so unrelated vector<T> instantiations don't count, plus a
+	// write breakpoint on the async-completion slot the JobWorkers also
+	// wait on (Dr1), answers that directly without needing to statically
+	// resolve every caller. Only ports the JobManagerPushBack watch mode
+	// from the original 5-mode file (SuspendPoint/FenceTarget/SignalSema
+	// were separate, already-concluded investigations) -- keeps the debug
+	// register usage minimal (Dr0+Dr1 only) and the diff reviewable.
+	// Opt-in: SHARPEMU_WATCH_JOBMANAGER_PUSHBACK=1.
+	private const ulong JobManagerPushBackAddress = 0x800FF85B0UL;
+	private const ulong JobManagerPendingArrayAddress = 0x8052AEBE8UL;
+	private const ulong JobManagerAsyncSlotAddress = 0x8052AF048UL;
+
+	// Third watch site (Dr2, execute): the *entry* of the submit routine that
+	// calls push_back. The 2026-07-21 run #9 (HIZ_INVESTIGATION.md) proved
+	// push_back into CJobManager's pending array fires only 6 times (5 at boot
+	// t=0.7-1.1s + 1 isolated at t=44.0s, then never again) from caller-return
+	// 0x800FF56A5. That return address sits inside a shared submit function; an
+	// offline capstone walk (padding int3 at 0x800FF5611-0x800FF561F, then a
+	// clean push rbp/mov rbp,rsp/push r15..rbx/sub rsp prologue) places the
+	// function entry at 0x800FF5620, cross-checked by 16 direct callers in the
+	// image. push_back at 0x800FF56A0 is on a conditional branch inside it, so
+	// the entry firing while push_back does NOT means the function is called
+	// but skips the push path (internal gate); the entry NOT firing means the
+	// stall is upstream, in whoever calls this function. Filter on rdi == the
+	// CJobManager `this`: the pending array pushed is [r14+0xA8] where
+	// r14 = rdi-at-entry, and the array is 0x8052AEBE8, so this == 0x8052AEB40.
+	// That mirrors the push_back site's container filter and rejects the other
+	// 15 callers' unrelated instances. Same opt-in flag as the two sites above.
+	private const ulong JobManagerSubmitJobEntryAddress = 0x800FF5620UL;
+	private const ulong JobManagerSubmitJobThisAddress = 0x8052AEB40UL;
+
+	// Fourth watch site (Dr3, execute): a frame-pointer BACKTRACE anchored on
+	// the named-submit factory 0x800FF57C0. Static call-graph climbing above
+	// the submitters dead-ends (run #12: functions with inlined ud2/int3 assert
+	// thunks defeat int3-boundary entry detection, and the convergence function
+	// is dispatched through a pointer with no static call/lea reference). So
+	// instead of guessing statically, this breakpoints the factory entry --
+	// dynamically proven to sit on the recurring 'pulse.sprig' path and to fire
+	// exactly at the pulse submissions (boot burst + one isolated late one) --
+	// and walks the rbp chain to dump the WHOLE stack in one run: *rsp is the
+	// return into the recurring submitter, then [rbp+8]/[rbp] climb through it
+	// up to the indirect dispatcher, scheduler and thread root. Every function
+	// on the path uses push rbp/mov rbp,rsp, so the walk is reliable (validated:
+	// the boot-init false-positive 0x800E2F690 gave a correct *rsp=0x8000000AF
+	// return into the entry stub). Same opt-in flag; keep it un-combined with
+	// SHARPEMU_FORCE_JOBMANAGER_GATE=1 (run #9 crash).
+	private const ulong JobManagerBacktraceAnchorAddress = 0x800FF57C0UL;
+
+	private static readonly bool _watchJobManagerPushBackEnabled =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_WATCH_JOBMANAGER_PUSHBACK"),
+			"1",
+			StringComparison.Ordinal);
+
+	private static long _jobManagerPushBackHitCount;
+	private static long _jobManagerAsyncSlotHitCount;
+	private static long _jobManagerSubmitJobHitCount;
+	private static long _jobManagerPulseTickHitCount;
+
+	[ThreadStatic]
+	private static bool _jobManagerPushBackArmedOnThisThread;
+
+	internal unsafe static void ArmJobManagerPushBackBreakpointOnCurrentThread()
+	{
+		if (!_watchJobManagerPushBackEnabled ||
+			!OperatingSystem.IsWindows() ||
+			_jobManagerPushBackArmedOnThisThread)
+		{
+			return;
+		}
+
+		_jobManagerPushBackArmedOnThisThread = true;
+
+		void* contextRecord = NativeMemory.AllocZeroed((nuint)Win64ContextSize);
+		try
+		{
+			WriteCtxU32(contextRecord, Win64ContextFlagsOffset, ContextAmd64DebugRegistersInteger);
+			var currentThread = GetCurrentThread();
+			if (!GetThreadContext(currentThread, contextRecord))
+			{
+				return;
+			}
+
+			WriteCtxU64(contextRecord, Win64ContextDr0Offset, JobManagerPushBackAddress);
+			WriteCtxU64(contextRecord, Win64ContextDr0Offset + 8, JobManagerAsyncSlotAddress);
+			WriteCtxU64(contextRecord, Win64ContextDr2Offset, JobManagerSubmitJobEntryAddress);
+			WriteCtxU64(contextRecord, Win64ContextDr3Offset, JobManagerBacktraceAnchorAddress);
+			// L0 (bit0) execute breakpoint on Dr0, R/W0=00/LEN0=00. L1 (bit2)
+			// write breakpoint on Dr1, R/W1=01 (write-only, bits 20-21) /
+			// LEN1=10 (8 bytes, bits 22-23). L2 (bit4) execute breakpoint on
+			// Dr2, R/W2=00/LEN2=00 (like Dr0). L3 (bit6) execute breakpoint on
+			// Dr3, R/W3=00/LEN3=00 -- 0x900000 | 0x5 | 0x10 | 0x40.
+			var dr7 = 0x900055UL;
+			WriteCtxU64(contextRecord, Win64ContextDr7Offset, dr7);
+			_ = SetThreadContext(currentThread, contextRecord);
+		}
+		finally
+		{
+			NativeMemory.Free(contextRecord);
+		}
+	}
+
+	// Called from the VEH on STATUS_SINGLE_STEP when the fault RIP matches
+	// one of the two armed addresses. x86 data breakpoints (Dr1) report the
+	// trap with the write already retired and RIP at the next instruction;
+	// execute breakpoints (Dr0) report RIP AT the armed address itself.
+	// Self-disarms each slot after a handful of hits to avoid log spam if
+	// a site turns out to be hot, and sets EFlags.RF so resuming doesn't
+	// immediately re-trip the same breakpoint on the very next instruction.
+	internal unsafe static bool TryHandleJobManagerPushBackBreakpoint(void* contextRecord, ulong rip)
+	{
+		if (!_watchJobManagerPushBackEnabled)
+		{
+			return false;
+		}
+
+		var dr6 = ReadCtxU64(contextRecord, Win64ContextDr6Offset);
+		var b0 = (dr6 & 0x1UL) != 0; // Dr0 (execute: push_back entry)
+		var b1 = (dr6 & 0x2UL) != 0; // Dr1 (write: async slot)
+		var b2 = (dr6 & 0x4UL) != 0; // Dr2 (execute: SoumettreJob entry)
+		var b3 = (dr6 & 0x8UL) != 0; // Dr3 (execute: named-submit factory entry)
+		if (!b0 && !b1 && !b2 && !b3)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, Win64ContextDr6Offset, 0);
+		var eflags = ReadCtxU32(contextRecord, Win64ContextEFlagsOffset);
+		WriteCtxU32(contextRecord, Win64ContextEFlagsOffset, eflags | 0x10000u);
+
+		var rsp = ReadCtxU64(contextRecord, 152);
+		var dr7 = ReadCtxU64(contextRecord, Win64ContextDr7Offset);
+
+		if (b1)
+		{
+			var hit1 = Interlocked.Increment(ref _jobManagerAsyncSlotHitCount);
+			_ = TryReadGuestMemoryDirect(JobManagerAsyncSlotAddress, out var slotValue);
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] JobManagerAsyncSlot hit#{hit1}: t={ElapsedSecondsSinceBoot():F1}s " +
+				$"rip_after_write=0x{rip:X16} new_value=0x{slotValue:X16} thread={Environment.CurrentManagedThreadId}");
+			Console.Error.Flush();
+			if (hit1 >= 20)
+			{
+				dr7 &= ~0x4UL;
+			}
+		}
+
+		if (b0 && rip == JobManagerPushBackAddress)
+		{
+			// Function entry: `this` (the container being pushed to) is
+			// still in rdi (arg0), the callee's own prologue hasn't run
+			// yet. Filter on it so the shared push_back template's hits
+			// for unrelated vector<T> instantiations don't spend the hit
+			// budget or spam the log.
+			var containerThis = ReadCtxU64(contextRecord, 176);
+			if (containerThis == JobManagerPendingArrayAddress)
+			{
+				var hit0 = Interlocked.Increment(ref _jobManagerPushBackHitCount);
+				ulong callerReturnAddress = rsp != 0 ? *(ulong*)rsp : 0;
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] JobManagerPushBack hit#{hit0}: t={ElapsedSecondsSinceBoot():F1}s " +
+					$"caller_return=0x{callerReturnAddress:X16} container=0x{containerThis:X16} " +
+					$"item=0x{ReadCtxU64(contextRecord, 168):X16} thread={Environment.CurrentManagedThreadId}");
+				Console.Error.Flush();
+				if (hit0 >= 20)
+				{
+					dr7 &= ~0x1UL;
+				}
+			}
+		}
+
+		if (b2 && rip == JobManagerSubmitJobEntryAddress)
+		{
+			// Function entry: arg0 (`this`, the CJobManager whose pending array
+			// [rdi+0xA8] push_back targets) is still in rdi. Filter on it so the
+			// other 15 callers of this shared submit routine don't count. Unlike
+			// the two sites above this one has a larger disarm budget (200): the
+			// whole point is to see whether entries KEEP arriving past t=44s
+			// (the moment push_back stopped firing in run #9), so it must not
+			// self-disarm before then.
+			var submitThis = ReadCtxU64(contextRecord, 176);
+			if (submitThis == JobManagerSubmitJobThisAddress)
+			{
+				var hit2 = Interlocked.Increment(ref _jobManagerSubmitJobHitCount);
+				ulong callerReturnAddress = rsp != 0 ? *(ulong*)rsp : 0;
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] JobManagerSubmitJob entry hit#{hit2}: t={ElapsedSecondsSinceBoot():F1}s " +
+					$"caller_return=0x{callerReturnAddress:X16} this=0x{submitThis:X16} " +
+					$"thread={Environment.CurrentManagedThreadId}");
+				Console.Error.Flush();
+				if (hit2 >= 200)
+				{
+					dr7 &= ~0x4UL;
+				}
+			}
+		}
+
+		if (b3 && rip == JobManagerBacktraceAnchorAddress)
+		{
+			// Anchor entry (before its own `push rbp`): rbp still belongs to the
+			// caller and *rsp is the return into the recurring submitter. Emit a
+			// backtrace by first taking *rsp, then walking the frame-pointer
+			// chain ([rbp+8]=return, [rbp]=next frame). Stacks grow down, so a
+			// valid next frame sits at a strictly higher address; stop on any
+			// out-of-order or faulting frame.
+			var hit3 = Interlocked.Increment(ref _jobManagerPulseTickHitCount);
+			var frame = ReadCtxU64(contextRecord, 160); // Rbp
+			var sb = new System.Text.StringBuilder();
+			sb.Append("0x").Append((rsp != 0 ? *(ulong*)rsp : 0).ToString("X"));
+			for (var i = 0; i < 16 && frame != 0; i++)
+			{
+				ulong ret, next;
+				try
+				{
+					ret = *(ulong*)(frame + 8);
+					next = *(ulong*)frame;
+				}
+				catch
+				{
+					break;
+				}
+
+				sb.Append(" <- 0x").Append(ret.ToString("X"));
+				if (next <= frame)
+				{
+					break;
+				}
+
+				frame = next;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] JobManagerSubmitBacktrace hit#{hit3}: t={ElapsedSecondsSinceBoot():F1}s " +
+				$"thread={Environment.CurrentManagedThreadId} backtrace={sb}");
+			Console.Error.Flush();
+			if (hit3 >= 40)
+			{
+				dr7 &= ~0x8UL;
+			}
+		}
+
+		WriteCtxU64(contextRecord, Win64ContextDr7Offset, dr7);
+		return true;
+	}
+
+	private void LogFlipStallSnapshot(double stalledSeconds)
+	{
+		try
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] --- flip stall snapshot (last_flip_version={FlipProgressTracker.LastFlipVersion} " +
+				$"stalled_for={stalledSeconds:F1}s) ---");
+
+			var (heartbeatCount, secondsSinceHeartbeat) = AgcExports.GpuWaitMonitorHeartbeat();
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall gpu_wait_monitor: iterations={heartbeatCount} " +
+				$"seconds_since_last_iteration={secondsSinceHeartbeat:F1}");
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall orphan_preamble_state: {AgcExports.DumpOrphanPreambleState()}");
+			LogGuestThreadGateOwner();
+			LogMainThreadFlipStallSnapshot();
+			LogGpuWaitRegistrySnapshot();
+			LogFlipStallGuestThreads();
+			Console.Error.Flush();
+		}
+		catch
+		{
+		}
+	}
+
+
+	// The process's original entry thread (RunGuestEntryStub) never goes
+	// through TryStartThread, so it has no GuestThreadState and is invisible
+	// to LogFlipStallGuestThreads below — a real gap, since on most titles
+	// this IS the thread that builds the per-frame graphics DCB and posts
+	// the job-worker semaphores every JobWorkerN in that dump is waiting on.
+	// _cpuContext already gives live access to its registers (see
+	// LogStallWatchdogSnapshot above, which reads the same field) — no
+	// suspend/resume dance needed here, unlike the per-guest-thread capture.
+	private void LogMainThreadFlipStallSnapshot()
+	{
+		var cpuContext = _cpuContext;
+		if (cpuContext is null)
+		{
+			return;
+		}
+
+		LogMainThreadOsLiveness();
+
+		var rip = cpuContext.Rip;
+		var progressed = _flipStallPrevMainRip == 0 || rip != _flipStallPrevMainRip;
+		_flipStallPrevMainRip = rip;
+
+		var stubText = string.Empty;
+		var alignedRip = rip & 0xFFFFFFFFFFFFFFF0uL;
+		for (var i = 0; i < _importEntries.Length; i++)
+		{
+			if (_importEntries[i].Address != alignedRip)
+			{
+				continue;
+			}
+
+			var nid = _importEntries[i].Nid;
+			stubText = _moduleManager.TryGetExport(nid, out var export)
+				? $" import={nid}({export.LibraryName}:{export.Name})"
+				: $" import={nid}";
+			break;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall main-thread: rip=0x{rip:X16} progressed={progressed}{stubText}");
+	}
+
+	// _cpuContext is a managed mirror whose Rip is only refreshed at import
+	// boundaries — it says nothing about whether the underlying OS thread
+	// still exists, and reads stale if that thread died between imports. This
+	// asks the kernel directly: does the entry thread's OS tid still resolve,
+	// is it still running (STILL_ACTIVE), and what RIP is it really at.
+	private void LogMainThreadOsLiveness()
+	{
+		var hostThreadId = Volatile.Read(ref _mainEntryHostThreadId);
+		if (hostThreadId == 0 || !OperatingSystem.IsWindows())
+		{
+			return;
+		}
+
+		var threadHandle = OpenThread(
+			ThreadGetContext | ThreadSuspendResume | ThreadQueryLimitedInformation,
+			false,
+			unchecked((uint)hostThreadId));
+		if (threadHandle == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall main-thread-os: tid={hostThreadId} alive=NO (OpenThread failed, " +
+				$"error={Marshal.GetLastWin32Error()} — the OS thread no longer exists)");
+			return;
+		}
+
+		try
+		{
+			var exitText = "exit_code=unavailable";
+			var alive = true;
+			if (GetExitCodeThread(threadHandle, out var exitCode))
+			{
+				alive = exitCode == StillActiveExitCode;
+				exitText = alive ? "running" : $"EXITED exit_code=0x{exitCode:X8}";
+			}
+
+			var liveRipText = string.Empty;
+			if (alive && TryCaptureHostThreadContext(hostThreadId, out var hostContext))
+			{
+				liveRipText = $" live_rip=0x{hostContext.Rip:X16} live_rsp=0x{hostContext.Rsp:X16}";
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall main-thread-os: tid={hostThreadId} alive={(alive ? "yes" : "NO")} " +
+				$"{exitText}{liveRipText}");
+		}
+		finally
+		{
+			_ = CloseHandle(threadHandle);
+		}
+	}
+
+	private void LogGpuWaitRegistrySnapshot()
+	{
+		List<GpuWaitRegistry.WaitingDcb> waiters;
+		try
+		{
+			waiters = GpuWaitRegistry.SnapshotAll();
+		}
+		catch
+		{
+			return;
+		}
+
+		if (waiters.Count == 0)
+		{
+			Console.Error.WriteLine("[LOADER][ERROR] Stall gpu-waits: none registered");
+			return;
+		}
+
+		var nowTicks = Stopwatch.GetTimestamp();
+		var logged = 0;
+		foreach (var waiter in waiters)
+		{
+			var ageSeconds = (nowTicks - waiter.RegisteredTicks) / (double)Stopwatch.Frequency;
+			// The live label value turns the static waiter list into a causal
+			// chain: whichever stuck waiter's label is exactly one short of
+			// its reference is waiting on a producer that never ran; a label
+			// already at/past its reference means the waiter itself was never
+			// re-polled (a different bug). Suite 24's snapshots lacked this
+			// and left the chain's head ambiguous.
+			var curText = TryReadGuestMemoryDirect(waiter.WaitAddress, out var liveValue)
+				? $" cur=0x{liveValue:X}"
+				: " cur=<unreadable>";
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall gpu-wait: addr=0x{waiter.WaitAddress:X16} ref=0x{waiter.ReferenceValue:X16} " +
+				$"mask=0x{waiter.Mask:X16} func={waiter.CompareFunction} queue={waiter.QueueName ?? "?"} " +
+				$"cb=0x{waiter.CommandBufferAddress:X16} age={ageSeconds:F1}s{curText}");
+			LogOrphanProducerScan(waiter.WaitAddress);
+			if (AgcExports.TryFindRingProducer(waiter.CommandBufferAddress, out var producerThread, out var secondsSinceWrite))
+			{
+				var pcText = string.Empty;
+				GuestThreadState? producerState;
+				using (LockGate("LogGpuWaitRegistrySnapshot"))
+				{
+					_guestThreads.TryGetValue(producerThread, out producerState);
+				}
+
+				if (producerState is not null &&
+					TryCaptureHostThreadContext(Volatile.Read(ref producerState.HostThreadId), out var hostContext))
+				{
+					pcText = $" host_rip=0x{hostContext.Rip:X16}";
+				}
+
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall ring-producer: cb=0x{waiter.CommandBufferAddress:X16} " +
+					$"thread=0x{producerThread:X16} last_write_age={secondsSinceWrite:F1}s{pcText} " +
+					"(see matching Stall guest-thread line for its current state)");
+			}
+			logged++;
+			if (logged >= 32 && waiters.Count > logged)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall gpu-wait: ... {waiters.Count - logged} more");
+				break;
+			}
+		}
+	}
+
+	// For one stuck wait label, find the packet that would satisfy it: scan
+	// every tracked builder arena for a qword equal to the label address. A
+	// write_data/release_mem packet stores its destination at packet+8, so a
+	// hit at ARENA+N means a candidate packet at ARENA+N-8; where that offset
+	// sits relative to the arena's cursor says whether the producer was built
+	// and left unsubmitted (offset >= cursor: the cursor-tracking gap), built
+	// and submitted but never executed (offset < cursor: it is parked behind
+	// a WAIT_REG_MEM upstream in the same DCB — the cascade case), or never
+	// built at all (no hit anywhere).
+	private void LogOrphanProducerScan(ulong waitAddress)
+	{
+		try
+		{
+			foreach (var (header, arenaBase, cursor) in AgcExports.SnapshotBuilderArenas())
+			{
+				if (arenaBase == 0)
+				{
+					continue;
+				}
+
+				var scanEnd = arenaBase + 0x10000;
+				for (var addr = arenaBase; addr + 8 <= scanEnd; addr += 4)
+				{
+					if (!TryReadGuestMemoryDirect(addr, out var value))
+					{
+						break; // arena chunk unmapped past here — stop this arena
+					}
+
+					if (value != waitAddress || addr < arenaBase + 8)
+					{
+						continue;
+					}
+
+					var packet = addr - 8;
+					_ = TryReadGuestMemoryDirect(packet, out var headerAndControl);
+					_ = TryReadGuestMemoryDirect(packet + 16, out var payload);
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Stall producer-scan: label=0x{waitAddress:X} " +
+						$"packet=0x{packet:X} arena_header=0x{header:X} arena=0x{arenaBase:X} " +
+						$"cursor=0x{cursor:X} beyond_cursor={packet >= cursor} " +
+						$"hdr_ctl=0x{headerAndControl:X16} payload=0x{payload:X16}");
+				}
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	// Every live guest thread except Exited/Faulted (those are done, not part
+	// of a stall), each annotated with whether its import count moved since
+	// the previous flip-stall snapshot — the one piece of information a
+	// single point-in-time dump cannot give: is this thread actually making
+	// progress, or has it been sitting at the same instruction the whole
+	// interval.
+	private void LogFlipStallGuestThreads()
+	{
+		var threads = SnapshotGuestThreads();
+		var seenHandles = new HashSet<ulong>(threads.Length);
+		var logged = 0;
+		foreach (var thread in threads)
+		{
+			seenHandles.Add(thread.ThreadHandle);
+			if (thread.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted)
+			{
+				continue;
+			}
+
+			var imports = Interlocked.Read(ref thread.ImportCount);
+			var progressed = !_flipStallPrevImportCounts.TryGetValue(thread.ThreadHandle, out var prevImports) ||
+				imports != prevImports;
+			_flipStallPrevImportCounts[thread.ThreadHandle] = imports;
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
+				$"state={thread.State} imports={imports} progressed={progressed} " +
+				$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
+				$"block={thread.BlockReason ?? "none"}");
+			logged++;
+			if (logged >= 40 && threads.Length > logged)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread: ... {threads.Length - logged} more");
+				break;
+			}
+		}
+
+		if (_flipStallPrevImportCounts.Count <= seenHandles.Count)
+		{
+			return;
+		}
+
+		foreach (var staleHandle in _flipStallPrevImportCounts.Keys.Where(h => !seenHandles.Contains(h)).ToList())
+		{
+			_flipStallPrevImportCounts.Remove(staleHandle);
 		}
 	}
 

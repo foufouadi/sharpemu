@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "다이렉트 메모리 할당과 실패를 콘솔에 기록합니다.\n게임이 부팅 중 중단되거나 종료될 때 사용하세요.",
   "Options.Env.LogIo.Desc": "파일 열기, 읽기, 경로 확인 동작을 콘솔에 기록합니다.\n게임이 부팅 중 데이터 파일을 찾지 못할 때 사용하세요.",
   "Options.Env.LogNp.Desc": "NP(PlayStation Network) 라이브러리 호출을 콘솔에 기록합니다.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "게임의 자체 CPU 코드가 다시 쓰는 게스트 표면을 다시 업로드합니다.\n평소에는 꺼 두세요. CPU로 그린 표면이 화면에 나타나지 않는 타이틀에서 켜세요.\n성능을 소모하며 GTA V 등 일부 타이틀에서는 문제가 생깁니다.",
   "Common.Save": "저장",
   "Common.Cancel": "취소",

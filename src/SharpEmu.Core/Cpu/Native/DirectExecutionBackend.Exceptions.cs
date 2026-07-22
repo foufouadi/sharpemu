@@ -15,6 +15,11 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	// STATUS_SINGLE_STEP — hardware debug-register (Dr0-Dr3) breakpoint
+	// traps (SHARPEMU_WATCH_JOBMANAGER_PUSHBACK=1, see DirectExecutionBackend.cs)
+	// surface as this exception code.
+	private const uint StatusSingleStep = 0x80000004u;
+
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
 	private static int _guestAllocatorHoleRecoveries;
@@ -123,6 +128,11 @@ public sealed partial class DirectExecutionBackend
 
 			ulong rip = ReadCtxU64(contextRecord, 248);
 			ulong rsp = ReadCtxU64(contextRecord, 152);
+			if (exceptionCode == StatusSingleStep &&
+				TryHandleJobManagerPushBackBreakpoint(contextRecord, rip))
+			{
+				return -1;
+			}
 			if (TryRecoverGuestInt41(exceptionCode, contextRecord, rip))
 			{
 				return -1;

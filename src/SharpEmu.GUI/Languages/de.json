@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "Direkte Speicherzuweisungen und Fehler in der Konsole protokollieren.\nVerwenden, wenn ein Spiel beim Start abbricht oder sich beendet.",
   "Options.Env.LogIo.Desc": "Datei-Öffnen, -Lesen und Pfadauflösung in der Konsole protokollieren.\nVerwenden, wenn ein Spiel beim Start seine Datendateien nicht findet.",
   "Options.Env.LogNp.Desc": "NP-Bibliotheksaufrufe (PlayStation Network) in der Konsole protokollieren.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Gast-Oberflächen neu hochladen, die der eigene CPU-Code des Spiels überschreibt.\nNormalerweise aus lassen. Für Titel aktivieren, deren CPU-gezeichnete Oberflächen nie auf dem Bildschirm erscheinen.\nKostet Leistung und verursacht bei einigen Titeln wie GTA V Regressionen.",
   "Common.Save": "Speichern",
   "Common.Cancel": "Abbrechen",

@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "تسجيل تخصيصات الذاكرة المباشرة وإخفاقاتها في وحدة التحكم.\nاستخدمه عندما تنهار لعبة أو تُغلق أثناء الإقلاع.",
   "Options.Env.LogIo.Desc": "تسجيل فتح الملفات وقراءتها وحلّ المسارات في وحدة التحكم.\nاستخدمه عندما لا تجد لعبة ملفات بياناتها أثناء الإقلاع.",
   "Options.Env.LogNp.Desc": "تسجيل نداءات مكتبة NP (شبكة PlayStation) في وحدة التحكم.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "إعادة رفع أسطح الضيف التي تعيد كتابتها شيفرة المعالج الخاصة باللعبة.\nاتركه مغلقًا عادة. شغّله للألعاب التي لا تصل أسطحها المرسومة بالمعالج إلى الشاشة.\nيكلّف أداءً ويسبب مشاكل في بعض الألعاب مثل GTA V.",
   "Common.Save": "حفظ",
   "Common.Cancel": "إلغاء",

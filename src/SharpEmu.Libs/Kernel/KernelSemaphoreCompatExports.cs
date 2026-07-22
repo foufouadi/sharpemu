@@ -196,7 +196,7 @@ public static class KernelSemaphoreCompatExports
             // this block.  When that happens WakeBlockedThreads cannot find the
             // waiter yet and the exit-handler re-check runs later; a re-check
             // here keeps the thread from yielding to the scheduler at all when
-            // the count is already sufficient.
+            // the count is already sufficient. (upstream par274/sharpemu #504)
             lock (semaphore.Gate)
             {
                 if (semaphore.Count >= needCount)

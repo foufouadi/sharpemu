@@ -323,6 +323,11 @@ public sealed class SpirvModuleBuilder
     private readonly List<uint> _executionModes = [];
     private readonly List<uint> _debug = [];
     private readonly List<uint> _annotations = [];
+    // Guards against emitting the same Decorate twice for a shared (deduplicated)
+    // type. OpTypeRuntimeArray %uint, for example, is cached, so two callers that
+    // both decorate it with ArrayStride would otherwise produce a "decorated with
+    // ArrayStride multiple times" spirv-val failure and an unusable module.
+    private readonly HashSet<string> _emittedDecorations = [];
     private readonly List<uint> _typesConstantsGlobals = [];
     private readonly List<uint> _functions = [];
     private readonly Dictionary<(uint Width, bool Signed), uint> _integerTypes = [];
@@ -415,6 +420,12 @@ public sealed class SpirvModuleBuilder
         values[0] = target;
         values[1] = (uint)decoration;
         operands.CopyTo(values, 2);
+        if (!_emittedDecorations.Add(string.Join(',', values)))
+        {
+            // Identical decoration already emitted for this target (shared type).
+            return;
+        }
+
         Emit(_annotations, SpirvOp.Decorate, values);
     }
 

@@ -84,6 +84,72 @@ public sealed class AjmExportsTests : IDisposable
     }
 
     [Fact]
+    public void ModuleRegister_AcceptsCodecTypesBeyondTheOldNarrowBound()
+    {
+        var contextId = Initialize();
+
+        // Codec type 0x18 (24) is what a shipped, retail title (Ghost of
+        // Yotei) registers during ordinary audio bring-up; a stale bound of
+        // 23 rejected it and stalled the whole boot. Registration is pure
+        // bookkeeping here, so any codec type that fits the instanceId
+        // packing (codecType << 14 | slot, see AjmInstanceCreate) must
+        // succeed.
+        Assert.Equal(0, RegisterCodec(contextId, 0x18));
+        Assert.Equal(0, CreateInstance(contextId, 0x18, 0x401, InstanceAddress));
+        Assert.Equal(0x60001u, ReadUInt32(InstanceAddress));
+    }
+
+    // Adapted from upstream par274/sharpemu #526 (fix(ajm): accept Gen5 codec
+    // types). Upstream widened a hard MaxCodecType from 23 to 25; our fix
+    // already treats registration as pure bookkeeping (MaxCodecType = 1<<18),
+    // which subsumes 25 — so the value change is a no-op/regression here and is
+    // deliberately NOT taken. The non-regressive, still-useful part is the
+    // coverage: every Gen5 codec type (23, 24, 25) must register and create an
+    // instance, guarding against any future re-narrowing of the bound.
+    [Theory]
+    [InlineData(23u)]
+    [InlineData(24u)]
+    [InlineData(25u)]
+    public void Gen5CodecTypesCanRegisterAndCreateInstances(uint codecType)
+    {
+        var contextId = Initialize();
+
+        Assert.Equal(0, RegisterCodec(contextId, codecType));
+        Assert.Equal(
+            0,
+            CreateInstance(contextId, codecType, 0x401, InstanceAddress));
+    }
+
+    [Fact]
+    public void ModuleUnregister_AllowsReRegisterAndRejectsUnknownContext()
+    {
+        var contextId = Initialize();
+        Assert.Equal(0, RegisterCodec(contextId, 1));
+
+        Assert.Equal(0, UnregisterCodec(contextId, 1));
+        Assert.Equal(0, RegisterCodec(contextId, 1));
+        Assert.Equal(InvalidContext, UnregisterCodec(contextId + 1, 1));
+    }
+
+    [Fact]
+    public void ModuleUnregister_ToleratesCodecThatNeverRegistered()
+    {
+        var contextId = Initialize();
+
+        Assert.Equal(0, UnregisterCodec(contextId, 1));
+    }
+
+    [Fact]
+    public void Finalize_RejectsUnknownAndDoubleFinalizedContext()
+    {
+        var contextId = Initialize();
+        _ctx[CpuRegister.Rdi] = contextId;
+
+        Assert.Equal(0, AjmExports.AjmFinalize(_ctx));
+        Assert.Equal(InvalidContext, AjmExports.AjmFinalize(_ctx));
+    }
+
+    [Fact]
     public void MemoryRegistration_TracksValidContextAndToleratesRepeatedUnregister()
     {
         var contextId = Initialize();
@@ -246,19 +312,6 @@ public sealed class AjmExportsTests : IDisposable
         var written = ReadBytes(sideband, 0x20);
         Assert.Equal(0, BinaryPrimitives.ReadInt32LittleEndian(written));
         Assert.All(written.AsSpan(8).ToArray(), value => Assert.Equal(0x5A, value));
-    }
-
-    [Theory]
-    [InlineData(23u)]
-    [InlineData(24u)]
-    public void Gen5CodecTypesCanRegisterAndCreateInstances(uint codecType)
-    {
-        var contextId = Initialize();
-
-        Assert.Equal(0, RegisterCodec(contextId, codecType));
-        Assert.Equal(
-            0,
-            CreateInstance(contextId, codecType, 0x401, InstanceAddress));
     }
 
     [Fact]

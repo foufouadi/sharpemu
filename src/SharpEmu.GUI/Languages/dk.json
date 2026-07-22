@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "Log direkte hukommelsestildelinger og fejl til konsollen.\nBrug dette, når et spil afbryder eller lukker under opstart.",
   "Options.Env.LogIo.Desc": "Log åbning og læsning af filer samt stiopslag til konsollen.\nBrug dette, når et spil ikke kan finde sine datafiler under opstart.",
   "Options.Env.LogNp.Desc": "Log NP-bibliotekskald (PlayStation Network) til konsollen.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Genindlæs gæsteoverflader, som spillets egen CPU-kode omskriver.\nLad den være slået fra normalt. Slå til for titler, hvis CPU-tegnede overflader aldrig når skærmen.\nKoster ydeevne og giver regressioner i nogle titler, såsom GTA V.",
   "Common.Save": "Gem",
   "Common.Cancel": "Annuller",

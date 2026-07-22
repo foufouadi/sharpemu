@@ -160,6 +160,38 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES"),
         "1",
         StringComparison.Ordinal);
+    // Diagnostic: when set, MonitorGpuWaits times each of its sections and logs
+    // a per-section breakdown whenever a single iteration exceeds ~50 ms. The
+    // heartbeat series proved the loop body blocks ~5 s/iteration while its
+    // Thread.Sleep is capped at 16 ms; this isolates which section is the
+    // culprit without altering behaviour. See HIZ_INVESTIGATION.md run #3.
+    private static readonly bool _timeWaitMonitorEnabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TIME_WAIT_MONITOR"),
+        "1",
+        StringComparison.Ordinal);
+    // Stage-1 instrumentation (see plan): set while the monitor thread replays an
+    // orphan preamble (SubmitOrphanSlice parses it inline). Lets us attribute the
+    // blocking WaitForGuestWork time at the writesGlobalMemory dispatch site to the
+    // orphan-drain path specifically, and confirm it is the ~5 s/iteration culprit.
+    [ThreadStatic]
+    private static bool _inOrphanReplay;
+    [ThreadStatic]
+    private static long _orphanReplayWaitGuestWorkTicks;
+    [ThreadStatic]
+    private static int _orphanReplayWaitGuestWorkCount;
+    // DrainPendingOrphanPreambles/SweepBuilderArenas used to process their
+    // ENTIRE backlog before returning; each header/target submission can
+    // block on a synchronous vkWaitForFences (WaitForActiveGuestQueueSubmissions
+    // ForCpuVisibility) for hundreds of ms once the GPU queue is congested, and
+    // with dozens of tracked headers that serialized into 5-17s per
+    // MonitorGpuWaits iteration (measured, see HIZ_INVESTIGATION.md run #4) --
+    // starving DrainResumableDcbs, the ~0ms fast-wake call earlier in the SAME
+    // iteration, for that entire stretch. Bounding how much backlog each call
+    // processes lets the loop return to DrainResumableDcbs on a near-16ms
+    // cadence instead; nothing is dropped, the remainder is picked up on the
+    // next iteration.
+    private const double OrphanDrainBudgetMs = 20.0;
+    private static int _sweepBuilderArenasRoundRobinCursor;
     private static readonly object _orphanPreambleGate = new();
     // One target label can have SEVERAL producer buffers: counter-style fences
     // (WAIT_REG_MEM ref=2/ref=3 seen live) only pass once every producer's
@@ -871,6 +903,9 @@ public static partial class AgcExports
             return;
         }
 
+        var deadlineTicks = System.Diagnostics.Stopwatch.GetTimestamp() +
+            (long)(OrphanDrainBudgetMs / 1000.0 * System.Diagnostics.Stopwatch.Frequency);
+
         // Flush arenas their builders abandoned since the last drain (see
         // TrackCbReleaseMemTarget) — cursor-based header submission can no
         // longer reach them. Clipped against game submissions like every
@@ -903,6 +938,13 @@ public static partial class AgcExports
                 slice.End,
                 targetAddress: 0,
                 minimumRangeSequence: lapSequence);
+
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks)
+            {
+                // Remaining closed slices (if any) stay queued; picked up by
+                // the next MonitorGpuWaits iteration.
+                return;
+            }
         }
 
         while (true)
@@ -935,6 +977,14 @@ public static partial class AgcExports
             foreach (var headerAddress in pendingHeaders)
             {
                 ForceSubmitOrphanPreambleHeader(ctx, gpuState, headerAddress, targetAddress);
+            }
+
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks)
+            {
+                // targetAddress is fully processed (all its headers ran); any
+                // targets still in _orphanPreamblePendingTargets stay queued
+                // for the next iteration.
+                return;
             }
         }
     }
@@ -1268,10 +1318,30 @@ public static partial class AgcExports
             headers = OrderHeadersByConstructionTimeLocked(_knownBuilderHeaders);
         }
 
-        foreach (var headerAddress in headers)
+        // Bounded per call (see OrphanDrainBudgetMs). Because `headers` is
+        // freshly re-sorted oldest-checkpoint-first on every call, always
+        // starting from index 0 would let a header whose checkpoint never
+        // advances (e.g. genuinely idle) permanently monopolize the front of
+        // the list and starve everything after it once the budget cuts the
+        // loop short. Rotate the starting point across calls instead so every
+        // known header gets a turn even when the backlog never fully drains
+        // in one pass.
+        var deadlineTicks = System.Diagnostics.Stopwatch.GetTimestamp() +
+            (long)(OrphanDrainBudgetMs / 1000.0 * System.Diagnostics.Stopwatch.Frequency);
+        var startIndex = _sweepBuilderArenasRoundRobinCursor % headers.Length;
+        var processedCount = 0;
+        for (var offset = 0; offset < headers.Length; offset++)
         {
+            var headerAddress = headers[(startIndex + offset) % headers.Length];
             ForceSubmitOrphanPreambleHeader(ctx, gpuState, headerAddress, targetAddress: 0);
+            processedCount++;
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks)
+            {
+                break;
+            }
         }
+
+        _sweepBuilderArenasRoundRobinCursor = (startIndex + processedCount) % headers.Length;
     }
 
     // Sorts headers by the wall-clock time their LATEST recorded checkpoint
@@ -1324,8 +1394,10 @@ public static partial class AgcExports
             $"command=0x{sliceStart:X16} dwords={dwordCount} targetLabel=0x{targetAddress:X16} " +
             $"owner={owner}");
 
+        var gateAcquireTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         lock (gpuState.Gate)
         {
+            var enqueueStartTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var queueState = new SubmittedDcbState
             {
                 QueueName = $"acb.orphan_preamble[0x{headerAddress:X}]",
@@ -1340,7 +1412,37 @@ public static partial class AgcExports
                 dwordCount,
                 ++gpuState.SubmissionSequence,
                 tracePackets: true);
-            DrainResumableDcbs(ctx, gpuState, tracePackets: true);
+            var drainStartTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var wasReplaying = _inOrphanReplay;
+            _inOrphanReplay = true;
+            try
+            {
+                DrainResumableDcbs(ctx, gpuState, tracePackets: true);
+            }
+            finally
+            {
+                _inOrphanReplay = wasReplaying;
+            }
+
+            if (_timeWaitMonitorEnabled)
+            {
+                var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+                var endTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                var holdMs = (endTicks - enqueueStartTicks) * 1000.0 / freq;
+                if (holdMs >= 100.0)
+                {
+                    var ci = System.Globalization.CultureInfo.InvariantCulture;
+                    // Splits the gate-hold of one orphan replay into its parse
+                    // (EnqueueSubmittedDcb) vs the inline DrainResumableDcbs, to
+                    // find which dominates the ~8s hold measured in run #15.
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] agc.orphan_submit_slow header=0x{headerAddress:X} dwords={dwordCount} " +
+                        $"gate_hold_ms={holdMs.ToString("F1", ci)} " +
+                        $"enqueue_ms={((drainStartTicks - enqueueStartTicks) * 1000.0 / freq).ToString("F1", ci)} " +
+                        $"inline_drain_ms={((endTicks - drainStartTicks) * 1000.0 / freq).ToString("F1", ci)} " +
+                        $"gate_acquire_ms={((enqueueStartTicks - gateAcquireTicks) * 1000.0 / freq).ToString("F1", ci)}");
+                }
+            }
         }
     }
 
@@ -1997,6 +2099,14 @@ public static partial class AgcExports
         public bool WaitMonitorRunning { get; set; }
         public object WaitMonitorSignalGate { get; } = new();
         public long WaitMonitorSignalVersion { get; set; }
+
+        // Set once when the dedicated orphan-maintenance loop is launched
+        // (SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES only). That loop runs the
+        // expensive orphan drain/sweep/salvage OFF the wait-monitor thread so a
+        // single multi-second inline preamble replay can no longer starve
+        // DrainResumableDcbs (the ~0ms fast wake). See HIZ_INVESTIGATION.md
+        // run #14 and yotei-hiz-not-the-bug-queue-orphan-timing.
+        public bool OrphanMaintenanceRunning { get; set; }
 
         // Coalesced resumable-DCB drain scheduling: completions only request a
         // drain; at most one thread-pool worker holds the drain duty at a time
@@ -5201,6 +5311,14 @@ public static partial class AgcExports
         while (offset < dwordCount)
         {
             var currentAddress = commandAddress + ((ulong)offset * sizeof(uint));
+            // Per-packet timing, orphan replays only: names the single packet
+            // whose effects cost the ~0.6-6.4s gate-hold measured in run #16
+            // (agc.orphan_submit_slow). Only non-suspending ops reach the check
+            // before `offset += length`; a suspending wait returns earlier, but
+            // those are the cheap path -- the expensive one is real work.
+            var packetStartTicks = (_timeWaitMonitorEnabled && state.IsForceSubmittedRing)
+                ? System.Diagnostics.Stopwatch.GetTimestamp()
+                : 0;
             if (!TryReadUInt32(ctx, currentAddress, out var header))
             {
                 TracePacketParseFailure(state, currentAddress, offset, 0, "header-read");
@@ -5809,6 +5927,19 @@ public static partial class AgcExports
                 state.TranslatedDraw = null;
             }
 
+            if (packetStartTicks != 0)
+            {
+                var packetMs = (System.Diagnostics.Stopwatch.GetTimestamp() - packetStartTicks) *
+                    1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                if (packetMs >= 50.0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] agc.orphan_slow_packet op=0x{op:X2} reg=0x{register:X2} " +
+                        $"len={length} addr=0x{currentAddress:X16} queue={state.QueueName} " +
+                        $"packet_ms={packetMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
+                }
+            }
+
             offset += length;
             // See SubmittedDcbState.LastParsedAddress: only reached once this
             // packet's effects have fully run, so every return point above
@@ -5917,9 +6048,20 @@ public static partial class AgcExports
             () =>
             {
                 InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
+                // A non-zero source below the GDS limit is a GDS *offset* to read
+                // from, not immediate fill data. The old heuristic classified any
+                // source <= uint.MaxValue as an immediate, so a DMA copying a
+                // ds_append counter out of the GDS (src=0x0D18, dst=guest) filled
+                // the destination with the literal offset 0x0D18 instead of the
+                // counter — leaving the indirect dispatch with garbage dims. Route
+                // GDS reads through the copy path (see TryCopyGuestMemory), and
+                // still treat src==0 as a zero fill (the per-frame GDS reset).
+                var sourceIsGds =
+                    sourceAddress != 0 &&
+                    sourceAddress < VulkanVideoPresenter.GdsAddressLimit;
                 var immediateFill =
                     compactLayout &&
-                    destinationAddress >= 0x10000 &&
+                    !sourceIsGds &&
                     sourceAddress <= uint.MaxValue;
                 var copied =
                     byteCount != 0 &&
@@ -7536,6 +7678,29 @@ public static partial class AgcExports
             static state => MonitorGpuWaits(state.Context, state.GpuState),
             (Context: monitorContext, GpuState: gpuState),
             preferLocal: false);
+
+        // Under the orphan-preamble workaround, run the heavy drain/sweep/
+        // salvage on a SEPARATE long-lived thread. A single ForceSubmitOrphan
+        // PreambleHeader can parse+replay a large preamble inline for several
+        // seconds (measured 8.7s, HIZ_INVESTIGATION.md run #14); leaving it on
+        // the wait-monitor thread froze DrainResumableDcbs (the fast wake) for
+        // that whole stretch. The orphan path already runs outside gpuState.Gate
+        // and takes it only per-submit, and its bookkeeping is guarded by
+        // _orphanPreambleGate, so it is safe to run concurrently with the
+        // monitor's gate-protected fast wake. Its context clones the SAME
+        // ctx.Memory instance so GpuWaitRegistry.SnapshotInRange's reference
+        // filter still matches the registered waits.
+        if (_forceSubmitOrphanPreamblesEnabled && !gpuState.OrphanMaintenanceRunning)
+        {
+            gpuState.OrphanMaintenanceRunning = true;
+            var orphanContext = new CpuContext(
+                submitContext.Memory,
+                submitContext.TargetGeneration);
+            ThreadPool.UnsafeQueueUserWorkItem(
+                static state => OrphanMaintenanceLoop(state.Context, state.GpuState),
+                (Context: orphanContext, GpuState: gpuState),
+                preferLocal: false);
+        }
     }
 
     // Diagnostic-only: MonitorGpuWaits' while(true) loop runs unsupervised on
@@ -7661,11 +7826,22 @@ public static partial class AgcExports
         {
             Interlocked.Increment(ref _gpuWaitMonitorHeartbeatCount);
             Volatile.Write(ref _gpuWaitMonitorHeartbeatTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+            var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+            var iterationStartTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            long gateWaitTicks = 0, drainDcbTicks = 0;
+            long sectionMark = iterationStartTicks;
             try
             {
             var madeProgress = false;
+            var beforeGateTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             lock (gpuState.Gate)
             {
+                if (_timeWaitMonitorEnabled)
+                {
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    gateWaitTicks = nowTicks - beforeGateTicks;
+                    sectionMark = nowTicks;
+                }
                 var before = GpuWaitRegistry.CountForMemory(ctx.Memory);
                 // With the orphan force-submit machinery active the monitor
                 // must OUTLIVE the waits: the game also polls builder-written
@@ -7685,6 +7861,12 @@ public static partial class AgcExports
                 if (before != 0)
                 {
                     var resumed = DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
+                    if (_timeWaitMonitorEnabled)
+                    {
+                        var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                        drainDcbTicks = nowTicks - sectionMark;
+                        sectionMark = nowTicks;
+                    }
                     remaining = GpuWaitRegistry.CountForMemory(ctx.Memory);
                     madeProgress = resumed != 0;
                     if (_traceAgc && resumed != 0)
@@ -7706,25 +7888,24 @@ public static partial class AgcExports
                 }
             }
 
-            // Safe here: this thread has no DCB parse on its stack, and the
-            // orphan-submit path takes gpuState.Gate itself. Re-offering every
-            // live wait address to the tracker also covers producers the game
-            // builds AFTER the wait registered (registration-time recording
-            // alone misses that ordering). This monitor's ctx.Memory is the
-            // same instance the waits were registered with (EnsureGpuWaitMonitor
-            // clones the registering thread's context), so SnapshotInRange's
-            // reference filter matches.
-            if (_forceSubmitOrphanPreamblesEnabled)
+            // The expensive orphan offer/drain/sweep/salvage that used to run
+            // here now runs on the dedicated OrphanMaintenanceLoop thread (see
+            // EnsureGpuWaitMonitor), so a multi-second inline preamble replay can
+            // no longer stall DrainResumableDcbs above. This loop stays the fast
+            // wake: gate + DrainResumableDcbs only.
+            if (_timeWaitMonitorEnabled)
             {
-                foreach (var (address, _) in
-                         GpuWaitRegistry.SnapshotInRange(ctx.Memory, 0, ulong.MaxValue))
+                var totalMs = (System.Diagnostics.Stopwatch.GetTimestamp() - iterationStartTicks) * 1000.0 / freq;
+                if (totalMs >= 50.0)
                 {
-                    TryForceSubmitOrphanPreamble(ctx, gpuState, address);
+                    // Invariant culture: see agc.orphan_maintenance_slow_iter
+                    // and yotei-locale-waited-ms-misread -- a comma-decimal
+                    // culture would inflate the reading ~1000x otherwise.
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] agc.wait_monitor_slow_iter total_ms={totalMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"gate_wait_ms={(gateWaitTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"drain_dcb_ms={(drainDcbTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
                 }
-
-                DrainPendingOrphanPreambles(ctx, gpuState);
-                SweepBuilderArenas(ctx, gpuState);
-                SalvageStuckFenceWrites(ctx, gpuState);
             }
 
             delayMilliseconds = madeProgress
@@ -7753,6 +7934,119 @@ public static partial class AgcExports
                     $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
                 Thread.Sleep(16);
             }
+        }
+    }
+
+    private static long _orphanMaintenanceHeartbeatCount;
+    private static long _orphanMaintenanceHeartbeatTimestamp;
+
+    public static (long Count, double SecondsSinceLastIteration) OrphanMaintenanceHeartbeat()
+    {
+        var count = Volatile.Read(ref _orphanMaintenanceHeartbeatCount);
+        var lastTicks = Volatile.Read(ref _orphanMaintenanceHeartbeatTimestamp);
+        var seconds = lastTicks == 0
+            ? -1
+            : (System.Diagnostics.Stopwatch.GetTimestamp() - lastTicks) / (double)System.Diagnostics.Stopwatch.Frequency;
+        return (count, seconds);
+    }
+
+    // Dedicated thread for the heavy orphan-preamble maintenance (offer, drain,
+    // sweep, salvage). Split out of MonitorGpuWaits so a single multi-second
+    // inline preamble replay (measured 8.7s, HIZ_INVESTIGATION.md run #14) can
+    // no longer freeze DrainResumableDcbs, the ~0ms fast wake, which stays on the
+    // monitor thread. Every function called here already serializes its shared
+    // state on gpuState.Gate (per-submit) and _orphanPreambleGate, so running
+    // concurrently with the monitor's gate-protected fast wake is safe. Same
+    // unsupervised-loop hazard as the monitor: a bare exception here would end
+    // orphan draining silently, so each iteration is wrapped and logged.
+    private static void OrphanMaintenanceLoop(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        var delayMilliseconds = 1;
+        while (true)
+        {
+            Interlocked.Increment(ref _orphanMaintenanceHeartbeatCount);
+            Volatile.Write(ref _orphanMaintenanceHeartbeatTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+            try
+            {
+                var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+                var iterationStartTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                long offerTicks = 0, drainOrphanTicks = 0, sweepTicks = 0, salvageTicks = 0;
+                var sectionMark = iterationStartTicks;
+                _orphanReplayWaitGuestWorkTicks = 0;
+                _orphanReplayWaitGuestWorkCount = 0;
+
+                // Re-offering every live wait address covers producers the game
+                // builds AFTER the wait registered (registration-time recording
+                // alone misses that ordering). ctx.Memory is the same instance
+                // the waits were registered with (EnsureGpuWaitMonitor clones the
+                // registering thread's context for this loop too), so
+                // SnapshotInRange's reference filter matches.
+                foreach (var (address, _) in
+                         GpuWaitRegistry.SnapshotInRange(ctx.Memory, 0, ulong.MaxValue))
+                {
+                    TryForceSubmitOrphanPreamble(ctx, gpuState, address);
+                }
+                if (_timeWaitMonitorEnabled)
+                {
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    offerTicks = nowTicks - sectionMark;
+                    sectionMark = nowTicks;
+                }
+
+                DrainPendingOrphanPreambles(ctx, gpuState);
+                if (_timeWaitMonitorEnabled)
+                {
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    drainOrphanTicks = nowTicks - sectionMark;
+                    sectionMark = nowTicks;
+                }
+                SweepBuilderArenas(ctx, gpuState);
+                if (_timeWaitMonitorEnabled)
+                {
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    sweepTicks = nowTicks - sectionMark;
+                    sectionMark = nowTicks;
+                }
+                SalvageStuckFenceWrites(ctx, gpuState);
+                if (_timeWaitMonitorEnabled)
+                {
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    salvageTicks = nowTicks - sectionMark;
+                }
+
+                var passMs = (System.Diagnostics.Stopwatch.GetTimestamp() - iterationStartTicks) * 1000.0 / freq;
+                if (_timeWaitMonitorEnabled && passMs >= 50.0)
+                {
+                    // Invariant culture: a comma-decimal culture (fr-FR default
+                    // here) would print "2565,940" for 2565.940 ms and be misread
+                    // as ~2.5 million ms. See yotei-locale-waited-ms-misread and
+                    // HIZ_INVESTIGATION.md run #2.
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] agc.orphan_maintenance_slow_iter total_ms={passMs.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"offer_ms={(offerTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"drain_orphan_ms={(drainOrphanTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"sweep_ms={(sweepTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"salvage_ms={(salvageTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"wait_guest_work_ms={(_orphanReplayWaitGuestWorkTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                        $"wait_guest_work_count={_orphanReplayWaitGuestWorkCount}");
+                }
+
+                // Grind backlog fast (1ms) while a pass is doing real work; back
+                // off to 16ms once passes go cheap so an idle loop stays quiet.
+                delayMilliseconds = passMs >= OrphanDrainBudgetMs * 0.5
+                    ? 1
+                    : Math.Min(delayMilliseconds * 2, 16);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][ERROR] agc.orphan_maintenance_iteration_exception " +
+                    $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+                delayMilliseconds = 16;
+            }
+            Thread.Sleep(delayMilliseconds);
         }
     }
 
@@ -7929,7 +8223,10 @@ public static partial class AgcExports
             $"agc.queue_resumed queue={waiter.QueueName} " +
             $"submission={waiter.SubmissionId} label=0x{waiter.WaitAddress:X16} " +
             $"resume=0x{waiter.ResumeAddress:X16} remaining_dwords={remainingDwords} " +
-            $"waited_ms={waitedMilliseconds:F3}");
+            // Invariant culture: see the comment on agc.wait_monitor_slow_iter
+            // above for why a comma-decimal culture here caused a previous
+            // session to misread ~2.6 seconds as "42.8 minutes".
+            $"waited_ms={waitedMilliseconds.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
         GpuWaitProfile.RecordResume(waiter.WaitAddress, waitedMilliseconds);
         if (remainingDwords == 0)
         {
@@ -12484,9 +12781,9 @@ public static partial class AgcExports
         }
 
         if ((initiator & 1) == 0 ||
-            !TryReadUInt32(ctx, dimensionsAddress, out var dispatchEndX) ||
-            !TryReadUInt32(ctx, dimensionsAddress + 4, out var dispatchEndY) ||
-            !TryReadUInt32(ctx, dimensionsAddress + 8, out var dispatchEndZ))
+            !TryReadDispatchDimension(ctx, dimensionsAddress, out var dispatchEndX) ||
+            !TryReadDispatchDimension(ctx, dimensionsAddress + 4, out var dispatchEndY) ||
+            !TryReadDispatchDimension(ctx, dimensionsAddress + 8, out var dispatchEndZ))
         {
             return false;
         }
@@ -12721,7 +13018,10 @@ public static partial class AgcExports
         }
 
         var computeSystemRegisters = DecodeComputeSystemRegisters(state.ShRegisters);
-        if (!Gen5ShaderTranslator.TryCreateState(
+        var evalStartTicks = (_timeWaitMonitorEnabled && _inOrphanReplay)
+            ? System.Diagnostics.Stopwatch.GetTimestamp()
+            : 0;
+        var createOk = Gen5ShaderTranslator.TryCreateState(
                 ctx,
                 shaderAddress,
                 shaderHeader,
@@ -12729,7 +13029,9 @@ public static partial class AgcExports
                 ComputeUserDataRegister,
                 out var shaderState,
                 out var error,
-                computeSystemRegisters) ||
+                computeSystemRegisters);
+        var createDoneTicks = evalStartTicks != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (!createOk ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 shaderState,
@@ -12746,6 +13048,21 @@ public static partial class AgcExports
             }
 
             return;
+        }
+
+        if (evalStartTicks != 0)
+        {
+            var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+            var evalDoneTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            var createMs = (createDoneTicks - evalStartTicks) * 1000.0 / freq;
+            var evaluateMs = (evalDoneTicks - createDoneTicks) * 1000.0 / freq;
+            if (createMs + evaluateMs >= 50.0)
+            {
+                var ci = System.Globalization.CultureInfo.InvariantCulture;
+                Console.Error.WriteLine(
+                    $"[LOADER][ERROR] agc.orphan_dispatch_eval cs=0x{shaderAddress:X16} " +
+                    $"create_ms={createMs.ToString("F1", ci)} evaluate_ms={evaluateMs.ToString("F1", ci)}");
+            }
         }
 
         var bindings = evaluation.ImageBindings;
@@ -12963,7 +13280,7 @@ public static partial class AgcExports
                     out _);
                 var globalMemoryBuffers =
                     CreateTranslatedComputeGlobalBuffers(evaluation);
-                GuestGpu.Current.SubmitComputeDispatch(
+                var workSequence = GuestGpu.Current.SubmitComputeDispatch(
                     shaderAddress,
                     computeShader,
                     textures,
@@ -12985,6 +13302,24 @@ public static partial class AgcExports
                 // Vulkan queue order keeps dependent dispatches coherent. CPU visibility is
                 // published by explicit PM4 release/write actions instead of per dispatch.
                 gpuDispatch = true;
+                if (writesGlobalMemory)
+                {
+                    var wgwStart = (_timeWaitMonitorEnabled && _inOrphanReplay)
+                        ? System.Diagnostics.Stopwatch.GetTimestamp()
+                        : 0;
+                    var completed = VulkanVideoPresenter.WaitForGuestWork(workSequence);
+                    if (wgwStart != 0)
+                    {
+                        _orphanReplayWaitGuestWorkTicks +=
+                            System.Diagnostics.Stopwatch.GetTimestamp() - wgwStart;
+                        _orphanReplayWaitGuestWorkCount++;
+                    }
+
+                    if (!completed)
+                    {
+                        computeError = $"global-write-sync-timeout sequence={workSequence}";
+                    }
+                }
             }
         }
 
@@ -15417,6 +15752,22 @@ public static partial class AgcExports
         return true;
     }
 
+    // Reads one indirect-dispatch dimension. Sucker Punch's GPU-driven pipeline
+    // can point the indirect args straight at a GDS counter, so a sub-0x10000
+    // address is read from the GDS mapping rather than (invalid) guest memory.
+    private static bool TryReadDispatchDimension(
+        CpuContext ctx,
+        ulong address,
+        out uint value)
+    {
+        if (address < VulkanVideoPresenter.GdsAddressLimit)
+        {
+            return VulkanVideoPresenter.TryReadGdsDword((uint)address, out value);
+        }
+
+        return TryReadUInt32(ctx, address, out value);
+    }
+
     private static bool TryReadUInt32(CpuContext ctx, ulong address, out uint value)
     {
         if (_dcbWindowBuffer is { } window &&
@@ -15531,6 +15882,23 @@ public static partial class AgcExports
             return true;
         }
 
+        // Addresses below the GDS limit are Global Data Share offsets, not guest
+        // virtual memory. This is the DMA that copies a ds_append counter out of
+        // the GDS into an indirect-dispatch argument buffer (src in GDS) and, in
+        // the other direction, any staging back into the GDS.
+        var sourceIsGds = sourceAddress < VulkanVideoPresenter.GdsAddressLimit;
+        var destinationIsGds = destinationAddress < VulkanVideoPresenter.GdsAddressLimit;
+        if (sourceIsGds || destinationIsGds)
+        {
+            return TryCopyGdsInvolvedMemory(
+                ctx,
+                sourceAddress,
+                destinationAddress,
+                byteCount,
+                sourceIsGds,
+                destinationIsGds);
+        }
+
         var buffer = new byte[Math.Min(byteCount, 64u * 1024u)];
         ulong offset = 0;
         while (offset < byteCount)
@@ -15549,12 +15917,83 @@ public static partial class AgcExports
         return true;
     }
 
+    // Handles a DMA copy where either endpoint is a GDS offset. GDS is at most
+    // 64 KiB, so a copy that large involving it is nonsensical; reject it rather
+    // than truncate. Returns false (leaving the DMA "not copied") when the GDS
+    // has not been created yet, which is the same safe drop as before.
+    private static bool TryCopyGdsInvolvedMemory(
+        CpuContext ctx,
+        ulong sourceAddress,
+        ulong destinationAddress,
+        uint byteCount,
+        bool sourceIsGds,
+        bool destinationIsGds)
+    {
+        if (byteCount == 0)
+        {
+            return true;
+        }
+
+        if (byteCount > VulkanVideoPresenter.GdsAddressLimit)
+        {
+            return false;
+        }
+
+        // Reading a GDS counter must observe the culling compute's ds_append
+        // writes, so fence all submitted GPU work first. This runs on the
+        // presenter thread (ordered DMA side effect), where the wait is safe.
+        if (sourceIsGds)
+        {
+            VulkanVideoPresenter.FlushGpuWorkForGdsReadback();
+        }
+
+        var buffer = new byte[byteCount];
+        var read = sourceIsGds
+            ? VulkanVideoPresenter.TryReadGds((uint)sourceAddress, buffer)
+            : ctx.Memory.TryRead(sourceAddress, buffer);
+        if (!read)
+        {
+            return false;
+        }
+
+        if (sourceIsGds && buffer.Length >= 4)
+        {
+            TraceAgc(
+                $"agc.gds_read src=0x{sourceAddress:X4} dst=0x{destinationAddress:X16} " +
+                $"bytes={byteCount} value=0x{BinaryPrimitives.ReadUInt32LittleEndian(buffer):X8}");
+        }
+
+        return destinationIsGds
+            ? VulkanVideoPresenter.TryWriteGds((uint)destinationAddress, buffer)
+            : ctx.Memory.TryWrite(destinationAddress, buffer);
+    }
+
     private static bool TryFillGuestMemory(
         CpuContext ctx,
         uint value,
         ulong destinationAddress,
         uint byteCount)
     {
+        // A fill targeting a GDS offset is the per-frame counter reset the game
+        // issues before it re-runs culling. Routing it here makes the reset
+        // happen for free — no cadence to guess — as the handoff predicted.
+        if (destinationAddress < VulkanVideoPresenter.GdsAddressLimit)
+        {
+            if (byteCount == 0)
+            {
+                return true;
+            }
+
+            TraceAgc(
+                $"agc.gds_fill dst=0x{destinationAddress:X4} value=0x{value:X8} " +
+                $"bytes={byteCount}");
+            return byteCount <= VulkanVideoPresenter.GdsAddressLimit &&
+                VulkanVideoPresenter.TryFillGds(
+                    (uint)destinationAddress,
+                    value,
+                    (int)byteCount);
+        }
+
         var buffer = new byte[Math.Min(byteCount, 64u * 1024u)];
         Span<byte> encoded = stackalloc byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32LittleEndian(encoded, value);

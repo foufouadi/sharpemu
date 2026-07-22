@@ -504,6 +504,16 @@ internal static unsafe class VulkanVideoPresenter
             : Math.Max(_maxPendingGuestWorkItems * 8, 4096);
     private static int _pendingPayloadGuestWorkCount;
     private static int _pendingSyncGuestWorkCount;
+    // Diagnostic: dump every SPIR-V module byte-for-byte right before it's
+    // handed to vkCreateShaderModule, numbered in creation order. Lets a
+    // validation-layer error (which names only SSA ids, not which shader)
+    // be matched back to a concrete .spv file for spirv-dis/spirv-val.
+    private static readonly bool _dumpSpirvOnCreateEnabled =
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV_ON_CREATE") == "1";
+    private static readonly string _spirvDumpDirectory =
+        Environment.GetEnvironmentVariable("SHARPEMU_SPIRV_DUMP_DIR") is { Length: > 0 } dir
+            ? dir
+            : Path.Combine(Path.GetTempPath(), "sharpemu-spirv-dump");
     // Diagnostic: skip every compute dispatch (mistranslated compute shaders
     // run long / GPU-hang and starve the present). Isolates whether the
     // geometry+composite path renders on its own.
@@ -3372,6 +3382,16 @@ internal static unsafe class VulkanVideoPresenter
             _deferredResourceDestroys = new();
         private readonly Queue<(GuestImageResource Image, ulong RetireTimeline)>
             _deferredGuestImageVersionDestroys = new();
+        // ConvertGuestImageBytesInPlace's two throwaway scratch images are
+        // referenced by a command buffer submitted via SubmitGuestCommandBuffer,
+        // which is asynchronous (returns right after vkQueueSubmit, well
+        // before the GPU finishes). Destroying them immediately in that
+        // function's `finally` block raced the GPU and validation caught it
+        // live (vkDestroyImage image-01000: image still in use by a command
+        // buffer). Defer to the same completed-timeline mechanism every other
+        // GPU-referenced resource in this file already uses.
+        private readonly Queue<(Image Image, DeviceMemory Memory, ulong RetireTimeline)>
+            _deferredScratchImageDestroys = new();
         private readonly Stack<Fence> _recycledGuestFences = new();
         private readonly Stack<CommandBuffer> _recycledGuestCommandBuffers = new();
         private readonly List<(VkBuffer Buffer, DeviceMemory Memory)> _batchRetireBuffers = new();
@@ -3764,6 +3784,7 @@ internal static unsafe class VulkanVideoPresenter
             public bool IsCpuBacked;
             public ulong CpuContentFingerprint;
             public bool SupportsStorageUsage;
+            public ImageUsageFlags CreatedUsage;
         }
 
         private readonly record struct ReinterpretedGuestImageViews(
@@ -5553,6 +5574,16 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        // Presenter-thread entry point for the GDS readback fence (see the static
+        // FlushGpuWorkForGdsReadback wrapper). FlushBatchedGuestCommands submits
+        // any command buffer still being batched so its fence is pending before
+        // we wait for every guest submission to complete.
+        internal void WaitForSubmittedGuestGpuWork()
+        {
+            FlushBatchedGuestCommands();
+            WaitForAllGuestSubmissions();
+        }
+
         private void CollectCompletedGuestSubmissions(bool waitForOldest, ulong maxWaitNs = 0)
         {
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
@@ -5819,10 +5850,24 @@ internal static unsafe class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_traceVulkanShaderEnabled)
             {
+                // Reached only when GetFenceStatus above already returned Success
+                // (the Result.NotReady branch above always returns before here),
+                // so there was no wait on this call.
+                const double waitedMs = 0.0;
                 TraceVulkanShader(
                     $"vk.queue_visibility queue={_activeGuestQueue.Name} " +
                     $"submission={_activeGuestQueue.SubmissionId} " +
-                    $"target_timeline={targetTimeline} completed_timeline={_completedTimeline}");
+                    $"target_timeline={targetTimeline} completed_timeline={_completedTimeline} " +
+                    $"pending_submissions={_pendingGuestSubmissions.Count} " +
+                    // Invariant culture: under a comma-decimal culture (e.g.
+                    // fr-FR, the default on this machine), the default
+                    // interpolation would print e.g. "380,552" for 380.552 ms --
+                    // easily misread as the English-grouped integer 380,552 with
+                    // an implied larger magnitude. This exact misreading
+                    // previously produced a false "waited 6.3 minutes"
+                    // conclusion in HIZ_INVESTIGATION.md run #2 (the real value
+                    // was ~0.38 seconds).
+                    $"waited_ms={waitedMs.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)}");
             }
 
             return true;
@@ -6247,6 +6292,14 @@ internal static unsafe class VulkanVideoPresenter
                 TraceVulkanShader(
                     $"vk.flip_retired version={imageEntry.Image.FlipVersion} " +
                     $"timeline={imageEntry.RetireTimeline} reason=presentation-dropped");
+            }
+
+            while (_deferredScratchImageDestroys.TryPeek(out var scratchEntry) &&
+                   scratchEntry.RetireTimeline <= _completedTimeline)
+            {
+                _deferredScratchImageDestroys.Dequeue();
+                _vk.DestroyImage(_device, scratchEntry.Image, null);
+                _vk.FreeMemory(_device, scratchEntry.Memory, null);
             }
         }
 
@@ -7073,8 +7126,17 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private static int _shaderModuleDumpCounter;
+
         private ShaderModule CreateShaderModule(byte[] code)
         {
+            if (_dumpSpirvOnCreateEnabled)
+            {
+                var index = Interlocked.Increment(ref _shaderModuleDumpCounter);
+                Directory.CreateDirectory(_spirvDumpDirectory);
+                File.WriteAllBytes(Path.Combine(_spirvDumpDirectory, $"module_{index:D5}.spv"), code);
+            }
+
             fixed (byte* codePointer = code)
             {
                 var createInfo = new ShaderModuleCreateInfo
@@ -7624,6 +7686,16 @@ internal static unsafe class VulkanVideoPresenter
                 for (var index = 0; index < textureCount; index++)
                 {
                     var isStorage = resources.Textures[index].IsStorage;
+                    if (isStorage && ShouldTraceVulkanResources())
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.storage_descriptor_bind " +
+                            $"addr=0x{resources.Textures[index].Address:X16} " +
+                            $"dstSelect=0x{resources.Textures[index].DstSelect:X3} " +
+                            $"view={resources.Textures[index].View.Handle:X} " +
+                            $"guestImageView={(resources.Textures[index].GuestImage?.View.Handle ?? 0):X} " +
+                            $"guestImageFormat={resources.Textures[index].GuestImage?.Format}");
+                    }
                     if (!isStorage &&
                         resources.Textures[index].Sampler.Handle == 0)
                     {
@@ -7984,7 +8056,24 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.PipelineLayoutCreateInfo,
             };
-            if (descriptorSetLayout.Handle != 0)
+            var isCompute = (stageFlags & ShaderStageFlags.ComputeBit) != 0;
+            // Compute pipelines always carry the GDS buffer as set 1 so
+            // ds_append/ds_consume shaders find their descriptor and non-GDS
+            // shaders simply leave the (harmless) set unused. Vulkan requires set
+            // 0 to be present in the array, so fall back to an empty layout when
+            // the compute shader has no set-0 bindings of its own.
+            var setLayouts = stackalloc DescriptorSetLayout[2];
+            if (isCompute)
+            {
+                EnsureGdsResources();
+                setLayouts[0] = descriptorSetLayout.Handle != 0
+                    ? descriptorSetLayout
+                    : _emptyDescriptorSetLayout;
+                setLayouts[1] = _gdsDescriptorSetLayout;
+                pipelineInfo.SetLayoutCount = 2;
+                pipelineInfo.PSetLayouts = setLayouts;
+            }
+            else if (descriptorSetLayout.Handle != 0)
             {
                 pipelineInfo.SetLayoutCount = 1;
                 pipelineInfo.PSetLayouts = &descriptorSetLayout;
@@ -7996,7 +8085,7 @@ internal static unsafe class VulkanVideoPresenter
                 Offset = 0,
                 Size = 3 * sizeof(uint),
             };
-            if ((stageFlags & ShaderStageFlags.ComputeBit) != 0)
+            if (isCompute)
             {
                 pipelineInfo.PushConstantRangeCount = 1;
                 pipelineInfo.PPushConstantRanges = &computePushConstantRange;
@@ -9264,6 +9353,11 @@ internal static unsafe class VulkanVideoPresenter
                     $"Storage scratch format {vkFormat} is unsupported for guest " +
                     $"format={texture.Format}/num={texture.NumberType}.");
             }
+            var createdUsage =
+                ImageUsageFlags.SampledBit |
+                ImageUsageFlags.StorageBit |
+                ImageUsageFlags.TransferSrcBit |
+                ImageUsageFlags.TransferDstBit;
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
@@ -9274,11 +9368,7 @@ internal static unsafe class VulkanVideoPresenter
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
-                Usage =
-                    ImageUsageFlags.SampledBit |
-                    ImageUsageFlags.StorageBit |
-                    ImageUsageFlags.TransferSrcBit |
-                    ImageUsageFlags.TransferDstBit,
+                Usage = createdUsage,
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
@@ -9337,6 +9427,7 @@ internal static unsafe class VulkanVideoPresenter
                 Memory = memory,
                 View = view,
                 SupportsStorageUsage = true,
+                CreatedUsage = createdUsage,
             };
 
             return new TextureResource
@@ -9531,9 +9622,29 @@ internal static unsafe class VulkanVideoPresenter
             var supportsAttachmentUsage =
                 supportsMutableUsage &&
                 !IsGuestTexture3D(texture.Type);
-            var supportsStorageUsage =
-                supportsMutableUsage &&
-                SupportsStorageImage(vkFormat);
+            // Same relaxation as GetOrCreateGuestImage: this image gets
+            // CreateExtendedUsageBit | CreateMutableFormatBit below whenever
+            // supportsMutableUsage is true, so STORAGE_BIT is legal as long
+            // as the storage-compatible alias (e.g. R8Unorm for R8Srgb)
+            // supports it, even if the base format doesn't. Without this, a
+            // texture first materialized here (CPU upload/sample path)
+            // before any compute pass touches it would be flagged
+            // SupportsStorageUsage=false forever, and a later compute UAV
+            // bind at the same guest address would fail even though the
+            // underlying image was created wide enough to support it. Gated
+            // on supportsMutableUsage rather than supportsAttachmentUsage:
+            // 3D textures are valid compute storage targets even though they
+            // cannot be color attachments.
+            var supportsStorageUsage = supportsMutableUsage &&
+                (SupportsStorageImage(vkFormat) ||
+                 SupportsStorageImage(GetStorageImageFormat(vkFormat)));
+            var createdUsage = supportsMutableUsage
+                ? ImageUsageFlags.TransferDstBit |
+                  ImageUsageFlags.SampledBit |
+                  (supportsAttachmentUsage ? ImageUsageFlags.ColorAttachmentBit : (ImageUsageFlags)0) |
+                  (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
+                  ImageUsageFlags.TransferSrcBit
+                : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit;
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
@@ -9547,15 +9658,7 @@ internal static unsafe class VulkanVideoPresenter
                 ArrayLayers = layers,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
-                Usage = supportsMutableUsage
-                    ? ImageUsageFlags.TransferDstBit |
-                      ImageUsageFlags.SampledBit |
-                      (supportsAttachmentUsage
-                          ? ImageUsageFlags.ColorAttachmentBit
-                          : (ImageUsageFlags)0) |
-                      (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
-                      ImageUsageFlags.TransferSrcBit
-                    : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                Usage = createdUsage,
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
@@ -9572,9 +9675,23 @@ internal static unsafe class VulkanVideoPresenter
             Check(_vk.AllocateMemory(_device, &memoryInfo, null, out var imageMemory), "vkAllocateMemory(texture)");
             Check(_vk.BindImageMemory(_device, image, imageMemory, 0), "vkBindImageMemory(texture)");
 
+            // This is the guest image's CANONICAL view and must stay
+            // identity-swizzled: it's cached as GuestImageResource.View and
+            // later reused as-is by GetOrCreateGuestImageIdentityView for
+            // compute storage-image descriptor binds from other draws, which
+            // require an identity-swizzle view
+            // (VUID-VkWriteDescriptorSet-descriptorType-00336). Baking this
+            // texture's own DstSelect into it here would silently poison
+            // every future storage bind at this address.
+            var viewUsageInfo = new ImageViewUsageCreateInfo
+            {
+                SType = StructureType.ImageViewUsageCreateInfo,
+                Usage = ClampViewUsageToFormatFeatures(vkFormat, createdUsage),
+            };
             var viewInfo = new ImageViewCreateInfo
             {
                 SType = StructureType.ImageViewCreateInfo,
+                PNext = &viewUsageInfo,
                 Image = image,
                 ViewType = GetGuestTextureViewType(
                     texture.Type,
@@ -9686,6 +9803,7 @@ internal static unsafe class VulkanVideoPresenter
                 WriteGeneration = texture.WriteGeneration,
             };
 
+            GuestImageResource? guestImage = null;
             if (texture.Address != 0 &&
                 !texture.ArrayedView &&
                 layers == 1 &&
@@ -9714,7 +9832,7 @@ internal static unsafe class VulkanVideoPresenter
                     SetDebugName(ObjectType.ImageView, canonicalView.Handle, $"{debugName} identity view");
                 }
 
-                var guestImage = new GuestImageResource
+                guestImage = new GuestImageResource
                 {
                     Address = texture.Address,
                     Width = width,
@@ -9734,6 +9852,7 @@ internal static unsafe class VulkanVideoPresenter
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
                     SupportsStorageUsage = supportsStorageUsage,
+                    CreatedUsage = createdUsage,
                 };
                 _guestImages.Add(texture.Address, guestImage);
                 resource.OwnsStorage = false;
@@ -9757,6 +9876,49 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            // 0xFAC == R,G,B,A identity DstSelect (see ToVkComponentMapping /
+            // GetOrCreateGuestImageView's default). Only when this texture
+            // actually asks for a channel remap do we need a second,
+            // separately-cached view for the sampled binding returned below.
+            const uint IdentityDstSelect = 0xFAC;
+            ImageView resourceView;
+            if (texture.DstSelect == IdentityDstSelect)
+            {
+                resourceView = view;
+            }
+            else if (guestImage is not null)
+            {
+                resourceView = GetOrCreateGuestImageView(
+                    guestImage,
+                    vkFormat,
+                    mipLevel: 0,
+                    levelCount: 1,
+                    texture.DstSelect);
+            }
+            else
+            {
+                var swizzledViewUsageInfo = new ImageViewUsageCreateInfo
+                {
+                    SType = StructureType.ImageViewUsageCreateInfo,
+                    Usage = ClampViewUsageToFormatFeatures(vkFormat, createdUsage),
+                };
+                var swizzledViewInfo = new ImageViewCreateInfo
+                {
+                    SType = StructureType.ImageViewCreateInfo,
+                    PNext = &swizzledViewUsageInfo,
+                    Image = image,
+                    ViewType = ImageViewType.Type2D,
+                    Format = vkFormat,
+                    Components = ToVkComponentMapping(texture.DstSelect),
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                Check(
+                    _vk.CreateImageView(_device, &swizzledViewInfo, null, out resourceView),
+                    "vkCreateImageView(texture swizzled)");
+                SetDebugName(ObjectType.ImageView, resourceView.Handle, $"{debugName} swizzled view");
+            }
+
+            resource.View = resourceView;
             return resource;
         }
 
@@ -11368,6 +11530,40 @@ internal static unsafe class VulkanVideoPresenter
             return (properties.OptimalTilingFeatures & FormatFeatureFlags.StorageImageBit) != 0;
         }
 
+        // Guest images are created with CreateExtendedUsageBit, which legalizes usage
+        // flags the base format doesn't natively support (e.g. STORAGE_BIT on an SRGB
+        // format) as long as a compatible sibling format supports them. But each
+        // individual VkImageView must restate, via VkImageViewUsageCreateInfo, only the
+        // usage bits its OWN format actually supports -- otherwise VUID-
+        // VkImageViewCreateInfo-usage-02275 fires for every view created with the base
+        // (unsupported) format, since it would otherwise silently inherit the image's
+        // full usage mask.
+        private ImageUsageFlags ClampViewUsageToFormatFeatures(Format viewFormat, ImageUsageFlags imageUsage)
+        {
+            _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, viewFormat, out var properties);
+            var features = properties.OptimalTilingFeatures;
+            var usage = imageUsage;
+            if ((usage & ImageUsageFlags.StorageBit) != 0 &&
+                (features & FormatFeatureFlags.StorageImageBit) == 0)
+            {
+                usage &= ~ImageUsageFlags.StorageBit;
+            }
+
+            if ((usage & ImageUsageFlags.ColorAttachmentBit) != 0 &&
+                (features & FormatFeatureFlags.ColorAttachmentBit) == 0)
+            {
+                usage &= ~ImageUsageFlags.ColorAttachmentBit;
+            }
+
+            if ((usage & ImageUsageFlags.SampledBit) != 0 &&
+                (features & FormatFeatureFlags.SampledImageBit) == 0)
+            {
+                usage &= ~ImageUsageFlags.SampledBit;
+            }
+
+            return usage;
+        }
+
         internal static Format GetTextureFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
@@ -11932,6 +12128,23 @@ internal static unsafe class VulkanVideoPresenter
                             0,
                             1,
                             &descriptorSet,
+                            0,
+                            null);
+                    }
+
+                    // Every compute pipeline layout carries the GDS buffer as
+                    // set 1 (see GetOrCreateDescriptorLayout); bind the singleton
+                    // descriptor set so ds_append/ds_consume reach it.
+                    if (_gdsDescriptorSet.Handle != 0)
+                    {
+                        var gdsSet = _gdsDescriptorSet;
+                        _vk.CmdBindDescriptorSets(
+                            _commandBuffer,
+                            PipelineBindPoint.Compute,
+                            resources.PipelineLayout,
+                            1,
+                            1,
+                            &gdsSet,
                             0,
                             null);
                     }
@@ -13999,7 +14212,17 @@ internal static unsafe class VulkanVideoPresenter
             uint depth = 1)
         {
             depth = GetGuestTextureDepth(type, depth);
-            var supportsStorageUsage = SupportsStorageImage(format);
+            // The image below is always created with CreateExtendedUsageBit |
+            // CreateMutableFormatBit, so STORAGE_BIT is legal as long as
+            // SOME format in the same Vulkan format-compatibility class
+            // supports it -- not just the base format itself. Gating on the
+            // base format alone was too conservative: e.g. R8Srgb has no
+            // storage support on most GPUs, but its unorm sibling R8Unorm
+            // (what compute UAV binds actually request, see
+            // GetStorageImageFormat) does, and the two alias the same bytes.
+            var storageCompatibleFormat = GetStorageImageFormat(format);
+            var supportsStorageUsage = SupportsStorageImage(format) ||
+                SupportsStorageImage(storageCompatibleFormat);
             if (requiresStorage && !supportsStorageUsage)
             {
                 throw new InvalidOperationException(
@@ -14254,6 +14477,14 @@ internal static unsafe class VulkanVideoPresenter
                 return retained;
             }
 
+            var createdUsage =
+                (IsGuestTexture3D(type)
+                    ? (ImageUsageFlags)0
+                    : ImageUsageFlags.ColorAttachmentBit) |
+                ImageUsageFlags.SampledBit |
+                (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
+                ImageUsageFlags.TransferSrcBit |
+                ImageUsageFlags.TransferDstBit;
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
@@ -14267,14 +14498,7 @@ internal static unsafe class VulkanVideoPresenter
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
-                Usage =
-                    (IsGuestTexture3D(type)
-                        ? (ImageUsageFlags)0
-                        : ImageUsageFlags.ColorAttachmentBit) |
-                    ImageUsageFlags.SampledBit |
-                    (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
-                    ImageUsageFlags.TransferSrcBit |
-                    ImageUsageFlags.TransferDstBit,
+                Usage = createdUsage,
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
@@ -14296,9 +14520,15 @@ internal static unsafe class VulkanVideoPresenter
             // chain once so full-chain sampled binds never read Undefined layout.
             TransitionNewGuestImageToSampled(image, mipLevels);
 
+            var viewUsageInfo = new ImageViewUsageCreateInfo
+            {
+                SType = StructureType.ImageViewUsageCreateInfo,
+                Usage = ClampViewUsageToFormatFeatures(format, createdUsage),
+            };
             var viewInfo = new ImageViewCreateInfo
             {
                 SType = StructureType.ImageViewCreateInfo,
+                PNext = &viewUsageInfo,
                 Image = image,
                 ViewType = GetGuestTextureViewType(type),
                 Format = format,
@@ -14362,6 +14592,7 @@ internal static unsafe class VulkanVideoPresenter
                 InitialRenderPass = initialRenderPass,
                 Framebuffer = framebuffer,
                 SupportsStorageUsage = supportsStorageUsage,
+                CreatedUsage = createdUsage,
             };
             var debugName = GuestImageDebugName(target, format);
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
@@ -14975,6 +15206,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             var (oldTyped, oldMemory) = CreateTransferScratchImage(fromFormat, resource.Width, resource.Height);
             var (newTyped, newMemory) = CreateTransferScratchImage(toFormat, resource.Width, resource.Height);
+            var submitted = false;
             try
             {
                 var commandBuffer = AllocateGuestCommandBuffer();
@@ -14987,12 +15219,29 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
                     "vkBeginCommandBuffer(format-convert)");
 
+                // Every OTHER GuestImageResource write path in this file (see
+                // RecordStorageImagesForWrite/RecordStorageImagesForRead,
+                // offscreen color-attachment draws, flip capture, present
+                // blit) follows the same convention: a resource that has been
+                // Initialized/InitialUploadPending is left in
+                // ShaderReadOnlyOptimal after every prior writer restores it
+                // there, and only ever transitions through General for the
+                // duration of a single recorded compute-storage bind. Hard-
+                // coding OldLayout=General here (as if this function were
+                // always called right after that storage-write window) was
+                // wrong for the common case -- a reinterpret triggered right
+                // after a normal sampled use (the actual Yotei ping-pong)
+                // finds the image in ShaderReadOnlyOptimal, and the validator
+                // catches the mismatch at the next vkQueueSubmit. Mirror the
+                // same Initialized-implies-ShaderReadOnlyOptimal convention
+                // instead of assuming General.
+                var sourceInitialized = resource.Initialized || resource.InitialUploadPending;
                 var toTransferSrc = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.MemoryWriteBit,
+                    SrcAccessMask = sourceInitialized ? AccessFlags.ShaderReadBit : 0,
                     DstAccessMask = AccessFlags.TransferReadBit,
-                    OldLayout = ImageLayout.General,
+                    OldLayout = sourceInitialized ? ImageLayout.ShaderReadOnlyOptimal : ImageLayout.Undefined,
                     NewLayout = ImageLayout.TransferSrcOptimal,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -15124,13 +15373,20 @@ internal static unsafe class VulkanVideoPresenter
                     resource.Image, ImageLayout.TransferDstOptimal,
                     1, &copyRegion);
 
-                var resourceToGeneral = new ImageMemoryBarrier
+                // Restore ShaderReadOnlyOptimal, not General: every other
+                // writer in this file leaves a GuestImageResource there (see
+                // the comment on the entry barrier above), and this function
+                // does not update resource.Initialized/InitialUploadPending,
+                // so leaving it in General here would desync the very
+                // convention the next consumer (color-attachment draw,
+                // storage bind, flip capture, present blit) relies on.
+                var resourceToShaderReadOnly = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
                     SrcAccessMask = AccessFlags.TransferWriteBit,
-                    DstAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
                     OldLayout = ImageLayout.TransferDstOptimal,
-                    NewLayout = ImageLayout.General,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = resource.Image,
@@ -15138,10 +15394,16 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit,
-                    0, 0, null, 0, null, 1, &resourceToGeneral);
+                    0, 0, null, 0, null, 1, &resourceToShaderReadOnly);
 
                 Check(_vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer(format-convert)");
                 SubmitGuestCommandBuffer(commandBuffer, [], []);
+                // SubmitGuestCommandBuffer is asynchronous (returns right
+                // after vkQueueSubmit, not after GPU completion) and just
+                // incremented _submitTimeline for this submission -- defer
+                // the scratch images' destruction until that timeline
+                // retires instead of freeing them out from under the GPU.
+                submitted = true;
 
                 if (_traceGuestImageEvents)
                 {
@@ -15155,10 +15417,21 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
-                _vk.DestroyImage(_device, oldTyped, null);
-                _vk.FreeMemory(_device, oldMemory, null);
-                _vk.DestroyImage(_device, newTyped, null);
-                _vk.FreeMemory(_device, newMemory, null);
+                if (submitted)
+                {
+                    _deferredScratchImageDestroys.Enqueue((oldTyped, oldMemory, _submitTimeline));
+                    _deferredScratchImageDestroys.Enqueue((newTyped, newMemory, _submitTimeline));
+                }
+                else
+                {
+                    // Never reached the GPU (an exception hit before/during
+                    // submit): nothing can be referencing them, safe to free
+                    // immediately.
+                    _vk.DestroyImage(_device, oldTyped, null);
+                    _vk.FreeMemory(_device, oldMemory, null);
+                    _vk.DestroyImage(_device, newTyped, null);
+                    _vk.FreeMemory(_device, newMemory, null);
+                }
             }
         }
 
@@ -15226,9 +15499,15 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            var reinterpretViewUsageInfo = new ImageViewUsageCreateInfo
+            {
+                SType = StructureType.ImageViewUsageCreateInfo,
+                Usage = ClampViewUsageToFormatFeatures(format, resource.CreatedUsage),
+            };
             var viewInfo = new ImageViewCreateInfo
             {
                 SType = StructureType.ImageViewCreateInfo,
+                PNext = &reinterpretViewUsageInfo,
                 Image = resource.Image,
                 ViewType = ImageViewType.Type2D,
                 Format = format,
@@ -15486,9 +15765,15 @@ internal static unsafe class VulkanVideoPresenter
                 return existing;
             }
 
+            var aliasViewUsageInfo = new ImageViewUsageCreateInfo
+            {
+                SType = StructureType.ImageViewUsageCreateInfo,
+                Usage = ClampViewUsageToFormatFeatures(format, resource.CreatedUsage),
+            };
             var viewInfo = new ImageViewCreateInfo
             {
                 SType = StructureType.ImageViewCreateInfo,
+                PNext = &aliasViewUsageInfo,
                 Image = resource.Image,
                 ViewType = GetGuestTextureViewType(resource.Type, arrayedView),
                 Format = format,
@@ -19256,6 +19541,35 @@ internal static unsafe class VulkanVideoPresenter
             while (_recycledDescriptorPools.TryPop(out var recycledDescriptorPool))
             {
                 _vk.DestroyDescriptorPool(_device, recycledDescriptorPool, null);
+            }
+            if (_gdsDescriptorPool.Handle != 0)
+            {
+                _vk.DestroyDescriptorPool(_device, _gdsDescriptorPool, null);
+                _gdsDescriptorPool = default;
+                _gdsDescriptorSet = default;
+            }
+            if (_gdsDescriptorSetLayout.Handle != 0)
+            {
+                _vk.DestroyDescriptorSetLayout(_device, _gdsDescriptorSetLayout, null);
+                _gdsDescriptorSetLayout = default;
+            }
+            if (_emptyDescriptorSetLayout.Handle != 0)
+            {
+                _vk.DestroyDescriptorSetLayout(_device, _emptyDescriptorSetLayout, null);
+                _emptyDescriptorSetLayout = default;
+            }
+            if (_gdsBuffer.Handle != 0)
+            {
+                if (_gdsMapped != null)
+                {
+                    _vk.UnmapMemory(_device, _gdsMemory);
+                    _gdsMapped = null;
+                }
+
+                _vk.DestroyBuffer(_device, _gdsBuffer, null);
+                _vk.FreeMemory(_device, _gdsMemory, null);
+                _gdsBuffer = default;
+                _gdsMemory = default;
             }
             foreach (var sampler in _samplers.Values)
             {

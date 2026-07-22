@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "Log directe geheugentoewijzingen en fouten naar de console.\nGebruik dit wanneer een game tijdens het opstarten afbreekt of afsluit.",
   "Options.Env.LogIo.Desc": "Log het openen en lezen van bestanden en het oplossen van paden naar de console.\nGebruik dit wanneer een game zijn databestanden niet kan vinden tijdens het opstarten.",
   "Options.Env.LogNp.Desc": "Log NP-bibliotheekaanroepen (PlayStation Network) naar de console.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Gastoppervlakken opnieuw uploaden die de eigen CPU-code van de game herschrijft.\nNormaal uit laten. Inschakelen voor titels waarvan de door de CPU getekende oppervlakken nooit het scherm bereiken.\nKost prestaties en veroorzaakt regressies in sommige titels, zoals GTA V.",
   "Common.Save": "Opslaan",
   "Common.Cancel": "Annuleren",

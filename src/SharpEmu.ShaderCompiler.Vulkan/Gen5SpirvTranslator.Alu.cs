@@ -956,6 +956,14 @@ public static partial class Gen5SpirvTranslator
                     // of the extracted field, so the result type must be signed
                     // and bitcast back for storage.
                     var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    // Every sibling _intType-producing case (VMinI32, VMed3I32,
+                    // SBfeI32, ...) bitcasts back to _uintType before returning
+                    // -- VGPR storage and the shared DPP-select epilogue below
+                    // (result vs. LoadV(destination), both expected _uintType)
+                    // assume it. This one didn't, so spirv-val rejected any
+                    // shader combining V_BFE_I32 with a DPP-controlled
+                    // instruction ("Expected both objects to be of Result
+                    // Type: Select"), silently failing vkCreateShaderModule.
                     result = Bitcast(
                         _uintType,
                         _module.AddInstruction(

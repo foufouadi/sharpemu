@@ -39,6 +39,7 @@
   "Options.Env.DumpSpirv.Desc": "Extrai os shaders AGC e suas traduções SPIR-V para a pasta shader-dumps.\nUse ao reportar bugs de shader ou renderização.",
   "Options.Env.LogDirectMemory.Desc": "Registra alocações de memória direta e falhas no console.\nUse quando um jogo aborta ou fecha durante a inicialização (boot).",
   "Options.Env.LogNp.Desc": "Registra chamadas da biblioteca NP (PlayStation Network) no console.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Recarrega as superfícies do convidado que o próprio código de CPU do jogo reescreve.\nDeixe desativado normalmente. Ative para títulos cujas superfícies desenhadas pela CPU nunca chegam à tela.\nCusta desempenho e causa regressões em alguns títulos, como GTA V.",
   "Options.Section.Emulation": "EMULAÇÃO",
   "Options.Section.Logging": "LOGS",

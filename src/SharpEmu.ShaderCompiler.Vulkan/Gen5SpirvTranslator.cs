@@ -17,6 +17,10 @@ public static partial class Gen5SpirvTranslator
     // so a smaller array is safe.
     private const uint PrivateLdsDwordCount = 2048;
     private const uint RdnaWaveLaneCount = 32;
+    // The PS5 GDS is 64 KiB, addressed by a 16-bit M0 byte offset. 64 KiB / 4
+    // bytes = 16384 dwords, a power of two so append/consume offsets can wrap
+    // cheaply with a mask. The Vulkan backend allocates a matching buffer.
+    internal const uint GdsDwordCount = 16384;
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -291,6 +295,9 @@ public static partial class Gen5SpirvTranslator
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
+        private uint _gds;
+        private uint _gdsUintPointer;
+        private uint _appendScratch;
         private uint _lds;
         private uint _ldsElementPointer;
         private uint _ldsDwordMask;
@@ -728,7 +735,10 @@ public static partial class Gen5SpirvTranslator
             if (UsesSubgroupOperations())
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniform);
-                if (UsesSubgroupShuffle())
+                // ds_append/ds_consume count the active lanes with a ballot and,
+                // in the native wave32 path, broadcast the atomic result with a
+                // subgroup shuffle. Enable both capabilities when they are used.
+                if (UsesSubgroupShuffle() || UsesAppendConsume())
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformShuffle);
                 }
@@ -738,7 +748,7 @@ public static partial class Gen5SpirvTranslator
                     _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 }
 
-                if (UsesSubgroupBroadcast() || UsesWaveControl())
+                if (UsesSubgroupBroadcast() || UsesWaveControl() || UsesAppendConsume())
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
                 }
@@ -852,6 +862,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             DeclareBuffers();
+            DeclareGds();
             DeclareImages();
             DeclareLds();
             DeclareWave64Scratch();
@@ -1000,6 +1011,64 @@ public static partial class Gen5SpirvTranslator
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, 0);
             _interfaces.Add(_globalBuffers);
         }
+
+        // The GDS (Global Data Share) is a device-wide scratch region the PS5
+        // GPU exposes to compute. Ghost of Yotei's GPU-driven culling uses
+        // ds_append against a GDS counter to publish the visible-instance count
+        // that later feeds an indirect dispatch. Model it as a single
+        // host-visible storage buffer bound in its own descriptor set (set 1,
+        // binding 0) so it never collides with the per-shader set 0 numbering,
+        // and so the CPU-side DMA path can read the counter back. The buffer is
+        // declared on every shader that emits ds_append/ds_consume; the backend
+        // binds the same physical buffer to set 1 for all compute pipelines.
+        private void DeclareGds()
+        {
+            if (!UsesAppendConsume())
+            {
+                return;
+            }
+
+            var runtimeArray = _module.TypeRuntimeArray(_uintType);
+            _module.AddDecoration(runtimeArray, SpirvDecoration.ArrayStride, sizeof(uint));
+            var block = _module.TypeStruct(runtimeArray);
+            _module.AddDecoration(block, SpirvDecoration.Block);
+            _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            var blockPointer =
+                _module.TypePointer(SpirvStorageClass.StorageBuffer, block);
+            _gdsUintPointer =
+                _module.TypePointer(SpirvStorageClass.StorageBuffer, _uintType);
+            _gds = _module.AddGlobalVariable(
+                blockPointer,
+                SpirvStorageClass.StorageBuffer);
+            _module.AddName(_gds, "gds");
+            _module.AddDecoration(_gds, SpirvDecoration.DescriptorSet, 1);
+            _module.AddDecoration(_gds, SpirvDecoration.Binding, 0);
+            _interfaces.Add(_gds);
+
+            // Per-invocation scratch used by the native wave32 append/consume
+            // path to capture the first active lane's atomic result before it is
+            // broadcast to the wave with a subgroup shuffle.
+            _appendScratch = _module.AddGlobalVariable(
+                _privateUintPointer,
+                SpirvStorageClass.Private,
+                _module.Constant(_uintType, 0));
+            _module.AddName(_appendScratch, "appendScratch");
+            _interfaces.Add(_appendScratch);
+        }
+
+        private uint GdsElementPointer(uint dwordIndex) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _gdsUintPointer,
+                _gds,
+                UInt(0),
+                // The GDS backing buffer is GdsDwordCount dwords; wrap the index
+                // to stay in bounds, mirroring the hardware's 64 KiB GDS wrap.
+                BitwiseAnd(dwordIndex, UInt(GdsDwordCount - 1)));
+
+        private bool UsesAppendConsume() =>
+            _state.Program.Instructions.Any(static instruction =>
+                instruction.Opcode is "DsAppend" or "DsConsume");
 
         private void DeclareImages()
         {
@@ -1168,6 +1237,18 @@ public static partial class Gen5SpirvTranslator
                     _subgroupInvocationIdInput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.SubgroupLocalInvocationId);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    // Subgroup ops used to be compute-only in practice (see
+                    // UsesSubgroupOperations), so this integer Input variable
+                    // never needed Flat before. Now that a real Yotei
+                    // fragment shader uses ds_swizzle_b32, the SPIR-V spec's
+                    // "integer/float fragment Input needs Flat" rule applies:
+                    // without it, spirv-val rejects the module (interpolating
+                    // an integer lane-index makes no sense anyway).
+                    _module.AddDecoration(_subgroupInvocationIdInput, SpirvDecoration.Flat);
+                }
+
                 _interfaces.Add(_subgroupInvocationIdInput);
 
                 if (_emulateWave64)
@@ -1942,6 +2023,11 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (instruction.Opcode is "DsAppend" or "DsConsume")
+            {
+                return TryEmitAppendConsume(instruction, control, out error);
+            }
+
             if (control.Gds)
             {
                 error = "GDS data share is not implemented";
@@ -2356,6 +2442,186 @@ public static partial class Gen5SpirvTranslator
             });
 
             return true;
+        }
+
+        // ds_append / ds_consume maintain a single counter in GDS (or LDS when
+        // GDS=0). Every active lane of the wave gets back the counter value from
+        // *before* this instruction, and the counter is advanced (append) or
+        // rewound (consume) by the number of active lanes. Ghost of Yotei's
+        // GPU-driven culling appends one slot per visible instance into a GDS
+        // counter that a later DMA copies into an indirect-dispatch arg. The
+        // increment therefore has to be exactly the active-lane count, applied
+        // once per wave, and the same pre-value handed to every lane.
+        private bool TryEmitAppendConsume(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count < 1)
+            {
+                error = "missing DS append/consume destination";
+                return false;
+            }
+
+            var atomicOp = instruction.Opcode == "DsAppend"
+                ? SpirvOp.AtomicIAdd
+                : SpirvOp.AtomicISub;
+
+            // The counter byte offset is M0[15:0] plus the DS OFFSET0 immediate;
+            // the counter itself is one dword. M0 is scalar register 124.
+            var byteOffset = IAdd(
+                BitwiseAnd(LoadS(124), UInt(0xFFFF)),
+                UInt(control.Offset0));
+            var dwordIndex = ShiftRightLogical(byteOffset, UInt(2));
+
+            uint pointer;
+            uint scope;
+            if (control.Gds)
+            {
+                if (_gds == 0)
+                {
+                    // Should not happen — DeclareGds keys on the same opcode —
+                    // but keep the shader valid rather than emit a dangling id.
+                    StoreV(instruction.Destinations[0].Value, UInt(0));
+                    return true;
+                }
+
+                pointer = GdsElementPointer(dwordIndex);
+                scope = 1; // Device: the GDS counter is shared across workgroups.
+            }
+            else
+            {
+                pointer = LdsPointer(byteOffset, 0);
+                scope = 2; // Workgroup.
+            }
+
+            var value = EmitFirstActiveLaneCounter(pointer, scope, atomicOp);
+            StoreV(instruction.Destinations[0].Value, value);
+            return true;
+        }
+
+        // Performs a single wave-wide counter update: the first active lane runs
+        // the atomic with the active-lane count as the operand, then the pre-value
+        // it read is broadcast to every lane. Returns 0 for lanes of an entirely
+        // inactive wave. Mirrors the structure of BroadcastFirstWave64Active for
+        // the emulated-wave64 case and uses a subgroup shuffle in native wave32.
+        private uint EmitFirstActiveLaneCounter(
+            uint pointer,
+            uint scope,
+            SpirvOp atomicOp)
+        {
+            if (_subgroupInvocationIdInput == 0)
+            {
+                // No subgroup (e.g. a graphics stage): a single logical lane.
+                var single = _module.Constant(_uintType, 0);
+                EmitExecConditional(() =>
+                {
+                    var old = EmitAtomic(
+                        atomicOp,
+                        _uintType,
+                        pointer,
+                        scope,
+                        semantics: 0,
+                        value: () => UInt(1),
+                        comparator: () => UInt(0));
+                    Store(_appendScratch, old);
+                });
+                return Load(_uintType, _appendScratch);
+            }
+
+            var lane = GuestWaveLane();
+            var mask = BooleanToWaveMask(Load(_boolType, _exec));
+            var lowMask = _module.AddInstruction(SpirvOp.UConvert, _uintType, mask);
+            var highMask = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(mask, _module.Constant64(_ulongType, 32)));
+            var hasLow = IsNotZero(lowMask);
+            var hasHigh = IsNotZero(highMask);
+            var anyActive = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                hasLow,
+                hasHigh);
+            var activeCount = IAdd(
+                _module.AddInstruction(SpirvOp.BitCount, _uintType, lowMask),
+                _module.AddInstruction(SpirvOp.BitCount, _uintType, highMask));
+            var firstLow = Ext(73, _uintType, lowMask);
+            var firstHigh = IAdd(UInt(32), Ext(73, _uintType, highMask));
+            var firstLane = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                hasLow,
+                firstLow,
+                _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    hasHigh,
+                    firstHigh,
+                    UInt(0)));
+            var isFirst = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, lane, firstLane),
+                anyActive);
+
+            uint result;
+            if (_emulateWave64)
+            {
+                // One 64-lane guest wave spans two subgroups joined by workgroup
+                // barriers, so rendezvous through the shared broadcast scratch.
+                EmitConditional(
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, lane, UInt(0)),
+                    () => Store(WaveBroadcastScratchPointer(), UInt(0)));
+                EmitWave64Barrier();
+                EmitConditional(isFirst, () =>
+                {
+                    var old = EmitAtomic(
+                        atomicOp,
+                        _uintType,
+                        pointer,
+                        scope,
+                        semantics: 0,
+                        value: () => activeCount,
+                        comparator: () => UInt(0));
+                    Store(WaveBroadcastScratchPointer(), old);
+                });
+                EmitWave64Barrier();
+                result = Load(_uintType, WaveBroadcastScratchPointer());
+                EmitWave64Barrier();
+            }
+            else
+            {
+                // Native wave32: capture the atomic result per-invocation, then
+                // pull it from the first active lane with a subgroup shuffle.
+                Store(_appendScratch, UInt(0));
+                EmitConditional(isFirst, () =>
+                {
+                    var old = EmitAtomic(
+                        atomicOp,
+                        _uintType,
+                        pointer,
+                        scope,
+                        semantics: 0,
+                        value: () => activeCount,
+                        comparator: () => UInt(0));
+                    Store(_appendScratch, old);
+                });
+                result = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3), // Subgroup scope.
+                    Load(_uintType, _appendScratch),
+                    firstLane);
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                anyActive,
+                result,
+                UInt(0));
         }
 
         // Maps the AMD atomic-op name suffix shared by buffer/image atomics to a SPIR-V opcode.
@@ -5685,10 +5951,9 @@ public static partial class Gen5SpirvTranslator
         // single-lane path historically used a cheaper whole-word non-zero test.
         // But bitwise-complement wave-mask idioms (S_NOT/S_ORN2/S_ANDN2/S_NAND/
         // S_NOR on a 64-bit mask) set the unused upper 63 bits; a whole-word test
-        // then reports "lane active" even when this lane's bit is clear. Unity's
-        // PostProcessing NaN killer does exactly this (`anyNaN | ~allFinite`),
-        // which made every valid pixel read as NaN and get replaced with 0 —
-        // zeroing the whole scene before tonemap. Extract the lane bit always.
+        // then reports "lane active" even when this lane's bit is clear (zeroing
+        // whole scenes, e.g. Unity's `anyNaN | ~allFinite` NaN killer). Extract
+        // the lane bit always. (upstream par274/sharpemu #465)
         private uint IsWaveMaskActive(uint mask) =>
             IsCurrentLaneSet(mask);
 
@@ -5732,7 +5997,15 @@ public static partial class Gen5SpirvTranslator
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
-                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32");
+                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32" or
+                    // ds_swizzle_b32 (DsSwizzleB32) emits OpGroupNonUniformShuffle
+                    // for its cross-lane read (see the Ds case ~line 2113) but
+                    // isn't a VPermlane/VReadlane/DPP instruction, so it was
+                    // missing from this capability-detection scan --
+                    // vkCreateShaderModule silently failed spirv-val
+                    // ("requires GroupNonUniformShuffle") for any shader using
+                    // it without also using AppendConsume or a covered opcode.
+                    "DsSwizzleB32");
 
         private bool UsesSubgroupBroadcast() =>
             _state.Program.Instructions.Any(instruction =>
@@ -5747,13 +6020,23 @@ public static partial class Gen5SpirvTranslator
                 instruction.Sources.Any(IsWaveMaskOperand) ||
                 instruction.Destinations.Any(IsWaveMaskOperand));
 
+        // Not restricted to Gen5SpirvStage.Compute: ds_swizzle_b32
+        // (UsesSubgroupShuffle's DsSwizzleB32 case) and other cross-lane
+        // opcodes are legal GCN/RDNA instructions in fragment shaders too --
+        // Yotei uses one in a real fragment shader (see the comment on
+        // DsSwizzleB32 above). GroupNonUniform* SPIR-V capabilities are not
+        // stage-restricted by the spec, so there is no correctness reason to
+        // gate this to compute; doing so meant any non-compute shader using
+        // these opcodes got its capability declarations silently skipped,
+        // and vkCreateShaderModule failed spirv-val with no useful indicator
+        // of which shader.
         private bool UsesSubgroupOperations() =>
-            _stage == Gen5SpirvStage.Compute &&
-            (UsesSubgroupShuffle() ||
-             UsesSubgroupBroadcast() ||
-             UsesWaveControl() ||
-             _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
+            UsesSubgroupShuffle() ||
+            UsesSubgroupBroadcast() ||
+            UsesWaveControl() ||
+            UsesAppendConsume() ||
+            _state.Program.Instructions.Any(static instruction =>
+                instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32");
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

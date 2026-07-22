@@ -1340,6 +1340,11 @@ public static class Gen5ShaderTranslator
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            // DS_APPEND/DS_CONSUME identities taken from KytyPS5 (real gfx10.3
+            // reverse-engineering) whose DS anchors match this table exactly.
+            // LLVM's AMDGPU table disagrees on 0x3E and must NOT be trusted here.
+            0x3D => "DsConsume",
+            0x3E => "DsAppend",
             0x4D => "DsWriteB64",
             0xB0 => "DsWriteAddtidB32",
             0xB1 => "DsReadAddtidB32",
@@ -2169,6 +2174,10 @@ public static class Gen5ShaderTranslator
                     // ds_read_addtid_b32 reads LDS[M0[15:0] + offset +
                     // laneId*4]; no VGPR operands, only the VDST destination.
                     "DsReadAddtidB32" => [],
+                    // ds_append/ds_consume take no source operand: the counter
+                    // offset is M0[15:0] and the wave increment is the count of
+                    // active lanes. Only the VDST destination is a real operand.
+                    "DsAppend" or "DsConsume" => [],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
                     "DsCmpstB32" or "DsCmpstRtnB32" => [
@@ -2184,7 +2193,8 @@ public static class Gen5ShaderTranslator
                 };
                 destinations = opcode switch
                 {
-                    "DsReadB32" or "DsSwizzleB32" or "DsReadAddtidB32" => [
+                    "DsReadB32" or "DsSwizzleB32" or "DsReadAddtidB32" or
+                        "DsAppend" or "DsConsume" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsRead2B32" or "DsRead2St64B32" or "DsReadB64" => [

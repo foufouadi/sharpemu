@@ -145,6 +145,7 @@
   "Options.Env.LogDirectMemory.Desc": "ダイレクトメモリの割り当てと失敗をコンソールに記録します。\nゲームが起動中に中断・終了する場合に使用してください。",
   "Options.Env.LogIo.Desc": "ファイルのオープン・読み込み・パス解決の動作をコンソールに記録します。\nゲームが起動中にデータファイルを見つけられない場合に使用してください。",
   "Options.Env.LogNp.Desc": "NP（PlayStation Network）ライブラリの呼び出しをコンソールに記録します。",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "ゲーム自身の CPU コードが書き換えるゲスト表面を再アップロードします。\n通常はオフのままにしてください。CPU で描画した表面が画面に反映されないタイトルで有効にします。\n性能を犠牲にし、GTA V など一部のタイトルでは不具合が生じます。",
   "Common.Save": "保存",
   "Common.Cancel": "キャンセル",

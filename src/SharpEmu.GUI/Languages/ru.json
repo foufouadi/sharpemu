@@ -1,4 +1,4 @@
-﻿{
+{
   "_languageName": "Русский",
 
   "Page.Library": "Библиотека",
@@ -42,6 +42,7 @@
   "Options.Env.LogDirectMemory.Desc": "Выводить в консоль выделения прямой памяти и ошибки выделения.\nИспользуйте, если игра аварийно завершает работу или закрывается при запуске.",
   "Options.Env.LogIo.Desc": "Выводить в консоль операции открытия и чтения файлов, а также разрешение путей.\nИспользуйте, если игра не может найти файлы данных при запуске.",
   "Options.Env.LogNp.Desc": "Выводить в консоль вызовы библиотеки NP (PlayStation Network).",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Повторно загружать гостевые поверхности, которые переписывает собственный код ЦП игры.\nОбычно оставляйте выключенным. Включайте для игр, чьи отрисованные ЦП поверхности не попадают на экран.\nСнижает производительность и вызывает регрессии в некоторых играх, например в GTA V.",
   "Options.Section.Emulation": "ЭМУЛЯЦИЯ",
   "Options.Section.Logging": "ЛОГГИРОВАНИЕ",

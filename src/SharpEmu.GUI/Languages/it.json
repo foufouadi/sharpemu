@@ -150,6 +150,7 @@
   "Options.Env.LogDirectMemory.Desc": "Registra in console le allocazioni di memoria diretta e i relativi errori.\nUsalo quando un gioco si interrompe o si chiude durante l'avvio.",
   "Options.Env.LogIo.Desc": "Registra in console l'apertura e la lettura dei file e la risoluzione dei percorsi.\nUsalo quando un gioco non trova i propri file di dati durante l'avvio.",
   "Options.Env.LogNp.Desc": "Registra in console le chiamate alla libreria NP (PlayStation Network).",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Ricarica le superfici guest riscritte dal codice CPU del gioco.\nLasciare disattivato normalmente. Attivare per i titoli le cui superfici disegnate dalla CPU non raggiungono mai lo schermo.\nCosta prestazioni e causa regressioni in alcuni titoli, come GTA V.",
   "Common.Save": "Salva",
   "Common.Cancel": "Annulla",

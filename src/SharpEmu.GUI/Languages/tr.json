@@ -177,6 +177,7 @@
   "Options.Env.LogDirectMemory.Desc": "Doğrudan bellek tahsislerini ve hatalarını konsola günlükle.\nBir oyun açılış sırasında çöküyor veya kapanıyorsa kullanın.",
   "Options.Env.LogIo.Desc": "Dosya açma, okuma ve yol çözümleme etkinliğini konsola günlükle.\nBir oyun açılışta veri dosyalarını bulamıyorsa kullanın.",
   "Options.Env.LogNp.Desc": "NP (PlayStation Network) kütüphane çağrılarını konsola günlükle.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Env.GuestImageCpuSync.Desc": "Oyunun kendi CPU kodunun yeniden yazdığı misafir yüzeyleri tekrar yükler.\nNormalde kapalı bırakın. CPU ile çizilen yüzeyleri ekrana ulaşmayan oyunlarda açın.\nPerformansa mal olur ve GTA V gibi bazı oyunlarda soruna yol açar.",
   "Options.DefaultProfile.Label": "Varsayilan profil adi",
   "Options.DefaultProfile.Desc": "Oyun metin girisi istediginde kullanilacak ad. Varsayilan deger Sharp'tir.",
