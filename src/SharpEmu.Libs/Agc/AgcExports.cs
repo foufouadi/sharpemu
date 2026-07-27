@@ -1816,6 +1816,14 @@ public static partial class AgcExports
     private static readonly List<DmaWriteRecord> _dmaWriteHistory = new();
     private static long _dmaWriteSequence;
     private const int DmaWriteHistoryLimit = 4096;
+    // Discriminant for the zero-dimension provenance trace above: does the
+    // producer side of the pipeline (a dispatched shader) or the consumer
+    // side (a shader rejected for reading a zeroed GDS counter) ever contain
+    // a ds_append/ds_consume instruction at all? "producer never emits it"
+    // and "producer emits it but the atomic never reaches the host buffer"
+    // are different bugs in different files -- this tells them apart before
+    // either gets a line of fix code.
+    private static readonly HashSet<ulong> _tracedDsAppendShaders = new();
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     // Unconditional (not gated behind SHARPEMU_LOG_AGC/tracePackets sampling):
     // every PM4 opcode this parser has no explicit handler for, logged once per
@@ -6752,6 +6760,46 @@ public static partial class AgcExports
 
         return $"producer={kind} bytes={write.ByteCount} copied={write.Copied} " +
                $"seq={write.Sequence} covering_writes={coveringWrites}";
+    }
+
+    /// <summary>
+    /// Logs, once per distinct shader address, whether that shader's decoded
+    /// program contains a ds_append/ds_consume instruction and at what M0
+    /// byte offsets. <paramref name="role"/> distinguishes shaders reached
+    /// via a successful dispatch from shaders identified only as the target
+    /// of a zero-dimension reject (which never actually run, so this is the
+    /// only way to see what they would have executed).
+    /// </summary>
+    private static void TraceDsAppendConsumeIfPresent(
+        ulong shaderAddress,
+        Gen5ShaderState shaderState,
+        string role)
+    {
+        lock (_submitTraceGate)
+        {
+            if (!_tracedDsAppendShaders.Add(shaderAddress))
+            {
+                return;
+            }
+        }
+
+        var sites = new List<string>();
+        foreach (var instruction in shaderState.Program.Instructions)
+        {
+            if (instruction.Opcode is not ("DsAppend" or "DsConsume"))
+            {
+                continue;
+            }
+
+            var control = instruction.Control as Gen5DataShareControl;
+            sites.Add(
+                $"{instruction.Opcode}(offset0=0x{control?.Offset0 ?? 0:X} " +
+                $"gds={control?.Gds ?? false})");
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.ds_append_scan cs=0x{shaderAddress:X10} role={role} " +
+            $"count={sites.Count} sites=[{string.Join(",", sites)}]");
     }
 
     private static void SubmitOrderedGpuSideEffect(
@@ -13545,6 +13593,7 @@ public static partial class AgcExports
                 dispatchEndY,
                 dispatchEndZ,
                 "zero-dimension",
+                ctx,
                 state);
         }
 
@@ -13716,31 +13765,54 @@ public static partial class AgcExports
         uint rawY,
         uint rawZ,
         string reason,
+        CpuContext? ctx = null,
         SubmittedDcbState? state = null)
     {
-        lock (_submitTraceGate)
+        if (_traceZeroDimProvenance)
         {
             // The dedup keeps steady-state logs readable, but it also hides
             // repeat counts -- exactly what the provenance trace needs.
-            if (_traceZeroDimProvenance)
-            {
-                var shader = state is not null &&
-                             TryGetShaderAddress(
-                                 state.ShRegisters,
-                                 ComputePgmLo,
-                                 ComputePgmHi,
-                                 out var shaderAddress)
-                    ? $"0x{shaderAddress:X10}"
-                    : "unresolved";
+            ulong shaderAddress = 0;
+            var resolvedShader = state is not null &&
+                         TryGetShaderAddress(
+                             state.ShRegisters,
+                             ComputePgmLo,
+                             ComputePgmHi,
+                             out shaderAddress);
+            var shader = resolvedShader ? $"0x{shaderAddress:X10}" : "unresolved";
 
+            lock (_submitTraceGate)
+            {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] agc.dispatch_reject.provenance source={source} " +
                     $"dims=0x{dimensionsAddress:X16} raw={rawX:X8}/{rawY:X8}/{rawZ:X8} " +
                     $"initiator=0x{initiator:X8} reason={reason} cs={shader} " +
                     $"{DescribeDmaProvenance(dimensionsAddress, 12)}");
-                return false;
             }
 
+            // The rejected dispatch never runs, so ObserveComputeDispatch never
+            // sees it -- decoding it here (outside the log lock: TryCreateState
+            // and the trace helper each take their own locks) is the only way
+            // to see whether it would have executed a ds_append/ds_consume.
+            if (resolvedShader &&
+                ctx is not null &&
+                Gen5ShaderTranslator.TryCreateState(
+                    ctx,
+                    shaderAddress,
+                    shaderHeaderAddress: 0,
+                    state!.ShRegisters,
+                    ComputeUserDataRegister,
+                    out var rejectedState,
+                    out _))
+            {
+                TraceDsAppendConsumeIfPresent(shaderAddress, rejectedState, "rejected");
+            }
+
+            return false;
+        }
+
+        lock (_submitTraceGate)
+        {
             if (_rejectedDispatchArguments.Count < 256 &&
                 _rejectedDispatchArguments.Add((dimensionsAddress, initiator, reason)))
             {
@@ -13789,6 +13861,11 @@ public static partial class AgcExports
                 out var shaderState,
                 out var error,
                 computeSystemRegisters);
+        if (createOk && _traceZeroDimProvenance)
+        {
+            TraceDsAppendConsumeIfPresent(shaderAddress, shaderState, "dispatched");
+        }
+
         var createDoneTicks = evalStartTicks != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (!createOk ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
