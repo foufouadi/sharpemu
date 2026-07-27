@@ -1792,6 +1792,30 @@ public static partial class AgcExports
         _tracedDispatchArguments = new();
     private static readonly HashSet<(ulong Address, uint Initiator, string Reason)>
         _rejectedDispatchArguments = new();
+    // SHARPEMU_TRACE_ZERO_DIM_PROVENANCE: answers where a rejected indirect
+    // dispatch read its zeroed dimensions from. The reject log alone says a
+    // dispatch found 0 work-groups but not *who was supposed to have written
+    // that number*, and the two candidate producers imply completely different
+    // bugs: a DMA whose source is a GDS offset means the ds_append visibility
+    // counter really did run and really did total zero (the culling compute is
+    // the suspect), while an address no DMA has ever touched means nothing
+    // feeds those dims at all (a missing upload path is the suspect). Also
+    // disables the reject dedup below, since "18 rejects" is only diagnostic
+    // once you know whether that is 18 sites or one site seen 18 times.
+    private static readonly bool _traceZeroDimProvenance =
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_ZERO_DIM_PROVENANCE") == "1";
+    private readonly record struct DmaWriteRecord(
+        ulong Destination,
+        ulong Source,
+        uint ByteCount,
+        bool ImmediateFill,
+        bool SourceIsGds,
+        bool Copied,
+        long Sequence);
+
+    private static readonly List<DmaWriteRecord> _dmaWriteHistory = new();
+    private static long _dmaWriteSequence;
+    private const int DmaWriteHistoryLimit = 4096;
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     // Unconditional (not gated behind SHARPEMU_LOG_AGC/tracePackets sampling):
     // every PM4 opcode this parser has no explicit handler for, logged once per
@@ -6614,6 +6638,17 @@ public static partial class AgcExports
                         immediateFill ? (uint)sourceAddress : null);
                 }
 
+                if (_traceZeroDimProvenance)
+                {
+                    RecordDmaWrite(
+                        destinationAddress,
+                        sourceAddress,
+                        byteCount,
+                        immediateFill,
+                        sourceIsGds,
+                        copied);
+                }
+
                 if (tracePacket)
                 {
                     TraceAgc(
@@ -6646,6 +6681,78 @@ public static partial class AgcExports
         (op == ItNop && register == RFlip && length >= 6) ||
         (op == ItNop && register == RDrawIndexAuto && length >= 2) ||
         (op == ItNop && register == RWaitFlipDone && length >= 3);
+
+    private static void RecordDmaWrite(
+        ulong destinationAddress,
+        ulong sourceAddress,
+        uint byteCount,
+        bool immediateFill,
+        bool sourceIsGds,
+        bool copied)
+    {
+        lock (_dmaWriteHistory)
+        {
+            // Oldest-first eviction: an indirect dispatch reads dims written
+            // earlier in the same frame, so recent history is what matters.
+            if (_dmaWriteHistory.Count >= DmaWriteHistoryLimit)
+            {
+                _dmaWriteHistory.RemoveRange(0, DmaWriteHistoryLimit / 4);
+            }
+
+            _dmaWriteHistory.Add(new DmaWriteRecord(
+                destinationAddress,
+                sourceAddress,
+                byteCount,
+                immediateFill,
+                sourceIsGds,
+                copied,
+                ++_dmaWriteSequence));
+        }
+    }
+
+    /// <summary>
+    /// Describes the most recent DMA write covering <paramref name="address"/>,
+    /// or reports that no DMA ever touched it. Used only by the zero-dimension
+    /// provenance trace.
+    /// </summary>
+    private static string DescribeDmaProvenance(ulong address, uint length)
+    {
+        DmaWriteRecord? newest = null;
+        int coveringWrites;
+        lock (_dmaWriteHistory)
+        {
+            coveringWrites = 0;
+            for (var i = _dmaWriteHistory.Count - 1; i >= 0; i--)
+            {
+                var record = _dmaWriteHistory[i];
+                if (address + length <= record.Destination ||
+                    record.Destination + record.ByteCount <= address)
+                {
+                    continue;
+                }
+
+                coveringWrites++;
+                newest ??= record;
+            }
+        }
+
+        if (newest is not { } write)
+        {
+            // "Not yet", not "never": the same range is routinely filled by a
+            // later DMA in the same run, which makes this an ordering result
+            // (dispatch consumed ahead of its producer), not a missing path.
+            return "producer=not-yet-written";
+        }
+
+        var kind = write.SourceIsGds
+            ? $"gds-offset=0x{write.Source:X4}"
+            : write.ImmediateFill
+                ? $"immediate-fill=0x{write.Source:X8}"
+                : $"guest-copy src=0x{write.Source:X16}";
+
+        return $"producer={kind} bytes={write.ByteCount} copied={write.Copied} " +
+               $"seq={write.Sequence} covering_writes={coveringWrites}";
+    }
 
     private static void SubmitOrderedGpuSideEffect(
         CpuContext ctx,
@@ -13437,7 +13544,8 @@ public static partial class AgcExports
                 dispatchEndX,
                 dispatchEndY,
                 dispatchEndZ,
-                "zero-dimension");
+                "zero-dimension",
+                state);
         }
 
         // When FORCE_START_AT_000 is clear, RDNA2 interprets the three packet
@@ -13607,10 +13715,32 @@ public static partial class AgcExports
         uint rawX,
         uint rawY,
         uint rawZ,
-        string reason)
+        string reason,
+        SubmittedDcbState? state = null)
     {
         lock (_submitTraceGate)
         {
+            // The dedup keeps steady-state logs readable, but it also hides
+            // repeat counts -- exactly what the provenance trace needs.
+            if (_traceZeroDimProvenance)
+            {
+                var shader = state is not null &&
+                             TryGetShaderAddress(
+                                 state.ShRegisters,
+                                 ComputePgmLo,
+                                 ComputePgmHi,
+                                 out var shaderAddress)
+                    ? $"0x{shaderAddress:X10}"
+                    : "unresolved";
+
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.dispatch_reject.provenance source={source} " +
+                    $"dims=0x{dimensionsAddress:X16} raw={rawX:X8}/{rawY:X8}/{rawZ:X8} " +
+                    $"initiator=0x{initiator:X8} reason={reason} cs={shader} " +
+                    $"{DescribeDmaProvenance(dimensionsAddress, 12)}");
+                return false;
+            }
+
             if (_rejectedDispatchArguments.Count < 256 &&
                 _rejectedDispatchArguments.Add((dimensionsAddress, initiator, reason)))
             {
