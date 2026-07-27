@@ -38,6 +38,23 @@ public sealed partial class DirectExecutionBackend
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
 
+	// SHARPEMU_TRACE_JOBWORKER_HLE=1: HIZ_INVESTIGATION.md's CJobManager thread
+	// (run #8-12) found the JobWorker1-10/JobWorkerLow1-10 threads pop real
+	// jobs from CJobManager::pending (confirmed via push_back live tracing)
+	// but the async completion slot they're expected to signal is never
+	// re-written. Rather than keep reading disassembly to find the exact
+	// scope of "now executing a job payload" (guesswork the project has
+	// already burned sessions on), this logs every HLE export call made by a
+	// thread whose GUEST-PROVIDED name starts with "JobWorker" -- a fact
+	// already observed live in past sessions, not a new assumption -- so any
+	// export that returns an error or is missing entirely shows up directly
+	// in the log for exactly the code path in question, without needing to
+	// bracket entry/exit by address.
+	private static readonly bool _traceJobWorkerHle = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_TRACE_JOBWORKER_HLE"),
+		"1",
+		StringComparison.Ordinal);
+
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
 		try
@@ -72,6 +89,7 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe static int RawVectoredHandlerManaged(void* exceptionInfo)
 	{
+		RecordVehRingEntry(exceptionInfo, handler: 0);
 		if (TryHandleGuestImageWriteFault(exceptionInfo))
 		{
 			return -1;
@@ -114,6 +132,79 @@ public sealed partial class DirectExecutionBackend
 	private unsafe static int RawUnhandledFilterManaged(void* exceptionInfo)
 	{
 		return TryRecoverUnresolvedSentinel(exceptionInfo);
+	}
+
+	// SHARPEMU_LOG_VEH_RING=1: HIZ_INVESTIGATION.md's UnmanagedCallersOnly fatal
+	// (unmanagedcallersonly-fatal.md) FailFasts with zero managed frames, so a
+	// post-mortem dump can never show what the crashing thread/handler was
+	// doing. This records every first-chance exception seen by the raw VEH
+	// entry (thread id, exception code, faulting RIP, timestamp) into a
+	// fixed-size preallocated ring -- plain struct-array writes, no
+	// allocation, no managed calls -- so a periodic flush (stall watchdog,
+	// every 200ms) can print "last N exceptions" even when the fatal itself
+	// gives no stack. Entry point only, not the recovery logic below.
+	private struct VehRingEntry
+	{
+		public long Ticks;
+		public uint ThreadId;
+		public uint ExceptionCode;
+		public ulong Rip;
+		public byte Handler;
+	}
+
+	private static readonly bool _logVehRing = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_LOG_VEH_RING"),
+		"1",
+		StringComparison.Ordinal);
+	private const int VehRingCapacity = 512;
+	private static readonly VehRingEntry[] _vehRing = new VehRingEntry[VehRingCapacity];
+	private static long _vehRingWriteIndex = -1;
+	private static long _vehRingFlushedIndex = -1;
+
+	private unsafe static void RecordVehRingEntry(void* exceptionInfo, byte handler)
+	{
+		if (!_logVehRing)
+		{
+			return;
+		}
+		EXCEPTION_RECORD* exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
+		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
+		long slot = Interlocked.Increment(ref _vehRingWriteIndex);
+		ref var entry = ref _vehRing[(int)(slot % VehRingCapacity)];
+		entry.Ticks = Stopwatch.GetTimestamp();
+		entry.ThreadId = GetCurrentThreadId();
+		entry.ExceptionCode = exceptionRecord->ExceptionCode;
+		entry.Rip = contextRecord != null ? ReadCtxU64(contextRecord, 248) : 0uL;
+		entry.Handler = handler;
+	}
+
+	// Called from the 200ms stall-watchdog tick (DirectExecutionBackend.cs).
+	// Prints only entries written since the last flush; safe from a normal
+	// host thread (not a VEH callback), so no reverse-P/Invoke risk here.
+	private static void FlushVehRing()
+	{
+		if (!_logVehRing)
+		{
+			return;
+		}
+		long writeIndex = Volatile.Read(ref _vehRingWriteIndex);
+		long flushedIndex = _vehRingFlushedIndex;
+		if (writeIndex <= flushedIndex)
+		{
+			return;
+		}
+		long start = Math.Max(flushedIndex + 1, writeIndex - VehRingCapacity + 1);
+		double frequency = Stopwatch.Frequency;
+		long now = Stopwatch.GetTimestamp();
+		for (long i = start; i <= writeIndex; i++)
+		{
+			var entry = _vehRing[(int)(i % VehRingCapacity)];
+			double agoMs = (now - entry.Ticks) / frequency * 1000.0;
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] veh_ring handler={(entry.Handler == 0 ? "raw" : "vectored")} " +
+				$"tid={entry.ThreadId} code=0x{entry.ExceptionCode:X8} rip=0x{entry.Rip:X16} ago_ms={agoMs:F1}");
+		}
+		_vehRingFlushedIndex = writeIndex;
 	}
 
 	private unsafe static int TryRecoverUnresolvedSentinel(void* exceptionInfo)
@@ -618,6 +709,50 @@ public sealed partial class DirectExecutionBackend
 			finally
 			{
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
+			}
+			if (_traceJobWorkerHle &&
+				_activeGuestThreadState is { } jobWorkerThreadState &&
+				jobWorkerThreadState.Name.StartsWith("JobWorker", StringComparison.Ordinal))
+			{
+				var exportLabel = importStubEntry.Export is { } tracedExport
+					? $"{tracedExport.LibraryName}:{tracedExport.Name}"
+					: "<unresolved>";
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] JobWorkerHle t={ElapsedSecondsSinceBoot():F3}s thread='{jobWorkerThreadState.Name}' " +
+					$"nid={importStubEntry.Nid} export={exportLabel} resolved={dispatchResolved} " +
+					$"result={orbisGen2Result} rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16}");
+				if (string.Equals(importStubEntry.Nid, "Yw0jKSqop+E", StringComparison.Ordinal))
+				{
+					// sceAgcDcbDrawIndexAuto specifically: this is the one HLE
+					// call a JobWorker makes that actually emits a draw, and
+					// every observed instance caps at rsi=0x18 (24 vertices,
+					// matching the long-standing "no draw >24 vertices"
+					// finding). caller_return=num7 plus an rbp walk from HERE
+					// (the guest's OWN rbp, not ours) identifies the game code
+					// that chose that count, without guessing from disassembly.
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] JobWorkerDrawIndexAuto caller_return=0x{num7:X16}");
+					var frame = cpuContext[CpuRegister.Rbp];
+					for (var depth = 0; depth < 16 && frame >= 0x10000; depth++)
+					{
+						if (!TryReadGuestU64(cpuContext, frame + 8, out var returnRip) ||
+							!TryReadGuestU64(cpuContext, frame, out var nextFrame))
+						{
+							break;
+						}
+
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] JobWorkerDrawIndexAuto   frame[{depth}] rbp=0x{frame:X16} ret=0x{returnRip:X16}");
+						if (nextFrame <= frame)
+						{
+							break;
+						}
+
+						frame = nextFrame;
+					}
+				}
+
+				Console.Error.Flush();
 			}
 			if (Volatile.Read(ref _pendingGuestExceptionCount) != 0)
 			{

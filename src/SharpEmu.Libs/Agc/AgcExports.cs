@@ -136,20 +136,33 @@ public static partial class AgcExports
     //
     // WHY IT'S STILL BEHIND A FLAG: the *cause* above is a general AGC
     // contract gap, not Yotei-specific, but the *compensating mechanism*
-    // below has only ever run against Ghost of Yotei, and one of its safety
+    // below has only ever run against Ghost of Yotei. One of its safety
     // fixes (c810f1e) left a residual risk on record, deliberately not
-    // closed: "non-flip side-effecting packets (write_data increments,
-    // draws) reached via the orphan path before the real queue's natural
-    // parse can still theoretically execute twice. Not observed to cause
-    // visible corruption in these runs... does not close it structurally."
+    // closed at the time: "non-flip side-effecting packets (write_data
+    // increments, draws) reached via the orphan path before the real
+    // queue's natural parse can still theoretically execute twice."
+    //
+    // CLOSED 2026-07-26 (this session): _orphanSubmittedRanges +
+    // ClipRealSubmissionAgainstOrphanSubmissions now clip DriverSubmitDcb/
+    // Acb's own submitted range against everything the orphan mechanism
+    // already executed, symmetric to how SubmitOrphanSliceClipped already
+    // clipped orphan candidates against _gameSubmittedRanges. Verified live:
+    // the exact scenario the comment above warned about — ring
+    // 0x201160C000 (mentioned by name in the game-submitted-range comment
+    // below) — hit the new guard and had its already-executed prefix
+    // skipped instead of re-parsed (`agc.orphan_submission_reexecution_
+    // avoided`), with no new crash signature and the full test suite
+    // (380/380) still green.
+    //
     // Every other safety rule here (cursor-bounded submission, vtable-class
     // gating, game-submitted-range exclusion, force-submitted flips never
     // presenting) was added in response to a real crash observed live on
-    // THIS title. Until the mechanism has run clean against a second title
-    // (or the residual risk above is closed structurally), do not remove
-    // this gate or make it unconditional — promote the flag's default only
-    // after that broader validation, not on the strength of the causal
-    // finding alone.
+    // THIS title. Until the mechanism has run clean against a second title,
+    // do not remove this gate or make it unconditional — promote the flag's
+    // default only after that broader validation, not on the strength of
+    // the causal finding alone. The residual double-execution risk is now
+    // closed; the remaining reason to keep it opt-in is single-title
+    // validation, not an open correctness gap.
     //
     // This tracks every sceAgcCbReleaseMem target address -> its ring
     // header, and whenever GpuWaitRegistry shows a stall on a tracked
@@ -400,6 +413,32 @@ public static partial class AgcExports
     // away, stalling the main thread's frame gate forever).
     private static readonly Dictionary<ulong, (ulong End, long Seq)> _gameSubmittedRanges = new();
     private static long _orphanTrackSequence;
+
+    // Symmetric counterpart to _gameSubmittedRanges above, closing the
+    // residual double-execution risk left on record in the
+    // SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES banner comment: "non-flip
+    // side-effecting packets... reached via the orphan path before the real
+    // queue's natural parse can still theoretically execute twice." That
+    // happens when a ring the orphan mechanism speculatively force-submits
+    // (because a stall matched one of its labels) is LATER submitted for
+    // real by the game itself (DriverSubmitDcb/Acb) once it reaches that
+    // point in its own control flow — the real submit's parse would then
+    // walk the same bytes a second time, double-firing every release_mem
+    // and increment=True write_data packet in the overlap (observed
+    // elsewhere in this file to silently corrupt exactly those counters).
+    // Byte ranges the orphan mechanism has already executed, keyed by
+    // absolute start address; DriverSubmitDcb/Acb clip their own submitted
+    // range against this before parsing (ClipRangeAgainstOrphanSubmissions).
+    // Same (End, Seq) shape and the same staleness hazard as
+    // _gameSubmittedRanges: ring pages are reused frame after frame, so an
+    // orphan range recorded against lap N of an arena must not clip lap N+1's
+    // fresh content once the builder has overwritten it. Rather than
+    // maintaining a parallel lap-sequence comparison for the clip side (the
+    // real-submit path has no lap number of its own to compare against),
+    // entries are purged eagerly the moment TrackCbReleaseMemTarget detects
+    // the owning arena has moved on — the same, already-safe checkpoint that
+    // computes closedBase/closedEnd below, not a new per-packet hook.
+    private static readonly Dictionary<ulong, (ulong End, long Seq)> _orphanSubmittedRanges = new();
     // First tracked packet of each (builder header, arena base) lap; game
     // ranges recorded before this sequence belong to a previous lap of the
     // arena and must not clip its current content.
@@ -816,6 +855,32 @@ public static partial class AgcExports
                         _orphanPreambleClosedSlices.Add(
                             (commandBufferAddress, closedBase, closedStart, closedEnd));
                     }
+
+                    // The builder is about to overwrite [closedBase, closedEnd)
+                    // with a new lap's content (or has already moved past it to
+                    // a new arena entirely). Any range recorded in
+                    // _orphanSubmittedRanges within that span describes bytes
+                    // this same memory used to hold, not what it holds now —
+                    // keeping it would wrongly clip fresh packets a later real
+                    // submission needs to execute (the exact "closed slice
+                    // wrongly empty" failure class documented on
+                    // _gameSubmittedRanges above, mirrored onto this map).
+                    if (closedEnd > closedBase)
+                    {
+                        var staleKeys = new List<ulong>();
+                        foreach (var (rangeStart, _) in _orphanSubmittedRanges)
+                        {
+                            if (rangeStart >= closedBase && rangeStart < closedEnd)
+                            {
+                                staleKeys.Add(rangeStart);
+                            }
+                        }
+
+                        foreach (var staleKey in staleKeys)
+                        {
+                            _orphanSubmittedRanges.Remove(staleKey);
+                        }
+                    }
                 }
 
                 if (!hadSeen || seen.Base != arenaBase)
@@ -947,6 +1012,16 @@ public static partial class AgcExports
             }
         }
 
+        // Targets whose header(s) were transiently unreadable this pass:
+        // re-queued after the loop (not inline) so a single unlucky read at
+        // t=X doesn't get retried microseconds later on the exact same guest
+        // memory state — it needs a later DrainPendingOrphanPreambles call
+        // (real wall-clock time) to have any chance of resolving (observed
+        // live: label 0x20118C82E0's header 0x8044CEC08 failed once at
+        // t=21.0s and was silently dropped forever afterward — the "will
+        // retry" comment on the unreadable branch was aspirational, nothing
+        // actually re-added it to the pending list).
+        List<ulong>? retryTargets = null;
         while (true)
         {
             ulong targetAddress;
@@ -955,7 +1030,7 @@ public static partial class AgcExports
             {
                 if (_orphanPreamblePendingTargets.Count == 0)
                 {
-                    return;
+                    break;
                 }
 
                 targetAddress = _orphanPreamblePendingTargets[0];
@@ -974,9 +1049,18 @@ public static partial class AgcExports
                     : Array.Empty<ulong>();
             }
 
+            var anyUnreadable = false;
             foreach (var headerAddress in pendingHeaders)
             {
-                ForceSubmitOrphanPreambleHeader(ctx, gpuState, headerAddress, targetAddress);
+                if (!ForceSubmitOrphanPreambleHeader(ctx, gpuState, headerAddress, targetAddress))
+                {
+                    anyUnreadable = true;
+                }
+            }
+
+            if (anyUnreadable)
+            {
+                (retryTargets ??= new List<ulong>()).Add(targetAddress);
             }
 
             if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks)
@@ -984,7 +1068,21 @@ public static partial class AgcExports
                 // targetAddress is fully processed (all its headers ran); any
                 // targets still in _orphanPreamblePendingTargets stay queued
                 // for the next iteration.
-                return;
+                break;
+            }
+        }
+
+        if (retryTargets is { Count: > 0 })
+        {
+            lock (_orphanPreambleGate)
+            {
+                foreach (var targetAddress in retryTargets)
+                {
+                    if (!_orphanPreamblePendingTargets.Contains(targetAddress))
+                    {
+                        _orphanPreamblePendingTargets.Add(targetAddress);
+                    }
+                }
             }
         }
     }
@@ -1034,7 +1132,13 @@ public static partial class AgcExports
         }
     }
 
-    private static void ForceSubmitOrphanPreambleHeader(
+    // Returns false only for the transient "unreadable at trigger time" case
+    // (header fields not readable yet) — the caller re-queues the target for
+    // another attempt once real wall-clock time has passed. Every other exit
+    // path (submitted, permanently-skipped wrong class, nothing new to send)
+    // is a resolved outcome and returns true so the target isn't retried
+    // forever for no reason.
+    private static bool ForceSubmitOrphanPreambleHeader(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         ulong headerAddress,
@@ -1057,14 +1161,14 @@ public static partial class AgcExports
             {
                 if (!_orphanPreambleUnreadableLogged.Add(headerAddress))
                 {
-                    return;
+                    return false;
                 }
             }
 
             Console.Error.WriteLine(
                 $"[LOADER][WARN] agc.orphan_preamble_skip header=0x{headerAddress:X16} " +
                 $"target=0x{targetAddress:X16} (unreadable at trigger time; will retry)");
-            return;
+            return false;
         }
 
         if (!IsKnownBuilderVtable(vtable))
@@ -1074,7 +1178,7 @@ public static partial class AgcExports
                 if (_orphanPreambleSubmitted.TryGetValue(headerAddress, out var seen) &&
                     seen.Base == 0)
                 {
-                    return;
+                    return true;
                 }
 
                 _orphanPreambleSubmitted[headerAddress] = (0, 0, 0);
@@ -1083,7 +1187,7 @@ public static partial class AgcExports
             Console.Error.WriteLine(
                 $"[LOADER][WARN] agc.orphan_preamble_skip header=0x{headerAddress:X16} " +
                 $"target=0x{targetAddress:X16} vtable=0x{vtable:X16} (not an orphan builder class)");
-            return;
+            return true;
         }
 
         // Arena-switch closures are normally staged by TrackCbReleaseMemTarget
@@ -1150,7 +1254,7 @@ public static partial class AgcExports
         {
             // Readable but empty right now — leave it unmarked so a later
             // re-scan picks it up once the game has written content.
-            return;
+            return true;
         }
 
         // The per-frame fence write (game function 0x800AB4A30) is stored by
@@ -1171,7 +1275,7 @@ public static partial class AgcExports
             {
                 if (last.Base == 0)
                 {
-                    return; // permanently skipped
+                    return true; // permanently skipped
                 }
 
                 if (last.Base == commandAddress &&
@@ -1180,7 +1284,7 @@ public static partial class AgcExports
                 {
                     if (extendedEnd == cursor)
                     {
-                        return; // no new content since the last slice
+                        return true; // no new content since the last slice
                     }
 
                     // Extension-only delta: the header cursor is unchanged,
@@ -1221,6 +1325,7 @@ public static partial class AgcExports
             extendedEnd,
             targetAddress,
             minimumRangeSequence: lapSequence);
+        return true;
     }
 
     // One 64KB builder arena can host BOTH content the game submits itself
@@ -1283,6 +1388,77 @@ public static partial class AgcExports
             SubmitOrphanSlice(ctx, gpuState, headerAddress, sliceStart, segmentEnd, targetAddress);
             sliceStart = segmentEnd;
         }
+    }
+
+    // Reverse direction of the clip above: called from DriverSubmitDcb/Acb
+    // (the game's OWN real submission), this splits [commandAddress,
+    // commandAddress + dwordCount*4) into the sub-ranges NOT already executed
+    // via the orphan-preamble path, so a ring the orphan mechanism
+    // speculatively force-submitted earlier does not have its packets parsed
+    // and side-effected a second time once the game reaches its own normal
+    // submit call for the same bytes. A no-op (returns the whole range
+    // unsplit) whenever _orphanSubmittedRanges is empty — true for every run
+    // without SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES=1 and for any title where
+    // the orphan mechanism never had to force-submit anything, so this adds
+    // one dictionary check to the hot submit path and nothing else.
+    private static List<(ulong Start, ulong End)> ClipRealSubmissionAgainstOrphanSubmissions(
+        ulong commandAddress,
+        uint dwordCount)
+    {
+        var end = commandAddress + (ulong)dwordCount * 4;
+        var segments = new List<(ulong Start, ulong End)>();
+        var sliceStart = commandAddress;
+        lock (_orphanPreambleGate)
+        {
+            if (_orphanSubmittedRanges.Count == 0)
+            {
+                segments.Add((commandAddress, end));
+                return segments;
+            }
+
+            while (sliceStart < end)
+            {
+                // Skip forward past any orphan-executed range covering
+                // sliceStart (mirrors SubmitOrphanSliceClipped's game-range
+                // skip loop above, same reason: a range can span more than
+                // one overlap once skipped forward).
+                var advanced = true;
+                while (advanced)
+                {
+                    advanced = false;
+                    foreach (var (rangeStart, range) in _orphanSubmittedRanges)
+                    {
+                        if (sliceStart >= rangeStart && sliceStart < range.End)
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] agc.orphan_submission_reexecution_avoided " +
+                                $"addr=0x{sliceStart:X16} orphan_range=0x{rangeStart:X16}-0x{range.End:X16}");
+                            sliceStart = range.End;
+                            advanced = true;
+                        }
+                    }
+                }
+
+                if (sliceStart >= end)
+                {
+                    break;
+                }
+
+                var segmentEnd = end;
+                foreach (var (rangeStart, _) in _orphanSubmittedRanges)
+                {
+                    if (rangeStart > sliceStart && rangeStart < segmentEnd)
+                    {
+                        segmentEnd = rangeStart;
+                    }
+                }
+
+                segments.Add((sliceStart, segmentEnd));
+                sliceStart = segmentEnd;
+            }
+        }
+
+        return segments;
     }
 
     // Submits every known builder's fresh current-arena content, without
@@ -1393,6 +1569,16 @@ public static partial class AgcExports
             $"[LOADER][WARN] agc.orphan_preamble_force_submit header=0x{headerAddress:X16} " +
             $"command=0x{sliceStart:X16} dwords={dwordCount} targetLabel=0x{targetAddress:X16} " +
             $"owner={owner}");
+
+        // Record what we are ABOUT to execute, not after DrainResumableDcbs
+        // returns: a game submission racing in on another thread must see this
+        // range as already-orphan-executed as soon as the interpreter can
+        // possibly have touched it, not after this whole (potentially
+        // recursive, cascade-triggering) call unwinds.
+        lock (_orphanPreambleGate)
+        {
+            _orphanSubmittedRanges[sliceStart] = (sliceEnd, ++_orphanTrackSequence);
+        }
 
         var gateAcquireTicks = _timeWaitMonitorEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         lock (gpuState.Gate)
@@ -1638,6 +1824,198 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+
+    // Opt-in: SHARPEMU_TRACE_SH_REGISTER_DESCRIPTOR_BASE=0x.... Run #51
+    // (HIZ_INVESTIGATION.md) found the T# descriptor for 0x5052BA0000 arrives
+    // via COMPUTE_USER_DATA (initial scalar registers at dispatch entry), not
+    // an SLoadDword the shader executes itself -- so there is no "table slot"
+    // to watch. The bytes must instead be assembled by the CPU into a
+    // SetShRegister packet before the dispatch; this runs entirely as normal
+    // managed code inside the HLE export that builds that packet (no VEH, no
+    // hardware breakpoint, no corrupted-state-exception risk -- every guest
+    // read here already happens on this exact path), scanning the values
+    // being written for an 8-dword window that decodes to the target address,
+    // and printing a full frame-pointer backtrace when one is found. rbp still
+    // belongs to the CALLER at this export's entry (the trampoline has not
+    // pushed a frame of its own), so the walk starts from the caller
+    // immediately, same convention as agc.dispatch_caller_trace above.
+    private static readonly ulong _traceShRegisterDescriptorBase = ParseTraceShRegisterDescriptorBase();
+
+    private static ulong ParseTraceShRegisterDescriptorBase()
+    {
+        var spec = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_SH_REGISTER_DESCRIPTOR_BASE");
+        if (string.IsNullOrWhiteSpace(spec))
+        {
+            return 0;
+        }
+
+        var text = spec.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? spec[2..] : spec;
+        return ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address)
+            ? address
+            : 0;
+    }
+
+    private static void TraceShRegisterDescriptorIfMatched(
+        CpuContext ctx,
+        ulong commandBufferAddress,
+        uint offset,
+        ulong valuesAddress,
+        uint valueCount)
+    {
+        if (_traceShRegisterDescriptorBase == 0 || valuesAddress == 0 || valueCount < 4)
+        {
+            return;
+        }
+
+        var values = new uint[valueCount];
+        for (var i = 0u; i < valueCount; i++)
+        {
+            if (!TryReadUInt32(ctx, valuesAddress + (i * sizeof(uint)), out values[i]))
+            {
+                return;
+            }
+        }
+
+        TraceShRegisterDescriptorIfMatched(ctx, commandBufferAddress, offset, values);
+    }
+
+    private static void TraceShRegisterDescriptorIfMatched(
+        CpuContext ctx,
+        ulong commandBufferAddress,
+        uint offset,
+        uint[] values)
+    {
+        if (_traceShRegisterDescriptorBase == 0 || values.Length < 4)
+        {
+            return;
+        }
+
+        // A T# is 8 dwords, a V# is 4; scan every window of both sizes rather
+        // than assuming this range's alignment, since offset (the SH register
+        // index) does not by itself say which resource type starts here.
+        for (var windowSize = 4; windowSize <= 8; windowSize += 4)
+        {
+            for (var start = 0; start + windowSize <= values.Length; start++)
+            {
+                var window = values.AsSpan(start, windowSize).ToArray();
+                var matches = windowSize == 8
+                    ? TryDecodeTextureDescriptor(window, out var texture) && texture.Address == _traceShRegisterDescriptorBase
+                    : TryDecodeBufferDescriptorBaseAddress(window, out var bufferBase) && bufferBase == _traceShRegisterDescriptorBase;
+                if (!matches)
+                {
+                    continue;
+                }
+
+                var frames = new List<string>();
+                if (TryReadUInt64(ctx, ctx[CpuRegister.Rsp], out var returnAddress))
+                {
+                    frames.Add($"ret0=0x{returnAddress:X16}");
+                }
+
+                var frameBase = ctx[CpuRegister.Rbp];
+                for (var depth = 0; depth < 12 && frameBase != 0; depth++)
+                {
+                    if (!TryReadUInt64(ctx, frameBase + 8, out var frameReturn) ||
+                        !TryReadUInt64(ctx, frameBase, out var nextFrameBase))
+                    {
+                        break;
+                    }
+
+                    frames.Add($"rbp{depth}=0x{frameReturn:X16}");
+                    if (nextFrameBase <= frameBase)
+                    {
+                        break;
+                    }
+
+                    frameBase = nextFrameBase;
+                }
+
+                Console.Error.WriteLine(
+                    $"[LOADER][ERROR] agc.sh_register_descriptor_match buf=0x{commandBufferAddress:X16} " +
+                    $"offset=0x{offset:X} window_start={start} window_dwords={windowSize} " +
+                    $"t={TraceSeconds()} " + string.Join(' ', frames));
+                Console.Error.Flush();
+            }
+        }
+    }
+
+    // Base-address-only decode of a V# (raw buffer) descriptor, for the
+    // 4-dword scan above -- mirrors the base-address bits TryDecodeTexture
+    // Descriptor already extracts for T#, without needing stride/records here.
+    private static bool TryDecodeBufferDescriptorBaseAddress(uint[] words, out ulong baseAddress)
+    {
+        baseAddress = 0;
+        if (words.Length < 4)
+        {
+            return false;
+        }
+
+        baseAddress = words[0] | ((ulong)(words[1] & 0xFF) << 32);
+        return baseAddress != 0;
+    }
+
+    // Cross-assembly hook for SHARPEMU_WATCH_HIZ_SOURCE_WRITE_DYNAMIC
+    // (DirectExecutionBackend, SharpEmu.Core): SharpEmu.Libs cannot reference
+    // SharpEmu.Core (the ProjectReference already runs Core -> Libs), so
+    // DirectExecutionBackend subscribes a delegate here instead of being
+    // called directly. Invoked from TraceImageDescriptorSourceIfMatched
+    // below the first time a table_slot resolves for the traced base
+    // address, so a page-guard watch can be armed on the address actually
+    // used THIS run (HIZ_INVESTIGATION.md run #53: fixed pre-launch
+    // addresses are worthless -- the arena allocator hands out a different
+    // slot every launch).
+    public static Action<ulong>? DynamicImageDescriptorSlotDiscovered;
+
+    // Image-descriptor counterpart of Gen5ShaderScalarEvaluator's
+    // SHARPEMU_TRACE_DESCRIPTOR_BASE: that one only fires for raw-buffer (V#)
+    // reads inside the scalar evaluator, so a T# (image/texture) binding never
+    // trips it even though the same "which guest memory slot handed us this
+    // descriptor" question applies. Reports the same table_slot via
+    // Gen5ShaderScalarEvaluator.TryGetLastScalarLoadSourceAddress, keyed on
+    // Gen5ImageBinding.Control.ScalarResource, from the two sites that already
+    // decode every image binding's address (compute dispatch + draw).
+    private static readonly ulong _traceImageDescriptorBaseAddress = ParseTraceImageDescriptorBaseAddress();
+
+    private static ulong ParseTraceImageDescriptorBaseAddress()
+    {
+        var spec = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_IMAGE_DESCRIPTOR_BASE");
+        if (string.IsNullOrWhiteSpace(spec))
+        {
+            return 0;
+        }
+
+        var text = spec.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? spec[2..] : spec;
+        return ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address)
+            ? address
+            : 0;
+    }
+
+    private static void TraceImageDescriptorSourceIfMatched(
+        TextureDescriptor texture,
+        Gen5ImageBinding binding,
+        string context)
+    {
+        if (_traceImageDescriptorBaseAddress == 0 || texture.Address != _traceImageDescriptorBaseAddress)
+        {
+            return;
+        }
+
+        var tableSlot = Gen5ShaderScalarEvaluator.TryGetLastScalarLoadSourceAddress(
+            binding.Control.ScalarResource,
+            out var slotAddress)
+            ? $"0x{slotAddress:X16}"
+            : "unknown (thread mismatch or not loaded via SLoadDword this evaluation)";
+        if (slotAddress != 0)
+        {
+            DynamicImageDescriptorSlotDiscovered?.Invoke(slotAddress);
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.image_descriptor_source context={context} " +
+            $"base=0x{texture.Address:X16} pc=0x{binding.Pc:X} opcode={binding.Opcode} " +
+            $"s{binding.Control.ScalarResource} table_slot={tableSlot}");
+        Console.Error.Flush();
+    }
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -2270,6 +2648,7 @@ public static partial class AgcExports
         }
 
         TraceCreateShader(destinationAddress, headerAddress, codeAddress, "ok");
+        TraceShaderCallerIfMatch(ctx, codeAddress);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -2906,6 +3285,135 @@ public static partial class AgcExports
         return (int)ctx[CpuRegister.Rax];
     }
 
+    // Yotei Hi-Z investigation, one level removed: the copy kernel
+    // (cs=0x8000410100) that's SUPPOSED to populate the Hi-Z source buffer
+    // (0x50050C0000) is confirmed to actually run periodically (~every 10s,
+    // group signature 2560x1x1) -- but its source is confirmed still empty
+    // every time (twice now, independent runs: a 20-minute CPU memory poll
+    // and this session's live GPU dispatch trace). sceAgcCbDispatch doesn't
+    // carry the shader address (bound separately via
+    // sceAgcCbSetShRegistersDirect), so filtering on the dispatch's own
+    // group-count signature is the only cheap way to identify the *caller*
+    // of this specific recurring dispatch without decoding SH register
+    // writes. Same pattern as TraceShaderCallerIfMatch (synchronous guest
+    // HLE call, real caller stack, no VEH). Opt-in:
+    // SHARPEMU_TRACE_DISPATCH_GROUPS=X,Y,Z (e.g. 2560,1,1).
+    private static readonly (uint X, uint Y, uint Z)? _traceDispatchGroups = ParseDispatchGroupsFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DISPATCH_GROUPS"));
+
+    private static (uint, uint, uint)? ParseDispatchGroupsFilter(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec))
+        {
+            return null;
+        }
+
+        var parts = spec.Split(',');
+        if (parts.Length != 3 ||
+            !uint.TryParse(parts[0], out var x) ||
+            !uint.TryParse(parts[1], out var y) ||
+            !uint.TryParse(parts[2], out var z))
+        {
+            return null;
+        }
+
+        return (x, y, z);
+    }
+
+    private static long _dispatchGroupsCallerHitCount;
+
+    private static void TraceDispatchCallerIfMatch(CpuContext ctx, uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        if (_traceDispatchGroups is not { } target ||
+            groupCountX != target.X ||
+            groupCountY != target.Y ||
+            groupCountZ != target.Z ||
+            Interlocked.Increment(ref _dispatchGroupsCallerHitCount) > 20)
+        {
+            return;
+        }
+
+        // The caller's gate (radare2, static): rax1=[rbx+0x38], rax2=[rax1+0x28],
+        // then `test byte [rax2+0x10], 1; je skip` decides whether this exact
+        // dispatch even happens. rbx is callee-saved in the guest's own ABI,
+        // so it still holds the caller's "this" pointer here at CbDispatch's
+        // entry (before its own prologue runs) -- resolving it now tells us
+        // the CONCRETE guest address of that gate byte for this run, so a
+        // future session can watch/poll it directly instead of re-deriving
+        // it from a fresh backtrace each time.
+        var gateThis = ctx[CpuRegister.Rbx];
+        var gateDescription = "unresolved";
+        ulong gateRax1 = 0;
+        ulong gateRax2 = 0;
+        if (TryReadUInt64(ctx, gateThis + 0x38, out gateRax1) &&
+            TryReadUInt64(ctx, gateRax1 + 0x28, out gateRax2))
+        {
+            var gateByteAddress = gateRax2 + 0x10;
+            gateDescription = TryReadUInt32(ctx, gateByteAddress, out var gateDword)
+                ? $"this=0x{gateThis:X16} gate_addr=0x{gateByteAddress:X16} gate_value=0x{gateDword:X8} bit0={gateDword & 1}"
+                : $"this=0x{gateThis:X16} gate_addr=0x{gateByteAddress:X16} gate_value=unreadable";
+        }
+
+        // Read the actual live object content instead of guessing the layout
+        // from static disassembly alone -- this=rbx, its +0x38 pointer, and
+        // that object's +0x28 pointer (the one whose +0x10 holds the gate
+        // byte) are all read here, raw, once, for offline inspection.
+        string DumpObject(string label, ulong address, int qwordCount)
+        {
+            if (address == 0)
+            {
+                return $"{label}=null";
+            }
+
+            var values = new List<string>(qwordCount);
+            for (var i = 0; i < qwordCount; i++)
+            {
+                values.Add(
+                    TryReadUInt64(ctx, address + (ulong)(i * 8), out var qword)
+                        ? qword.ToString("X16")
+                        : "????????????????");
+            }
+
+            return $"{label}=0x{address:X16}[{string.Join(',', values)}]";
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] agc.dispatch_gate_object_dump t={TraceSeconds()} " +
+            DumpObject("this", gateThis, 16) + " " +
+            DumpObject("this+0x38", gateRax1, 16) + " " +
+            DumpObject("gateobj", gateRax2, 16));
+        Console.Error.Flush();
+
+        var frames = new List<string>();
+        if (TryReadUInt64(ctx, ctx[CpuRegister.Rsp], out var returnAddress))
+        {
+            frames.Add($"ret0=0x{returnAddress:X16}");
+        }
+
+        var frameBase = ctx[CpuRegister.Rbp];
+        for (var depth = 0; depth < 8 && frameBase != 0; depth++)
+        {
+            if (!TryReadUInt64(ctx, frameBase + 8, out var frameReturn) ||
+                !TryReadUInt64(ctx, frameBase, out var nextFrameBase))
+            {
+                break;
+            }
+
+            frames.Add($"rbp{depth}=0x{frameReturn:X16}");
+            if (nextFrameBase <= frameBase)
+            {
+                break;
+            }
+
+            frameBase = nextFrameBase;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] agc.dispatch_caller_trace groups={groupCountX}x{groupCountY}x{groupCountZ} " +
+            $"t={TraceSeconds()} gate=[{gateDescription}] " + string.Join(' ', frames));
+        Console.Error.Flush();
+    }
+
     [SysAbiExport(
         Nid = "k3GhuSNmBLU",
         ExportName = "sceAgcCbDispatch",
@@ -2918,6 +3426,7 @@ public static partial class AgcExports
         var groupCountY = (uint)ctx[CpuRegister.Rdx];
         var groupCountZ = (uint)ctx[CpuRegister.Rcx];
         var modifier = (uint)ctx[CpuRegister.R8];
+        TraceDispatchCallerIfMatch(ctx, groupCountX, groupCountY, groupCountZ);
         if (commandBufferAddress == 0 ||
             !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDispatchDirect, 0)) ||
@@ -3005,6 +3514,12 @@ public static partial class AgcExports
                     return ReturnPointer(ctx, 0);
                 }
             }
+
+            TraceShRegisterDescriptorIfMatched(
+                ctx,
+                commandBufferAddress,
+                registers[startIndex].Offset,
+                registers[startIndex..endIndex].Select(static r => r.Value).ToArray());
 
             startIndex = endIndex;
         }
@@ -3244,6 +3759,7 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.cb_set_sh_range buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset=0x{offset:X8} count={valueCount}");
+        TraceShRegisterDescriptorIfMatched(ctx, commandBufferAddress, offset, valuesAddress, valueCount);
         RefreshBuilderArenaCursorPassive(ctx, commandBufferAddress);
         return ReturnPointer(ctx, commandAddress);
     }
@@ -4851,17 +5367,28 @@ public static partial class AgcExports
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
         RecordGameSubmittedRange(commandAddress, dwordCount);
         var gpuState = _submittedGpuStates.GetValue(CanonicalMemory(ctx.Memory), static _ => new SubmittedGpuState());
+        // Clip against anything the orphan-preamble mechanism already executed
+        // on this byte range (see _orphanSubmittedRanges) so a ring it
+        // speculatively force-submitted earlier is not parsed and
+        // side-effected a second time now that the game submits it for real.
+        // A no-op split (one segment, the whole range) whenever that map is
+        // empty.
+        var submitSegments = ClipRealSubmissionAgainstOrphanSubmissions(commandAddress, dwordCount);
         lock (gpuState.Gate)
         {
             gpuState.Graphics.QueueName = "dcb.graphics";
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                gpuState.Graphics,
-                commandAddress,
-                dwordCount,
-                ++gpuState.SubmissionSequence,
-                tracePackets);
+            foreach (var (segmentStart, segmentEnd) in submitSegments)
+            {
+                EnqueueSubmittedDcb(
+                    ctx,
+                    gpuState,
+                    gpuState.Graphics,
+                    segmentStart,
+                    (uint)((segmentEnd - segmentStart) / 4),
+                    ++gpuState.SubmissionSequence,
+                    tracePackets);
+            }
+
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -4913,6 +5440,9 @@ public static partial class AgcExports
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
         RecordGameSubmittedRange(commandAddress, dwordCount);
         var gpuState = _submittedGpuStates.GetValue(CanonicalMemory(ctx.Memory), static _ => new SubmittedGpuState());
+        // See DriverSubmitDcb: clip against ranges the orphan mechanism
+        // already executed so this real submission cannot re-run them.
+        var submitSegments = ClipRealSubmissionAgainstOrphanSubmissions(commandAddress, dwordCount);
         lock (gpuState.Gate)
         {
             if (!gpuState.ComputeQueues.TryGetValue(ownerHandle, out var queueState))
@@ -4923,14 +5453,18 @@ public static partial class AgcExports
 
             queueState.QueueName = $"acb.compute[{ownerHandle}]";
             queueState.CompletionEventId = ownerHandle;
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                queueState,
-                commandAddress,
-                dwordCount,
-                ++gpuState.SubmissionSequence,
-                tracePackets);
+            foreach (var (segmentStart, segmentEnd) in submitSegments)
+            {
+                EnqueueSubmittedDcb(
+                    ctx,
+                    gpuState,
+                    queueState,
+                    segmentStart,
+                    (uint)((segmentEnd - segmentStart) / 4),
+                    ++gpuState.SubmissionSequence,
+                    tracePackets);
+            }
+
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -8578,6 +9112,19 @@ public static partial class AgcExports
             RShRegsIndirect => state.ShRegisters,
             _ => state.UcRegisters,
         };
+        // Only allocated when the trace flag is set (Run #51/#52,
+        // HIZ_INVESTIGATION.md): SetShRegister's two DIRECT builders never
+        // carry 0x5052BA0000's descriptor, so it must arrive through this
+        // indirect table instead -- populated by the game with plain memory
+        // stores our HLE builders never see. Buffering (offset, value,
+        // sourceEntryAddress) here and scanning for a matching window after
+        // the loop finds the exact guest slot a follow-up write watchpoint
+        // needs to target, the same way _lastScalarLoadSourceAddress answers
+        // it for shader-side SLoadDword.
+        List<(uint Offset, uint Value, ulong EntryAddress)>? traceEntries =
+            _traceShRegisterDescriptorBase != 0 && register == RShRegsIndirect
+                ? new List<(uint, uint, ulong)>((int)registerCount)
+                : null;
         for (uint index = 0; index < registerCount; index++)
         {
             var entryAddress = registersAddress + ((ulong)index * 8);
@@ -8595,6 +9142,88 @@ public static partial class AgcExports
             if (register == RUcRegsIndirect)
             {
                 ApplyUcIndexTypeIfNeeded(state, registerOffset, value);
+            }
+
+            traceEntries?.Add((registerOffset, value, entryAddress));
+        }
+
+        if (traceEntries is { Count: >= 4 })
+        {
+            TraceShIndirectRegisterDescriptorIfMatched(ctx, traceEntries);
+        }
+    }
+
+    private static void TraceShIndirectRegisterDescriptorIfMatched(
+        CpuContext ctx,
+        List<(uint Offset, uint Value, ulong EntryAddress)> entries)
+    {
+        // Only consecutive SH register OFFSETS form a valid descriptor -- the
+        // table is unordered in general, so sort a copy rather than assume
+        // index order already matches register order.
+        var sorted = entries.OrderBy(static e => e.Offset).ToArray();
+        for (var windowSize = 4; windowSize <= 8; windowSize += 4)
+        {
+            for (var start = 0; start + windowSize <= sorted.Length; start++)
+            {
+                var consecutive = true;
+                for (var i = 1; i < windowSize; i++)
+                {
+                    if (sorted[start + i].Offset != sorted[start + i - 1].Offset + 1)
+                    {
+                        consecutive = false;
+                        break;
+                    }
+                }
+
+                if (!consecutive)
+                {
+                    continue;
+                }
+
+                var window = new uint[windowSize];
+                for (var i = 0; i < windowSize; i++)
+                {
+                    window[i] = sorted[start + i].Value;
+                }
+
+                var matches = windowSize == 8
+                    ? TryDecodeTextureDescriptor(window, out var texture) && texture.Address == _traceShRegisterDescriptorBase
+                    : TryDecodeBufferDescriptorBaseAddress(window, out var bufferBase) && bufferBase == _traceShRegisterDescriptorBase;
+                if (!matches)
+                {
+                    continue;
+                }
+
+                var frames = new List<string>();
+                if (TryReadUInt64(ctx, ctx[CpuRegister.Rsp], out var returnAddress))
+                {
+                    frames.Add($"ret0=0x{returnAddress:X16}");
+                }
+
+                var frameBase = ctx[CpuRegister.Rbp];
+                for (var depth = 0; depth < 12 && frameBase != 0; depth++)
+                {
+                    if (!TryReadUInt64(ctx, frameBase + 8, out var frameReturn) ||
+                        !TryReadUInt64(ctx, frameBase, out var nextFrameBase))
+                    {
+                        break;
+                    }
+
+                    frames.Add($"rbp{depth}=0x{frameReturn:X16}");
+                    if (nextFrameBase <= frameBase)
+                    {
+                        break;
+                    }
+
+                    frameBase = nextFrameBase;
+                }
+
+                Console.Error.WriteLine(
+                    $"[LOADER][ERROR] agc.sh_indirect_descriptor_match " +
+                    $"offset=0x{sorted[start].Offset:X} window_dwords={windowSize} " +
+                    $"table_slot=0x{sorted[start].EntryAddress:X16} " +
+                    $"t={TraceSeconds()} " + string.Join(' ', frames));
+                Console.Error.Flush();
             }
         }
     }
@@ -13079,6 +13708,8 @@ public static partial class AgcExports
                 texture = CreateFallbackTextureDescriptor(binding.ResourceDescriptor);
             }
 
+            TraceImageDescriptorSourceIfMatched(texture, binding, "compute");
+
             translatedBindings.Add(
                 new TranslatedImageBinding(
                     texture,
@@ -13112,6 +13743,40 @@ public static partial class AgcExports
         var localSizeX = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadX);
         var localSizeY = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadY);
         var localSizeZ = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadZ);
+
+        // GCN lets a workgroup put up to 1024 threads on any single axis, but
+        // Vulkan devices routinely cap Y/Z far lower (64 on the hardware this
+        // was found on), so a perfectly legal guest shape such as 1x1x256 has
+        // no host equivalent even though its 256 total invocations are well
+        // inside maxComputeWorkGroupInvocations. Rather than drop the dispatch,
+        // declare a flat workgroup of the same size and have the shader unpack
+        // its own x/y/z from the linear invocation index. The decision has to
+        // be made here because the declared shape has to reach both the
+        // translator and the dispatch itself.
+        var declaredSizeX = localSizeX;
+        var declaredSizeY = localSizeY;
+        var declaredSizeZ = localSizeZ;
+        var linearizeWorkGroup = false;
+        if (GuestGpu.Current.TryGetComputeWorkGroupLimits(
+                out var maxWorkGroupSizeX,
+                out var maxWorkGroupSizeY,
+                out var maxWorkGroupSizeZ,
+                out var maxWorkGroupInvocations))
+        {
+            var invocations = (ulong)localSizeX * localSizeY * localSizeZ;
+            if ((localSizeX > maxWorkGroupSizeX ||
+                 localSizeY > maxWorkGroupSizeY ||
+                 localSizeZ > maxWorkGroupSizeZ) &&
+                invocations <= maxWorkGroupInvocations &&
+                invocations <= maxWorkGroupSizeX)
+            {
+                linearizeWorkGroup = true;
+                declaredSizeX = (uint)invocations;
+                declaredSizeY = 1;
+                declaredSizeZ = 1;
+            }
+        }
+
         if (_traceComputeShaderAddress == shaderAddress)
         {
             var globalHeads = evaluation.GlobalMemoryBindings.Count == 0
@@ -13260,7 +13925,8 @@ public static partial class AgcExports
                         : guestGlobalBufferCount,
                     waveLaneCount: dispatch.WaveLaneCount,
                     storageBufferOffsetAlignment:
-                        _storageBufferOffsetAlignment))
+                        _storageBufferOffsetAlignment,
+                    linearizeWorkGroup: linearizeWorkGroup))
             {
                 DumpCompiledShader(
                     "cs",
@@ -13291,9 +13957,9 @@ public static partial class AgcExports
                     dispatch.BaseGroupX,
                     dispatch.BaseGroupY,
                     dispatch.BaseGroupZ,
-                    localSizeX,
-                    localSizeY,
-                    localSizeZ,
+                    declaredSizeX,
+                    declaredSizeY,
+                    declaredSizeZ,
                     dispatch.IsIndirect,
                     writesGlobalMemory,
                     dispatch.ThreadCountX,
@@ -16225,12 +16891,24 @@ public static partial class AgcExports
         File.WriteAllLines(Path.Combine(directory, $"{name}.ir.txt"), lines);
     }
 
+    // Yotei Hi-Z investigation: the default ShouldTraceHotPath dedup (first 8
+    // calls, then 1-in-100000) makes SHARPEMU_LOG_AGC useless for finding ONE
+    // specific shader among the dozens/hundreds a real title creates over a
+    // run -- the target is essentially never among the first 8. This opt-in
+    // bypasses the throttle for create_shader specifically (still requires
+    // SHARPEMU_LOG_AGC=1) so a full run's shader list is actually visible.
+    private static readonly bool _logAllShaderCreates =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_ALL_SHADER_CREATES"),
+            "1",
+            StringComparison.Ordinal);
+
     private static void TraceCreateShader(ulong destinationAddress, ulong headerAddress, ulong codeAddress, string detail)
     {
         var isOk = string.Equals(detail, "ok", StringComparison.Ordinal);
         if (isOk &&
             (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal) ||
-             !ShouldTraceHotPath(ref _createShaderTraceCount)))
+             (!_logAllShaderCreates && !ShouldTraceHotPath(ref _createShaderTraceCount))))
         {
             return;
         }
@@ -16343,6 +17021,91 @@ public static partial class AgcExports
     {
         ctx[CpuRegister.Rax] = 4u * sizeof(uint);
         return (int)ctx[CpuRegister.Rax];
+    }
+
+    // Debug-only: reverse-engineering aid. Captures the GUEST call stack (return
+    // address chain, best-effort RBP walk) at the exact moment sceAgcCreateShader
+    // processes one specific shader code address -- this is a call the guest CPU
+    // makes synchronously, so ctx's stack pointer at function entry genuinely
+    // holds the caller's return address into the game's own binary (unlike a GPU
+    // buffer address, which is allocated dynamically and never appears as a
+    // literal in the game image, a shader's code pointer and its caller's return
+    // address DO point into the loaded module and are meaningful to a
+    // disassembler). SHARPEMU_TRACE_SHADER_CALLER_ADDRESS=0x...
+    private static readonly ulong _traceShaderCallerAddress =
+        ulong.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_SHADER_CALLER_ADDRESS")
+                ?.Replace("0x", "", StringComparison.OrdinalIgnoreCase),
+            System.Globalization.NumberStyles.HexNumber,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var traceShaderCallerAddress)
+            ? traceShaderCallerAddress
+            : 0;
+
+    private static void TraceShaderCallerIfMatch(CpuContext ctx, ulong codeAddress)
+    {
+        if (_traceShaderCallerAddress == 0 || codeAddress != _traceShaderCallerAddress)
+        {
+            return;
+        }
+
+        var frames = new List<string>();
+        if (TryReadUInt64(ctx, ctx[CpuRegister.Rsp], out var returnAddress))
+        {
+            frames.Add($"ret0=0x{returnAddress:X16}");
+        }
+
+        // Best-effort RBP frame-pointer walk, mirroring the crash-diagnostic
+        // "Frame chain (RBP walk)" pattern used elsewhere in this codebase.
+        // Not guaranteed (PS5 SDK builds don't always keep a frame pointer),
+        // but free to try and often works for a few frames.
+        var frameBase = ctx[CpuRegister.Rbp];
+        for (var depth = 0; depth < 6 && frameBase != 0; depth++)
+        {
+            if (!TryReadUInt64(ctx, frameBase + 8, out var frameReturn) ||
+                !TryReadUInt64(ctx, frameBase, out var nextFrameBase))
+            {
+                break;
+            }
+
+            frames.Add($"rbp{depth}=0x{frameReturn:X16}");
+            if (nextFrameBase <= frameBase)
+            {
+                break;
+            }
+
+            frameBase = nextFrameBase;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] agc.shader_caller_trace code=0x{codeAddress:X16} " +
+            $"rsp=0x{ctx[CpuRegister.Rsp]:X16} rbp=0x{ctx[CpuRegister.Rbp]:X16} " +
+            string.Join(' ', frames));
+
+        // Raw hex bytes ending just after each return address (the CALL
+        // instruction and its immediate/target land in the last 5-7 bytes of
+        // this window): enough for manual opcode identification without
+        // pulling in a disassembler dependency here.
+        foreach (var frameAddress in frames
+            .Select(static frame => frame[(frame.IndexOf('=') + 1)..])
+            .Select(static hex => ulong.Parse(hex[2..], System.Globalization.NumberStyles.HexNumber)))
+        {
+            var windowStart = frameAddress - 32;
+            var bytes = new byte[40];
+            var readOk = true;
+            for (var offset = 0; offset < bytes.Length && readOk; offset += 8)
+            {
+                readOk = TryReadUInt64(ctx, windowStart + (ulong)offset, out var qword);
+                if (readOk)
+                {
+                    BitConverter.GetBytes(qword).CopyTo(bytes, offset);
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] agc.shader_caller_bytes ret=0x{frameAddress:X16} " +
+                $"window=[ret-32..ret+8]=0x{windowStart:X16}: {Convert.ToHexString(bytes)}");
+        }
     }
 
     [SysAbiExport(

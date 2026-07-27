@@ -20,6 +20,14 @@ public sealed partial class DirectExecutionBackend
 	// surface as this exception code.
 	private const uint StatusSingleStep = 0x80000004u;
 
+	// STATUS_GUARD_PAGE_VIOLATION — a PAGE_GUARD-protected page was touched.
+	// Used by SHARPEMU_WATCH_HIZ_SOURCE_WRITE_DYNAMIC (DirectExecutionBackend.cs,
+	// ArmDynamicHiZGuardPage): unlike Dr1, this fires no matter which thread
+	// performs the access, which run #53 of HIZ_INVESTIGATION.md showed
+	// matters (the writer's thread was never confirmed to be one where the
+	// old fixed-address Dr1 watch was even armed).
+	private const uint StatusGuardPageViolation = 0x80000001u;
+
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
 	private static int _guestAllocatorHoleRecoveries;
@@ -62,16 +70,31 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine("[LOADER][INFO] Raw exception handler disabled by SHARPEMU_DISABLE_RAW_HANDLER=1");
 		}
 
-		_handlerDelegate = VectoredHandler;
-		_handlerHandle = GCHandle.Alloc(_handlerDelegate);
-		_exceptionHandlerStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
-		if (_exceptionHandlerStub == 0)
+		// DIAGNOSTIC ONLY (SHARPEMU_DISABLE_VECTORED_HANDLER=1): skips installing this
+		// handler entirely to test whether the reverse-P/Invoke transition into
+		// VectoredHandler itself -- triggered by a first-chance exception on a raw
+		// native guest-worker thread -- is the actual UnmanagedCallersOnly fatal
+		// trigger, as opposed to the guest-thread pump/continuation machinery. This
+		// ALSO disables the lazy-commit/allocator-hole/JobManager-breakpoint recovery
+		// paths that live in the same handler -- expect DIFFERENT crashes (real
+		// unhandled AVs) if those paths were actually needed for this run. Not a fix;
+		// remove once the hypothesis is confirmed or ruled out.
+		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_VECTORED_HANDLER"), "1", StringComparison.Ordinal))
 		{
-			throw new InvalidOperationException("Failed to create exception handler trampoline");
+			_handlerDelegate = VectoredHandler;
+			_handlerHandle = GCHandle.Alloc(_handlerDelegate);
+			_exceptionHandlerStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
+			if (_exceptionHandlerStub == 0)
+			{
+				throw new InvalidOperationException("Failed to create exception handler trampoline");
+			}
+			_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, _exceptionHandlerStub);
+			Console.Error.WriteLine($"[LOADER][INFO] Exception handler installed: 0x{_exceptionHandler:X16}");
 		}
-		_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, _exceptionHandlerStub);
-		Console.Error.WriteLine($"[LOADER][INFO] Exception handler installed: 0x{_exceptionHandler:X16}");
-		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
+		else
+		{
+			Console.Error.WriteLine("[LOADER][INFO] Vectored exception handler disabled by SHARPEMU_DISABLE_VECTORED_HANDLER=1");
+		}
 
 		_unhandledFilterDelegate = UnhandledExceptionFilter;
 		_unhandledFilterHandle = GCHandle.Alloc(_unhandledFilterDelegate);
@@ -104,8 +127,143 @@ public sealed partial class DirectExecutionBackend
 		return 0;
 	}
 
+	// SHARPEMU_WATCH_HIZ_SOURCE_WRITE_DYNAMIC: fires on ANY access (read,
+	// write, or execute) to the guarded page, from ANY thread. A read/execute
+	// hit isn't what we want -- it just means something else touched the page
+	// first and consumed the one-shot PAGE_GUARD trap (Windows clears the
+	// attribute the instant it fires) -- so those get logged and the guard
+	// is re-armed shortly after from a background thread, once the faulting
+	// instruction has had a chance to retire (re-arming synchronously here,
+	// before returning, would re-trap the SAME instruction on its retry:
+	// PAGE_GUARD is cleared only once the access that hit it actually
+	// completes). A write hit is the one this investigation is after: logged
+	// with a frame-pointer backtrace exactly like the Dr1 HiZSourceWrite
+	// capture, then left unguarded (mission accomplished for this address).
+	private unsafe static bool TryHandleDynamicHiZGuardPageWatch(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (Interlocked.Read(ref _dynamicHiZWatchTargetAddress) == 0 ||
+			exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		var accessType = exceptionRecord->ExceptionInformation[0];
+		var faultAddress = exceptionRecord->ExceptionInformation[1];
+		var pageBase = Volatile.Read(ref _dynamicHiZWatchGuardPageBase);
+		if (faultAddress < pageBase || faultAddress >= pageBase + 0x1000)
+		{
+			return false;
+		}
+
+		var hit = Interlocked.Increment(ref _dynamicHiZWatchHitCount);
+		var accessText = accessType switch
+		{
+			0uL => "read",
+			1uL => "write",
+			8uL => "execute",
+			_ => $"unknown({accessType})"
+		};
+
+		var rdi = ReadCtxU64(contextRecord, 176);
+		var rsi = ReadCtxU64(contextRecord, 168);
+		var rdx = ReadCtxU64(contextRecord, 136);
+		var rcx = ReadCtxU64(contextRecord, 128);
+		var rax = ReadCtxU64(contextRecord, 120);
+		var rbp = ReadCtxU64(contextRecord, 160);
+		// r12/r14: SysV callee-saved -- if the write happened inside an
+		// indirect call (confirmed live for the boot-time slot, run #53d:
+		// rip_after_write sits right after `mov rdi, r14; call rax` with
+		// `rax` loaded from `[r12-0x18]`), these still hold the caller's
+		// values here, letting the callback pointer be recovered after the
+		// fact instead of needing a second, earlier breakpoint on the call
+		// site itself.
+		var r12 = ReadCtxU64(contextRecord, 216);
+		var r14 = ReadCtxU64(contextRecord, 232);
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] DynamicHiZWatch hit#{hit}: t={ElapsedSecondsSinceBoot():F1}s access={accessText} " +
+			$"fault_addr=0x{faultAddress:X16} rip=0x{rip:X16} thread={Environment.CurrentManagedThreadId} " +
+			$"rdi=0x{rdi:X16} rsi=0x{rsi:X16} rdx=0x{rdx:X16} rcx=0x{rcx:X16} rax=0x{rax:X16} " +
+			$"r12=0x{r12:X16} r14=0x{r14:X16}");
+
+		if (TryReadJobSubmitQword(unchecked(r12 - 0x18), out var callbackPointer))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] DynamicHiZWatch#{hit}   callback_at_r12_minus_0x18=0x{callbackPointer:X16}");
+		}
+
+		var frame = rbp;
+		var backtrace = new System.Text.StringBuilder();
+		for (var i = 0; i < 24 && frame != 0; i++)
+		{
+			if (!TryReadJobSubmitQword(frame + 8, out var returnAddress) ||
+				!TryReadJobSubmitQword(frame, out var nextFrame))
+			{
+				break;
+			}
+
+			backtrace.Append(i == 0 ? string.Empty : " <- ").Append("0x").Append(returnAddress.ToString("X"));
+			if (nextFrame <= frame)
+			{
+				break;
+			}
+
+			frame = nextFrame;
+		}
+
+		Console.Error.WriteLine($"[LOADER][ERROR] DynamicHiZWatch#{hit}   backtrace={backtrace}");
+		Console.Error.Flush();
+
+		var targetAddress = unchecked((ulong)Volatile.Read(ref _dynamicHiZWatchTargetAddress));
+		// PAGE_GUARD covers the whole 4KB page, not just our 8-byte target --
+		// run #53e found this page holds several adjacent descriptor slots
+		// (a hit at fault_addr = target-0x20 stole the trap before the real
+		// target was ever touched). Only stop watching once the exact target
+		// window is the one that faulted; anything else (a write elsewhere
+		// in the page, or a read/execute anywhere in it) just gets logged
+		// and the guard is re-armed once the faulting instruction retires.
+		var isExactTargetWrite = accessType == 1 &&
+			faultAddress >= targetAddress &&
+			faultAddress < targetAddress + sizeof(ulong);
+
+		if (isExactTargetWrite)
+		{
+			Interlocked.Exchange(ref _dynamicHiZWatchWriteCaptured, 1);
+			ThreadPool.QueueUserWorkItem(_ =>
+			{
+				// Let a multi-dword/rep-style copy finish settling before
+				// reading back -- the trap fires on the first byte touched,
+				// not after the whole descriptor has landed.
+				Thread.Sleep(50);
+				if (TryReadJobSubmitQword(targetAddress, out var settled))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] DynamicHiZWatch#{hit}   settled_value=0x{settled:X16}");
+					Console.Error.Flush();
+				}
+			});
+		}
+		else
+		{
+			ThreadPool.QueueUserWorkItem(_ =>
+			{
+				Thread.Sleep(1);
+				if (Volatile.Read(ref _dynamicHiZWatchWriteCaptured) == 0)
+				{
+					ArmDynamicHiZGuardPage(targetAddress);
+				}
+			});
+		}
+
+		return true;
+	}
+
 	private unsafe int VectoredHandler(void* exceptionInfo)
 	{
+		RecordVehRingEntry(exceptionInfo, handler: 1);
 		if (_vectoredHandlerDepth > 0)
 		{
 			LogNestedVectoredException(exceptionInfo);
@@ -132,6 +290,11 @@ public sealed partial class DirectExecutionBackend
 			ulong rsp = ReadCtxU64(contextRecord, 152);
 			if (exceptionCode == StatusSingleStep &&
 				TryHandleJobManagerPushBackBreakpoint(contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == StatusGuardPageViolation &&
+				TryHandleDynamicHiZGuardPageWatch(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}

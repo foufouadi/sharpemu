@@ -5895,7 +5895,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[offset++] = 91;
 			ptr2[offset++] = 195;
 			ulong sentinel = (ulong)ptr + (ulong)sentinelOffset;
-			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
+			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub; 
 			_activeGuestReturnSlotAddress = context[CpuRegister.Rsp] - 16uL;
 			if (!context.TryWriteUInt64(context[CpuRegister.Rsp], sentinel))
 			{
@@ -6602,6 +6602,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				}
 				MaybeLogFlipStallSnapshot();
 				MaybeLogDcbSubmitWentQuiet();
+				FlushVehRing();
 				// Unlike the checks above, the JobManager gate force-patch
 				// must not wait for a genuine stall: Yotei's menu keeps
 				// flipping frames (just with an empty/underpopulated
@@ -7201,17 +7202,1028 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			"1",
 			StringComparison.Ordinal);
 
+	// Opt-in, independent of every JobManager flag above: a plain write
+	// watchpoint (Dr1) on a single guest address, for the Yotei Hi-Z
+	// investigation (HIZ_INVESTIGATION.md, "0x50050C0000 never written" —
+	// confirmed empty by CPU polling and GPU dispatch tracing alike, but
+	// never watched with an actual hardware breakpoint). SHARPEMU_WATCH_
+	// HIZ_SOURCE_WRITE=1 uses the known-stable address below; a hex value
+	// (with or without "0x") watches that address instead, for reuse on any
+	// other guest buffer. Takes priority over SHARPEMU_WATCH_JOBMANAGER_
+	// ASYNC_SLOT for the shared Dr1 slot -- do not request both.
+	private const ulong HiZSourceBufferAddress = 0x50050C0000UL;
+
+	private static readonly ulong _hiZSourceWatchAddress = ParseHiZSourceWatchAddress();
+
+	private static ulong ParseHiZSourceWatchAddress()
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_WATCH_HIZ_SOURCE_WRITE");
+		if (string.IsNullOrWhiteSpace(spec))
+		{
+			return 0;
+		}
+
+		if (spec == "1")
+		{
+			return HiZSourceBufferAddress;
+		}
+
+		var text = spec.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? spec[2..] : spec;
+		return ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address)
+			? address
+			: 0;
+	}
+
+	// Opt-in, SHARPEMU_WATCH_HIZ_SOURCE_READWRITE=1: x86 data breakpoints
+	// have no read-only mode (R/W field is 01=write or 11=read-or-write),
+	// so the plain write watch above can only ever prove "nobody writes
+	// this" -- it can't find who's READING a buffer that's stuck at its
+	// initial value, which is exactly the open question for
+	// 0x5014190400 (PROGRESS.md Suite 37: written once, read every frame
+	// as a culling threshold, never refreshed -- the consumer, not the
+	// writer, is what's unknown). Flips Dr1's R/W field from 01 to 11;
+	// LEN stays 8 bytes. Same capture path as the write-only watch (VEH
+	// only reads CONTEXT registers and defers to JobSubmitDumpLoop for
+	// anything else), so this carries no additional crash risk.
+	private static readonly bool _hiZSourceWatchReadWrite = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_WATCH_HIZ_SOURCE_READWRITE"),
+		"1",
+		StringComparison.Ordinal);
+
+	// Opt-in, SHARPEMU_WATCH_HIZ_SOURCE_WRITE_DYNAMIC=1: HIZ_INVESTIGATION.md
+	// run #53 proved a fixed pre-launch address is worthless here -- the
+	// game's command-arena allocator hands out a DIFFERENT slot address for
+	// the same logical resource on every process launch, so an address
+	// captured from one run's log is never the right one to watch in the
+	// next. This arms the watch LIVE, the first time
+	// SHARPEMU_TRACE_IMAGE_DESCRIPTOR_BASE's read-side trace
+	// (AgcExports.TraceImageDescriptorSourceIfMatched) resolves a table_slot
+	// for the target base address in THIS run -- so the address is always
+	// correct for the run it's used in. SharpEmu.Libs cannot reference
+	// SharpEmu.Core (the dependency already runs the other way), so the hook
+	// is a plain delegate AgcExports exposes, subscribed to below.
+	// A hex address (with or without "0x") instead of "1" pre-arms that exact
+	// address immediately at process start, instead of waiting for the
+	// read-side trace to discover one: run #53d found the very first
+	// (boot-time) slot address is deterministic across launches even though
+	// later steady-state slots are not, and arming only on discovery is
+	// always too late for a slot that is written exactly once (the write the
+	// read depends on has, by construction, already happened by the time the
+	// read is observed). The target page may not be committed yet this
+	// early, so this retries briefly on a background thread instead of
+	// giving up on the first failed VirtualProtect.
+	private static readonly bool _dynamicHiZWatchEnabled = InitializeDynamicHiZWatch();
+
+	private static bool InitializeDynamicHiZWatch()
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_WATCH_HIZ_SOURCE_WRITE_DYNAMIC");
+		if (string.IsNullOrWhiteSpace(spec))
+		{
+			return false;
+		}
+
+		SharpEmu.Libs.Agc.AgcExports.DynamicImageDescriptorSlotDiscovered = TryArmDynamicHiZSourceWatch;
+
+		if (spec != "1")
+		{
+			var text = spec.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? spec[2..] : spec;
+			if (ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var preArmAddress) &&
+				preArmAddress != 0)
+			{
+				ThreadPool.QueueUserWorkItem(_ => PreArmDynamicHiZSourceWatch(preArmAddress));
+			}
+		}
+
+		return true;
+	}
+
+	private static void PreArmDynamicHiZSourceWatch(ulong address)
+	{
+		for (var attempt = 0; attempt < 200; attempt++)
+		{
+			if (Volatile.Read(ref _dynamicHiZWatchWriteCaptured) != 0)
+			{
+				return;
+			}
+
+			if (Interlocked.CompareExchange(ref _dynamicHiZWatchTargetAddress, unchecked((long)address), 0) != 0)
+			{
+				return; // Discovery beat the pre-arm to it (or a different address already armed).
+			}
+
+			unsafe
+			{
+				if (VirtualQuery((void*)(address & ~0xFFFUL), out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0 &&
+					mbi.State == 0x1000u) // MEM_COMMIT
+				{
+					ArmDynamicHiZGuardPage(address);
+					return;
+				}
+			}
+
+			// Not committed yet -- undo the claim and retry shortly.
+			Volatile.Write(ref _dynamicHiZWatchTargetAddress, 0);
+			Thread.Sleep(5);
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] DynamicHiZWatch: gave up pre-arming 0x{address:X16} after 200 attempts (page never committed)");
+		Console.Error.Flush();
+	}
+
+	// A page-guard trap (STATUS_GUARD_PAGE_VIOLATION), unlike the Dr1
+	// hardware breakpoint above, fires regardless of which thread performs
+	// the access -- the JobManager investigation already hit the limits of
+	// per-thread debug registers (arming timing, one shared Dr1 slot); this
+	// sidesteps that entirely for the one address this session cares about.
+	private const uint PageGuardModifier = 0x100u;
+
+	private static long _dynamicHiZWatchTargetAddress; // 0 = not yet armed this run.
+	private static ulong _dynamicHiZWatchGuardPageBase;
+	private static long _dynamicHiZWatchHitCount;
+	private static long _dynamicHiZWatchWriteCaptured; // 1 once the write we want has fired -- stop re-arming.
+
+	internal unsafe static void TryArmDynamicHiZSourceWatch(ulong address)
+	{
+		if (!_dynamicHiZWatchEnabled ||
+			address == 0 ||
+			!OperatingSystem.IsWindows() ||
+			Volatile.Read(ref _dynamicHiZWatchWriteCaptured) != 0)
+		{
+			return;
+		}
+
+		if (Interlocked.CompareExchange(ref _dynamicHiZWatchTargetAddress, unchecked((long)address), 0) != 0)
+		{
+			// Already armed for a (possibly different) slot address this run --
+			// only the first discovery gets watched, matching the Dr1 watch's
+			// "one opt-in probe" convention above.
+			return;
+		}
+
+		ArmDynamicHiZGuardPage(address);
+	}
+
+	internal unsafe static void ArmDynamicHiZGuardPage(ulong address)
+	{
+		var pageBase = address & ~0xFFFUL;
+		Volatile.Write(ref _dynamicHiZWatchGuardPageBase, pageBase);
+		if (VirtualQuery((void*)pageBase, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] DynamicHiZWatch: VirtualQuery failed for page 0x{pageBase:X16}");
+			Console.Error.Flush();
+			return;
+		}
+
+		uint oldProtect;
+		if (!VirtualProtect((void*)pageBase, 0x1000, mbi.Protect | PageGuardModifier, &oldProtect))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] DynamicHiZWatch: VirtualProtect(PAGE_GUARD) failed for page 0x{pageBase:X16}");
+			Console.Error.Flush();
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] DynamicHiZWatch armed: t={ElapsedSecondsSinceBoot():F1}s target=0x{address:X16} " +
+			$"page=0x{pageBase:X16} protect=0x{mbi.Protect:X8}");
+		Console.Error.Flush();
+	}
+
 	private static long _jobManagerPushBackHitCount;
 	private static long _jobManagerAsyncSlotHitCount;
 	private static long _jobManagerSubmitJobHitCount;
 	private static long _jobManagerPulseTickHitCount;
+	private static long _hiZSourceWatchHitCount;
+
+	// Opt-in (Dr0, execute), SHARPEMU_WATCH_HIZ_RESOLVER=1: the generic
+	// resource-dependency resolver already identified statically
+	// (HIZ_INVESTIGATION.md run #23/#27) as the entry point whose call chain
+	// reaches cs=0x410100 (the Hi-Z copy kernel) with a "type" selector -- but
+	// static analysis of its 22-case dispatch dead-ended ("plomberie
+	// générique... aucune logique Hi-Z identifiable", per project memory).
+	// This watches it LIVE instead: entry has `this` in rdi and the type
+	// selector in esi (`cmp ecx, esi` at +0x1408, against `[rdi+0x88]`,
+	// BEFORE esi is written anywhere in the prologue), so every call's
+	// (object, type) pair is tallied without needing to understand the
+	// dispatch body at all. Mutually exclusive with boot-progress and
+	// JobManager-pushback for the shared Dr0 slot -- do not request more than
+	// one at a time.
+	private const ulong HiZResolverEntryAddress = 0x8010013E0UL;
+
+	private static readonly bool _hiZResolverWatchEnabled = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_WATCH_HIZ_RESOLVER"),
+		"1",
+		StringComparison.Ordinal);
+
+	private static long _hiZResolverHitCount;
+	private static readonly object _hiZResolverTallyGate = new();
+	private static readonly Dictionary<uint, long> _hiZResolverTypeTally = new();
+
+	// Boot-progress milestones (Dr1, execute), opt-in via
+	// SHARPEMU_WATCH_BOOT_PROGRESS=<hex,hex,...>. The addresses must be listed in
+	// true execution order: exactly ONE is armed at a time and the handler
+	// advances to the next as each is reached. That keeps the cost at one VEH
+	// entry per milestone -- important because every entry is a chance to hit the
+	// pre-existing UnmanagedCallersOnly fatal -- and makes the answer trivially
+	// readable: the last milestone logged is where execution stopped.
+	private static readonly ulong[] _bootProgressAddresses = ParseBootProgressAddresses();
+
+	private static int _bootProgressIndex;
+
+	private static ulong[] ParseBootProgressAddresses()
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_WATCH_BOOT_PROGRESS");
+		if (string.IsNullOrWhiteSpace(spec))
+		{
+			return Array.Empty<ulong>();
+		}
+
+		var parsed = new List<ulong>();
+		foreach (var token in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+		{
+			var text = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? token[2..] : token;
+			if (ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address))
+			{
+				parsed.Add(address);
+			}
+		}
+
+		return parsed.ToArray();
+	}
+
+	private static ulong CurrentBootProgressAddress()
+	{
+		var index = Volatile.Read(ref _bootProgressIndex);
+		return index >= 0 && index < _bootProgressAddresses.Length ? _bootProgressAddresses[index] : 0;
+	}
+
+	private static bool BootProgressOwnsAllDebugRegisters =>
+		_bootProgressAddresses.Length != 0 && !_watchJobManagerPushBackEnabled;
+
+	// Milestones frequently sit inside conditional blocks, and a milestone that
+	// is legitimately skipped would otherwise stall the whole walk and read as a
+	// hang. When boot progress owns every debug register, arm a sliding WINDOW of
+	// the next four milestones instead of just one: up to three consecutive
+	// skipped milestones are then tolerated, and the walk only stops where
+	// execution really stops.
+	private unsafe static void ApplyBootProgressWindow(void* contextRecord, ref ulong dr7)
+	{
+		var index = Volatile.Read(ref _bootProgressIndex);
+		if (!BootProgressOwnsAllDebugRegisters)
+		{
+			var single = CurrentBootProgressAddress();
+			if (single != 0)
+			{
+				WriteCtxU64(contextRecord, Win64ContextDr0Offset + 8, single);
+				dr7 |= 0x4UL;
+			}
+			else
+			{
+				dr7 &= ~0x4UL;
+			}
+
+			return;
+		}
+
+		ReadOnlySpan<int> slotOffsets = stackalloc int[4]
+		{
+			Win64ContextDr0Offset,
+			Win64ContextDr0Offset + 8,
+			Win64ContextDr2Offset,
+			Win64ContextDr3Offset,
+		};
+		ReadOnlySpan<ulong> enableBits = stackalloc ulong[4] { 0x1UL, 0x4UL, 0x10UL, 0x40UL };
+
+		// Execute breakpoints only: clear every R/W and LEN field.
+		dr7 &= ~0xFFFF0000UL;
+		for (var slot = 0; slot < 4; slot++)
+		{
+			var milestone = index + slot;
+			if (milestone < _bootProgressAddresses.Length)
+			{
+				WriteCtxU64(contextRecord, slotOffsets[slot], _bootProgressAddresses[milestone]);
+				dr7 |= enableBits[slot];
+			}
+			else
+			{
+				dr7 &= ~enableBits[slot];
+			}
+		}
+	}
+
+	// The four sites above answer WHEN a submission happens, never WHAT is
+	// submitted. Dereferencing guest memory from inside the VEH is unsafe (run
+	// #29), so the handler only snapshots the argument registers into this ring
+	// and a normal host thread drains it and does every dereference. The ring is
+	// fill-once (the sites are rare by construction and self-disarm well below
+	// the capacity), so a slot is never reused and the reader needs no sequence
+	// number: a published Ready flag is sufficient.
+	private struct JobSubmitCapture
+	{
+		public long Hit;
+		public double Seconds;
+		public int Site;
+		public int ManagedThreadId;
+		public ulong Rdi;
+		public ulong Rsi;
+		public ulong Rdx;
+		public ulong Rcx;
+		public ulong R8;
+		public ulong R9;
+		public ulong Rsp;
+		public ulong Rax;
+		public uint HostThreadId;
+		public ulong Rbp;
+		public ulong ReturnAddress;
+		public int Ready;
+	}
+
+	private const int JobSubmitCaptureCapacity = 64;
+
+	private static readonly JobSubmitCapture[] _jobSubmitCaptures = new JobSubmitCapture[JobSubmitCaptureCapacity];
+
+	private static long _jobSubmitCaptureCount;
+	private static int _jobSubmitDumpThreadStarted;
 
 	[ThreadStatic]
 	private static bool _jobManagerPushBackArmedOnThisThread;
 
+	// Called from the VEH: register reads only, plus the single *rsp read the
+	// surrounding sites already perform. Never touches anything else.
+	private static void CaptureJobSubmit(
+		int site,
+		long hit,
+		ulong rdi,
+		ulong rsi,
+		ulong rdx,
+		ulong rcx,
+		ulong r8,
+		ulong r9,
+		ulong rsp,
+		ulong rbp,
+		ulong rax,
+		ulong returnAddress)
+	{
+		var slot = (int)(Interlocked.Increment(ref _jobSubmitCaptureCount) - 1);
+		if (slot < 0 || slot >= JobSubmitCaptureCapacity)
+		{
+			return;
+		}
+
+		ref var capture = ref _jobSubmitCaptures[slot];
+		capture.Hit = hit;
+		capture.Seconds = ElapsedSecondsSinceBoot();
+		capture.Site = site;
+		capture.ManagedThreadId = Environment.CurrentManagedThreadId;
+		capture.Rdi = rdi;
+		capture.Rsi = rsi;
+		capture.Rdx = rdx;
+		capture.Rcx = rcx;
+		capture.R8 = r8;
+		capture.R9 = r9;
+		capture.Rsp = rsp;
+		capture.Rax = rax;
+		capture.HostThreadId = GetCurrentThreadId();
+		capture.Rbp = rbp;
+		capture.ReturnAddress = returnAddress;
+		// Publish last so the drain thread cannot pair a half-written frame.
+		Volatile.Write(ref capture.Ready, 1);
+	}
+
+	private static void StartJobSubmitDumpThread()
+	{
+		if (Interlocked.Exchange(ref _jobSubmitDumpThreadStarted, 1) != 0)
+		{
+			return;
+		}
+
+		var thread = new Thread(JobSubmitDumpLoop)
+		{
+			IsBackground = true,
+			Name = "SharpEmu-JobSubmitDump",
+			// The submitted object may be a short-lived allocation, so drain
+			// promptly rather than competing with the guest for a slice.
+			Priority = ThreadPriority.AboveNormal,
+		};
+		thread.Start();
+	}
+
+	private static long _nextHiZResolverTallyLogTimestamp;
+
+	private static void JobSubmitDumpLoop()
+	{
+		var drained = 0;
+		while (drained < JobSubmitCaptureCapacity)
+		{
+			if (Volatile.Read(ref _jobSubmitCaptures[drained].Ready) != 1)
+			{
+				if (_bootProgressAddresses.Length != 0)
+				{
+					SampleStalledBootThread();
+				}
+				else
+				{
+					Thread.Sleep(1);
+				}
+
+				// The tally lives past the 64-slot capture ring (see
+				// LogHiZResolverTallyIfPresent), so print it on its own
+				// schedule instead of waiting for the ring to fill or the
+				// process to exit -- this loop is otherwise idle-polling
+				// while the resolver watch runs.
+				if (_hiZResolverWatchEnabled)
+				{
+					var now = Stopwatch.GetTimestamp();
+					if (now >= Volatile.Read(ref _nextHiZResolverTallyLogTimestamp))
+					{
+						Volatile.Write(ref _nextHiZResolverTallyLogTimestamp, now + Stopwatch.Frequency * 5);
+						LogHiZResolverTallyIfPresent();
+					}
+				}
+
+				continue;
+			}
+
+			try
+			{
+				DumpJobSubmitCapture(in _jobSubmitCaptures[drained]);
+			}
+			catch (Exception ex)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] JobSubmitDump failed: {ex.Message}");
+			}
+
+			drained++;
+			_lastDrainedHostThreadId = _jobSubmitCaptures[drained - 1].HostThreadId;
+			_lastDrainedTimestamp = Stopwatch.GetTimestamp();
+		}
+	}
+
+	private static uint _lastDrainedHostThreadId;
+	private static long _lastDrainedTimestamp;
+
+	// Walking milestone-by-milestone answers "how far did it get" but not "what
+	// is it doing now", and every conditional branch costs another run. Once the
+	// walk goes quiet, suspend the thread that logged the last milestone and
+	// sample its live RIP instead: a RIP that wanders inside a small address
+	// range is a spin loop, a RIP parked in one place is a blocking wait.
+	private static void SampleStalledBootThread()
+	{
+		if (_bootProgressAddresses.Length == 0 || _lastDrainedHostThreadId == 0)
+		{
+			Thread.Sleep(50);
+			return;
+		}
+
+		var quietFor = (Stopwatch.GetTimestamp() - _lastDrainedTimestamp) / (double)Stopwatch.Frequency;
+		if (quietFor < 5.0)
+		{
+			Thread.Sleep(200);
+			return;
+		}
+
+		for (var sample = 0; sample < 12; sample++)
+		{
+			if (!TryCaptureHostThreadContext(unchecked((int)_lastDrainedHostThreadId), out var snapshot) ||
+				!snapshot.IsValid)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] BootStallSample tid={_lastDrainedHostThreadId} <unavailable>");
+				break;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] BootStallSample#{sample} tid={_lastDrainedHostThreadId} " +
+				$"rip=0x{snapshot.Rip:X16} rsp=0x{snapshot.Rsp:X16} rbp=0x{snapshot.Rbp:X16} " +
+				$"rax=0x{snapshot.Rax:X16} rbx=0x{snapshot.Rbx:X16} rcx=0x{snapshot.Rcx:X16} rdx=0x{snapshot.Rdx:X16} " +
+				$"guest={IsGuestModulePointer(snapshot.Rip)}");
+
+			// The spin loop found at 0x800CD5000 polls a completion counter at
+			// [[0x8044B9268] + [0x8044CECDC] * 0x20]; print the whole chain so the
+			// expected value (rbx) can be compared against what is actually there.
+			if (TryReadJobSubmitQword(0x8044B9268UL, out var labelTable) &&
+				TryReadJobSubmitQword(0x8044CECDCUL, out var queueIndexRaw))
+			{
+				var queueIndex = (uint)queueIndexRaw;
+				var slotAddress = labelTable + (ulong)queueIndex * 0x20UL;
+				var slotText = TryReadJobSubmitQword(slotAddress, out var slotValue)
+					? $"0x{slotValue:X16}"
+					: "<unreadable>";
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] BootStallSample#{sample}   label_table=0x{labelTable:X} " +
+					$"queue_index={queueIndex} slot=0x{slotAddress:X} value={slotText} waiting_for=0x{snapshot.Rbx:X}");
+			}
+
+			Console.Error.Flush();
+			Thread.Sleep(700);
+		}
+
+		// One burst is enough; do not keep suspending a live thread.
+		_lastDrainedHostThreadId = 0;
+	}
+
+	// SHARPEMU_WATCH_HIZ_SOURCE_WRITE: the register snapshot belongs to
+	// whatever function just performed the write, captured AFTER it retired
+	// (x86 data-breakpoint semantics), so this prints them as plain SysV
+	// argument candidates plus a frame-pointer backtrace, then re-reads the
+	// address now that it is safe to do so from this thread (the drain
+	// thread, never the VEH) to show what value actually landed.
+	private static void DumpHiZSourceWatchCapture(in JobSubmitCapture capture)
+	{
+		// x86 R/W=11 breakpoints don't report which of read/write tripped
+		// them (Dr6 only says "Dr1 fired"), so in read-or-write mode the
+		// label is deliberately generic -- "Write" would overclaim.
+		var label = _hiZSourceWatchReadWrite ? "HiZSourceAccess" : "HiZSourceWrite";
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] {label} hit#{capture.Hit}: t={capture.Seconds:F1}s " +
+			$"thread={capture.ManagedThreadId} rip_after_access=0x{capture.ReturnAddress:X16} " +
+			$"rdi=0x{capture.Rdi:X16} rsi=0x{capture.Rsi:X16} rdx=0x{capture.Rdx:X16} rcx=0x{capture.Rcx:X16} " +
+			$"rax=0x{capture.Rax:X16}");
+
+		if (TryReadJobSubmitQword(_hiZSourceWatchAddress, out var newValue))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] {label}#{capture.Hit}   addr=0x{_hiZSourceWatchAddress:X16} value=0x{newValue:X16}");
+		}
+
+		var frame = capture.Rbp;
+		var backtrace = new System.Text.StringBuilder();
+		for (var i = 0; i < 24 && frame != 0; i++)
+		{
+			if (!TryReadJobSubmitQword(frame + 8, out var returnAddress) ||
+				!TryReadJobSubmitQword(frame, out var nextFrame))
+			{
+				break;
+			}
+
+			backtrace.Append(i == 0 ? string.Empty : " <- ").Append("0x").Append(returnAddress.ToString("X"));
+			if (nextFrame <= frame)
+			{
+				break;
+			}
+
+			frame = nextFrame;
+		}
+
+		Console.Error.WriteLine($"[LOADER][ERROR] HiZSourceWrite#{capture.Hit}   backtrace={backtrace}");
+		Console.Error.Flush();
+	}
+
+	// SHARPEMU_WATCH_HIZ_RESOLVER: one line per call with (this, type) plus a
+	// frame-pointer backtrace (this function's own prologue hasn't run yet at
+	// entry, so *rsp/rbp still belong to the CALLER -- same convention as the
+	// job-submit sites). Only the first 64 hits get this full detail (ring
+	// capacity); the running tally below covers the whole 4000-hit budget
+	// regardless, so the (type -> frequency) picture is never capacity-limited
+	// even though the per-hit backtraces are.
+	private static void DumpHiZResolverCapture(in JobSubmitCapture capture)
+	{
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] HiZResolver hit#{capture.Hit}: t={capture.Seconds:F1}s " +
+			$"thread={capture.ManagedThreadId} this=0x{capture.Rdi:X16} type={capture.Rsi} " +
+			$"caller_return=0x{capture.ReturnAddress:X16}");
+
+		var frame = capture.Rbp;
+		var backtrace = new System.Text.StringBuilder();
+		backtrace.Append("0x").Append(capture.ReturnAddress.ToString("X"));
+		for (var i = 0; i < 16 && frame != 0; i++)
+		{
+			if (!TryReadJobSubmitQword(frame + 8, out var returnAddress) ||
+				!TryReadJobSubmitQword(frame, out var nextFrame))
+			{
+				break;
+			}
+
+			backtrace.Append(" <- 0x").Append(returnAddress.ToString("X"));
+			if (nextFrame <= frame)
+			{
+				break;
+			}
+
+			frame = nextFrame;
+		}
+
+		Console.Error.WriteLine($"[LOADER][ERROR] HiZResolver#{capture.Hit}   backtrace={backtrace}");
+		Console.Error.Flush();
+	}
+
+	// Printed once, when the tally goes quiet (SHARPEMU_WATCH_HIZ_RESOLVER's
+	// hit budget runs out or the run ends): the whole point of the tally is a
+	// (type -> frequency) table that survives past the 64-slot capture ring,
+	// so this reads it independently of DumpHiZResolverCapture above.
+	internal static void LogHiZResolverTallyIfPresent()
+	{
+		if (!_hiZResolverWatchEnabled)
+		{
+			return;
+		}
+
+		lock (_hiZResolverTallyGate)
+		{
+			if (_hiZResolverTypeTally.Count == 0)
+			{
+				return;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] HiZResolverTally total_hits={Volatile.Read(ref _hiZResolverHitCount)} " +
+				$"distinct_types={_hiZResolverTypeTally.Count}");
+			foreach (var (type, count) in _hiZResolverTypeTally.OrderByDescending(pair => pair.Value))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] HiZResolverTally   type={type} count={count}");
+			}
+
+			Console.Error.Flush();
+		}
+	}
+
+	private static void DumpJobSubmitCapture(in JobSubmitCapture capture)
+	{
+		if (capture.Site == 400)
+		{
+			DumpHiZResolverCapture(capture);
+			return;
+		}
+
+		if (capture.Site == 300)
+		{
+			DumpHiZSourceWatchCapture(capture);
+			return;
+		}
+
+		if (capture.Site is >= 100 and < 200)
+		{
+			// Boot milestone: the address and the timestamp are the whole answer,
+			// and the surrounding registers are arbitrary boot state, so skip the
+			// argument dumps entirely.
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] BootProgress#{capture.Hit}/{_bootProgressAddresses.Length} " +
+				$"reached=0x{capture.ReturnAddress:X16} t={capture.Seconds:F1}s thread={capture.ManagedThreadId} " +
+				$"rdi=0x{capture.Rdi:X16} rsi=0x{capture.Rsi:X16} rdx=0x{capture.Rdx:X16} rcx=0x{capture.Rcx:X16} " +
+				$"rax=0x{capture.Rax:X16}");
+
+			// Indirect `call qword [rax]` / `call qword [rax+N]` sites: rax is the
+			// vtable, so resolve the first few slots to name the real callee.
+			if (IsPlausibleGuestPointer(capture.Rax))
+			{
+				var slots = new System.Text.StringBuilder();
+				for (var i = 0; i < 4; i++)
+				{
+					if (!TryReadJobSubmitQword(capture.Rax + (ulong)(i * 8), out var slot))
+					{
+						break;
+					}
+
+					slots.Append(i == 0 ? string.Empty : " ").Append('[').Append("rax+0x")
+						.Append((i * 8).ToString("X2")).Append("]=0x").Append(slot.ToString("X"));
+				}
+
+				if (slots.Length != 0)
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR] BootProgress#{capture.Hit}   vtable {slots}");
+				}
+			}
+
+			// Thunks tail-jump through the *object's* vtable ([[rdi]+N]), so
+			// resolve that one too or the real callee stays hidden.
+			if (IsPlausibleGuestPointer(capture.Rdi) &&
+				TryReadJobSubmitQword(capture.Rdi, out var objectVtable) &&
+				IsGuestModulePointer(objectVtable))
+			{
+				var slots = new System.Text.StringBuilder();
+				for (var i = 0; i < 8; i++)
+				{
+					if (!TryReadJobSubmitQword(objectVtable + (ulong)(i * 8), out var slot))
+					{
+						break;
+					}
+
+					slots.Append(i == 0 ? string.Empty : " ").Append("+0x")
+						.Append((i * 8).ToString("X2")).Append(":0x").Append(slot.ToString("X"));
+				}
+
+				if (slots.Length != 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] BootProgress#{capture.Hit}   [rdi]=0x{objectVtable:X} {slots}");
+				}
+			}
+
+			// Milestones on an error path carry their message in a register; show
+			// any argument that reads back as text.
+			foreach (var (name, value) in new[]
+			{
+				("rdi", capture.Rdi),
+				("rsi", capture.Rsi),
+				("rdx", capture.Rdx),
+				("rcx", capture.Rcx),
+			})
+			{
+				if (TryReadGuestPrintableRun(value, 160, out var text))
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR] BootProgress#{capture.Hit}   {name}->'{text}'");
+				}
+			}
+
+			Console.Error.Flush();
+			return;
+		}
+
+		var site = capture.Site switch
+		{
+			0 => "PendingArrayPushBack@0x800FF85B0",
+			2 => "SoumettreJobEntry@0x800FF5620",
+			3 => "NamedSubmitFactory@0x800FF57C0",
+			_ => $"site{capture.Site}",
+		};
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] JobSubmitDump {site} hit#{capture.Hit}: t={capture.Seconds:F1}s " +
+			$"thread={capture.ManagedThreadId} caller_return=0x{capture.ReturnAddress:X16} " +
+			$"rdi=0x{capture.Rdi:X16} rsi=0x{capture.Rsi:X16} rdx=0x{capture.Rdx:X16} " +
+			$"rcx=0x{capture.Rcx:X16} r8=0x{capture.R8:X16} r9=0x{capture.R9:X16} rsp=0x{capture.Rsp:X16}");
+
+		// Frame-pointer walk ([rbp+8]=return, [rbp]=next frame). Stacks grow
+		// down, so a valid next frame sits at a strictly higher address; stop on
+		// any out-of-order or unreadable frame.
+		var frame = capture.Rbp;
+		var backtrace = new System.Text.StringBuilder();
+		backtrace.Append("0x").Append(capture.ReturnAddress.ToString("X"));
+		for (var i = 0; i < 16 && frame != 0; i++)
+		{
+			if (!TryReadJobSubmitQword(frame + 8, out var returnAddress) ||
+				!TryReadJobSubmitQword(frame, out var nextFrame))
+			{
+				break;
+			}
+
+			backtrace.Append(" <- 0x").Append(returnAddress.ToString("X"));
+			if (nextFrame <= frame)
+			{
+				break;
+			}
+
+			frame = nextFrame;
+		}
+
+		Console.Error.WriteLine($"[LOADER][ERROR] JobSubmitDump#{capture.Hit}   backtrace={backtrace}");
+
+		// The named-submit factory takes its name as a (pointer, length) pair in
+		// rdx/rcx -- the game's string type is not NUL-terminated, so the name is
+		// only readable as a counted string.
+		if (capture.Site == 3)
+		{
+			// rcx has been observed one short of the visible name, so also read
+			// past it up to the first non-printable byte rather than trusting the
+			// count alone.
+			if (TryReadGuestCountedString(capture.Rdx, capture.Rcx, out var countedName))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] JobSubmitDump#{capture.Hit}   job_name[rcx={capture.Rcx}]='{countedName}'");
+			}
+
+			if (TryReadGuestPrintableRun(capture.Rdx, 128, out var fullName))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] JobSubmitDump#{capture.Hit}   job_name_full='{fullName}'");
+			}
+		}
+
+		DumpJobSubmitArgument(capture.Hit, "rdi", capture.Rdi, depth: 0);
+		DumpJobSubmitArgument(capture.Hit, "rsi", capture.Rsi, depth: 0);
+		DumpJobSubmitArgument(capture.Hit, "rdx", capture.Rdx, depth: 0);
+		DumpJobSubmitArgument(capture.Hit, "rcx", capture.Rcx, depth: 0);
+		DumpJobSubmitArgument(capture.Hit, "r8", capture.R8, depth: 0);
+		DumpJobSubmitArgument(capture.Hit, "r9", capture.R9, depth: 0);
+		Console.Error.Flush();
+	}
+
+	// The guest image is loaded at the standard 0x800000000 base; everything the
+	// job system touches (code, vtables, static instances such as the
+	// CJobManager at 0x8052AEB40) lives inside it, so a hit in this window is a
+	// strong hint that the qword is a pointer INTO the game rather than data.
+	private static bool IsGuestModulePointer(ulong value) =>
+		value >= 0x800000000UL && value < 0x810000000UL;
+
+	private static bool IsPlausibleGuestPointer(ulong value) =>
+		value >= 0x10000UL && value < 0x0000800000000000UL && (value & 0x7UL) == 0;
+
+	// The drain thread runs as ordinary managed code, so a faulting read here
+	// does NOT merely fail: the access violation re-enters the vectored handler
+	// from managed code and trips the pre-existing UnmanagedCallersOnly fatal,
+	// killing the run mid-dump (observed on runs 5-8, two captures each). A
+	// try/catch cannot help — AccessViolationException is a corrupted-state
+	// exception. Every dereference below must therefore be proven mapped and
+	// readable with VirtualQuery first, exactly like DumpHostStackWalk does.
+	private unsafe static bool IsGuestMemoryReadable(ulong address, ulong length)
+	{
+		if (address == 0 || length == 0)
+		{
+			return false;
+		}
+
+		var end = address + length;
+		var probe = address;
+		while (probe < end)
+		{
+			if (VirtualQuery((void*)probe, out var info, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				info.RegionSize == 0 ||
+				info.State != 0x1000u /* MEM_COMMIT */ ||
+				(info.Protect & 0xFFu) is not (0x02u or 0x04u or 0x08u or 0x20u or 0x40u or 0x80u))
+			{
+				return false;
+			}
+
+			probe = info.BaseAddress + info.RegionSize;
+		}
+
+		return true;
+	}
+
+	private unsafe static bool TryReadJobSubmitQword(ulong address, out ulong value)
+	{
+		value = 0;
+		if (!IsGuestMemoryReadable(address, 8))
+		{
+			return false;
+		}
+
+		value = *(ulong*)address;
+		return true;
+	}
+
+	private static void DumpJobSubmitArgument(long hit, string register, ulong value, int depth)
+	{
+		if (!IsPlausibleGuestPointer(value))
+		{
+			return;
+		}
+
+		var indent = depth == 0 ? "  " : "      ";
+		if (TryReadGuestAsciiZ(value, 96, out var text))
+		{
+			Console.Error.WriteLine($"[LOADER][ERROR] JobSubmitDump#{hit} {indent}{register}=0x{value:X16} string='{text}'");
+			return;
+		}
+
+		// A job object is small; 8 qwords covers the header, the vtable slot and
+		// the routine/context pair without turning the log into a memory dump.
+		var qwords = new ulong[8];
+		var readCount = 0;
+		for (var i = 0; i < qwords.Length; i++)
+		{
+			if (!TryReadJobSubmitQword(value + (ulong)(i * 8), out qwords[i]))
+			{
+				break;
+			}
+
+			readCount++;
+		}
+
+		if (readCount == 0)
+		{
+			Console.Error.WriteLine($"[LOADER][ERROR] JobSubmitDump#{hit} {indent}{register}=0x{value:X16} <unreadable>");
+			return;
+		}
+
+		var builder = new System.Text.StringBuilder();
+		var ascii = new System.Text.StringBuilder();
+		for (var i = 0; i < readCount; i++)
+		{
+			builder.Append(i == 0 ? string.Empty : " ");
+			builder.Append('+').Append((i * 8).ToString("X2")).Append(":0x").Append(qwords[i].ToString("X16"));
+			if (IsGuestModulePointer(qwords[i]))
+			{
+				builder.Append("(module)");
+			}
+
+			// Job payloads carry inline names and tags; render the same bytes as
+			// text so they do not have to be reassembled by hand from the qwords.
+			for (var b = 0; b < 8; b++)
+			{
+				var ch = (byte)(qwords[i] >> (b * 8));
+				ascii.Append(ch >= 0x20 && ch <= 0x7E ? (char)ch : '.');
+			}
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] JobSubmitDump#{hit} {indent}{register}=0x{value:X16} {builder} |{ascii}|");
+
+		if (depth != 0)
+		{
+			return;
+		}
+
+		// One level deeper on every readable pointer field, not just module ones:
+		// the routine and the vtable live in the module, but the job's own
+		// parameter block and name buffer are heap allocations.
+		for (var i = 0; i < readCount; i++)
+		{
+			if (IsPlausibleGuestPointer(qwords[i]) && IsGuestMemoryReadable(qwords[i], 8))
+			{
+				DumpJobSubmitArgument(hit, $"{register}+0x{i * 8:X2}", qwords[i], depth + 1);
+			}
+		}
+	}
+
+	private unsafe static bool TryReadGuestCountedString(ulong address, ulong length, out string text)
+	{
+		text = string.Empty;
+		if (length == 0 || length > 256 || !IsGuestMemoryReadable(address, length))
+		{
+			return false;
+		}
+
+		var builder = new System.Text.StringBuilder((int)length);
+		for (var i = 0UL; i < length; i++)
+		{
+			var b = *(byte*)(address + i);
+			builder.Append(b >= 0x20 && b <= 0x7E ? (char)b : '.');
+		}
+
+		text = builder.ToString();
+		return true;
+	}
+
+	private unsafe static bool TryReadGuestPrintableRun(ulong address, int maxLength, out string text)
+	{
+		text = string.Empty;
+		var builder = new System.Text.StringBuilder();
+		for (var i = 0; i < maxLength; i++)
+		{
+			var at = address + (ulong)i;
+			if (!IsGuestMemoryReadable(at, 1))
+			{
+				break;
+			}
+
+			var b = *(byte*)at;
+			if (b < 0x20 || b > 0x7E)
+			{
+				break;
+			}
+
+			builder.Append((char)b);
+		}
+
+		if (builder.Length < 4)
+		{
+			return false;
+		}
+
+		text = builder.ToString();
+		return true;
+	}
+
+	private unsafe static bool TryReadGuestAsciiZ(ulong address, int maxLength, out string text)
+	{
+		text = string.Empty;
+		if (!IsPlausibleGuestPointer(address))
+		{
+			return false;
+		}
+
+		var builder = new System.Text.StringBuilder();
+		for (var i = 0; i < maxLength; i++)
+		{
+			var at = address + (ulong)i;
+			if (!IsGuestMemoryReadable(at, 1))
+			{
+				return false;
+			}
+
+			var b = *(byte*)at;
+			if (b == 0)
+			{
+				// Require enough printable characters that a small integer pair
+				// cannot masquerade as a string.
+				if (builder.Length < 4)
+				{
+					return false;
+				}
+
+				text = builder.ToString();
+				return true;
+			}
+
+			if (b < 0x20 || b > 0x7E)
+			{
+				return false;
+			}
+
+			builder.Append((char)b);
+		}
+
+		return false;
+	}
+
 	internal unsafe static void ArmJobManagerPushBackBreakpointOnCurrentThread()
 	{
-		if (!_watchJobManagerPushBackEnabled ||
+		if ((!_watchJobManagerPushBackEnabled &&
+				_bootProgressAddresses.Length == 0 &&
+				_hiZSourceWatchAddress == 0 &&
+				!_hiZResolverWatchEnabled) ||
 			!OperatingSystem.IsWindows() ||
 			_jobManagerPushBackArmedOnThisThread)
 		{
@@ -7219,6 +8231,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		_jobManagerPushBackArmedOnThisThread = true;
+		StartJobSubmitDumpThread();
 
 		void* contextRecord = NativeMemory.AllocZeroed((nuint)Win64ContextSize);
 		try
@@ -7230,16 +8243,78 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return;
 			}
 
-			WriteCtxU64(contextRecord, Win64ContextDr0Offset, JobManagerPushBackAddress);
-			WriteCtxU64(contextRecord, Win64ContextDr0Offset + 8, JobManagerAsyncSlotAddress);
-			WriteCtxU64(contextRecord, Win64ContextDr2Offset, JobManagerSubmitJobEntryAddress);
-			WriteCtxU64(contextRecord, Win64ContextDr3Offset, JobManagerBacktraceAnchorAddress);
+			var bootProgressAddress = CurrentBootProgressAddress();
+			if (!BootProgressOwnsAllDebugRegisters)
+			{
+				// Dr0 is shared the same way Dr1 is below: the Hi-Z resolver
+				// watch overrides the JobManager push_back address when
+				// requested (mutually exclusive by convention -- only one of
+				// these questions is ever being asked in a given run).
+				WriteCtxU64(
+					contextRecord,
+					Win64ContextDr0Offset,
+					_hiZResolverWatchEnabled ? HiZResolverEntryAddress : JobManagerPushBackAddress);
+				WriteCtxU64(contextRecord, Win64ContextDr0Offset + 8, JobManagerAsyncSlotAddress);
+				WriteCtxU64(contextRecord, Win64ContextDr2Offset, JobManagerSubmitJobEntryAddress);
+				WriteCtxU64(contextRecord, Win64ContextDr3Offset, JobManagerBacktraceAnchorAddress);
+			}
 			// L0 (bit0) execute breakpoint on Dr0, R/W0=00/LEN0=00. L1 (bit2)
 			// write breakpoint on Dr1, R/W1=01 (write-only, bits 20-21) /
 			// LEN1=10 (8 bytes, bits 22-23). L2 (bit4) execute breakpoint on
 			// Dr2, R/W2=00/LEN2=00 (like Dr0). L3 (bit6) execute breakpoint on
 			// Dr3, R/W3=00/LEN3=00 -- 0x900000 | 0x5 | 0x10 | 0x40.
-			var dr7 = 0x900055UL;
+			//
+			// Dr1 is opt-in on top of the group flag: the async-slot question it
+			// answers was already concluded (run #8), and arming it now fail-fasts
+			// the process (0xC0000409) on its very first hit at t=0.0s, before any
+			// submission can be observed -- reproduced twice, identical log length.
+			// The three execute breakpoints are unaffected, so keep them armed and
+			// leave the data breakpoint off unless someone explicitly asks for it.
+			//
+			// Dr0 is opt-in for a second reason: every VEH entry is a chance to
+			// hit the pre-existing UnmanagedCallersOnly fatal, and the push_back
+			// site fires once per submission on top of Dr2, halving how many
+			// submissions a run can observe. Its `item` argument is a stack
+			// temporary holding the same job pointer Dr2 already reports in rsi,
+			// so nothing is lost by leaving it disarmed.
+			var dr7 = _watchJobManagerPushBackEnabled ? 0x50UL : 0x0UL;
+			if (_watchJobManagerPushBackEnabled &&
+				string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_WATCH_JOBMANAGER_ARRAY_PUSH"),
+					"1",
+					StringComparison.Ordinal))
+			{
+				dr7 |= 0x1UL;
+			}
+
+			if (_hiZResolverWatchEnabled)
+			{
+				dr7 |= 0x1UL;
+			}
+
+			// Dr1 is shared: boot-progress milestones (execute) win over
+			// everything else, then the Hi-Z source watch, then the
+			// JobManager async-slot watch -- do not request more than one of
+			// these at a time, only the highest-priority one gets Dr1.
+			if (bootProgressAddress != 0)
+			{
+				ApplyBootProgressWindow(contextRecord, ref dr7);
+			}
+			else if (_hiZSourceWatchAddress != 0)
+			{
+				WriteCtxU64(contextRecord, Win64ContextDr0Offset + 8, _hiZSourceWatchAddress);
+				// R/W1 bits 20-21: 01=write-only (0x900004), 11=read-or-write
+				// (0xB00004). LEN1 (bits 22-23) stays 10 = 8 bytes either way.
+				dr7 |= _hiZSourceWatchReadWrite ? 0xB00004UL : 0x900004UL;
+			}
+			else if (_watchJobManagerPushBackEnabled &&
+				string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_WATCH_JOBMANAGER_ASYNC_SLOT"),
+					"1",
+					StringComparison.Ordinal))
+			{
+				dr7 |= 0x900004UL;
+			}
 			WriteCtxU64(contextRecord, Win64ContextDr7Offset, dr7);
 			_ = SetThreadContext(currentThread, contextRecord);
 		}
@@ -7258,7 +8333,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// immediately re-trip the same breakpoint on the very next instruction.
 	internal unsafe static bool TryHandleJobManagerPushBackBreakpoint(void* contextRecord, ulong rip)
 	{
-		if (!_watchJobManagerPushBackEnabled)
+		if (!_watchJobManagerPushBackEnabled &&
+			_bootProgressAddresses.Length == 0 &&
+			_hiZSourceWatchAddress == 0 &&
+			!_hiZResolverWatchEnabled)
 		{
 			return false;
 		}
@@ -7280,7 +8358,72 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var rsp = ReadCtxU64(contextRecord, 152);
 		var dr7 = ReadCtxU64(contextRecord, Win64ContextDr7Offset);
 
-		if (b1)
+		if (_bootProgressAddresses.Length != 0 && (b0 || b1 || b2 || b3))
+		{
+			// Any milestone inside the armed window may fire, not just the first:
+			// resolve which one this rip is, record it, then slide the window past
+			// it. Milestones the window skipped are simply never logged.
+			var windowStart = Volatile.Read(ref _bootProgressIndex);
+			var reachedIndex = -1;
+			for (var slot = 0; slot < 4 && windowStart + slot < _bootProgressAddresses.Length; slot++)
+			{
+				if (_bootProgressAddresses[windowStart + slot] == rip)
+				{
+					reachedIndex = windowStart + slot;
+					break;
+				}
+			}
+
+			if (reachedIndex >= 0)
+			{
+				CaptureJobSubmit(
+					100 + reachedIndex,
+					reachedIndex + 1,
+					ReadCtxU64(contextRecord, 176),
+					ReadCtxU64(contextRecord, 168),
+					ReadCtxU64(contextRecord, 136),
+					ReadCtxU64(contextRecord, 128),
+					ReadCtxU64(contextRecord, 184),
+					ReadCtxU64(contextRecord, 192),
+					rsp,
+					ReadCtxU64(contextRecord, 160),
+					ReadCtxU64(contextRecord, 120),
+					rip);
+				Volatile.Write(ref _bootProgressIndex, reachedIndex + 1);
+				ApplyBootProgressWindow(contextRecord, ref dr7);
+			}
+
+			WriteCtxU64(contextRecord, Win64ContextDr7Offset, dr7);
+			return true;
+		}
+
+		if (b1 && _hiZSourceWatchAddress != 0)
+		{
+			// x86 data breakpoints report AFTER the write retires with RIP at
+			// the NEXT instruction -- rbp/rdi/rsi/rdx/rcx here belong to the
+			// function that just performed the write (SysV args if it's near
+			// its own entry, live locals otherwise), and rbp anchors a
+			// frame-pointer backtrace the drain thread walks the same way the
+			// job-submit sites already do. Never disarms: unlike the
+			// JobManager sites this is a single opt-in probe for one address,
+			// not a hot shared template -- every hit across the whole run is
+			// wanted.
+			var hitHiZ = Interlocked.Increment(ref _hiZSourceWatchHitCount);
+			CaptureJobSubmit(
+				300,
+				hitHiZ,
+				ReadCtxU64(contextRecord, 176),
+				ReadCtxU64(contextRecord, 168),
+				ReadCtxU64(contextRecord, 136),
+				ReadCtxU64(contextRecord, 128),
+				ReadCtxU64(contextRecord, 184),
+				ReadCtxU64(contextRecord, 192),
+				rsp,
+				ReadCtxU64(contextRecord, 160),
+				ReadCtxU64(contextRecord, 120),
+				rip);
+		}
+		else if (b1)
 		{
 			var hit1 = Interlocked.Increment(ref _jobManagerAsyncSlotHitCount);
 			_ = TryReadGuestMemoryDirect(JobManagerAsyncSlotAddress, out var slotValue);
@@ -7294,7 +8437,46 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 
-		if (b0 && rip == JobManagerPushBackAddress)
+		if (b0 && _hiZResolverWatchEnabled && rip == HiZResolverEntryAddress)
+		{
+			// Function entry: rdi = `this` (the resource-dependency object),
+			// esi = the type selector -- read here, before the prologue's
+			// `mov ecx, [rdi+0x88]; cmp ecx, esi` clobbers nothing (esi is
+			// only ever read, never written, by this function). Tally is a
+			// plain locked dictionary increment -- no guest-memory
+			// dereference, so it is as safe here as the existing
+			// Interlocked hit counters elsewhere in this handler.
+			var resolverThis = ReadCtxU64(contextRecord, 176);
+			var resolverType = (uint)ReadCtxU64(contextRecord, 168);
+			var hitR = Interlocked.Increment(ref _hiZResolverHitCount);
+			lock (_hiZResolverTallyGate)
+			{
+				_hiZResolverTypeTally.TryGetValue(resolverType, out var count);
+				_hiZResolverTypeTally[resolverType] = count + 1;
+			}
+
+			CaptureJobSubmit(
+				400,
+				hitR,
+				resolverThis,
+				resolverType,
+				ReadCtxU64(contextRecord, 136),
+				ReadCtxU64(contextRecord, 128),
+				ReadCtxU64(contextRecord, 184),
+				ReadCtxU64(contextRecord, 192),
+				rsp,
+				ReadCtxU64(contextRecord, 160),
+				ReadCtxU64(contextRecord, 120),
+				rsp != 0 ? *(ulong*)rsp : 0);
+
+			// Large budget: the point is a statistical sample of (object,
+			// type) pairs across the whole run, not just the first handful.
+			if (hitR >= 4000)
+			{
+				dr7 &= ~0x1UL;
+			}
+		}
+		else if (b0 && rip == JobManagerPushBackAddress)
 		{
 			// Function entry: `this` (the container being pushed to) is
 			// still in rdi (arg0), the callee's own prologue hasn't run
@@ -7305,12 +8487,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (containerThis == JobManagerPendingArrayAddress)
 			{
 				var hit0 = Interlocked.Increment(ref _jobManagerPushBackHitCount);
-				ulong callerReturnAddress = rsp != 0 ? *(ulong*)rsp : 0;
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] JobManagerPushBack hit#{hit0}: t={ElapsedSecondsSinceBoot():F1}s " +
-					$"caller_return=0x{callerReturnAddress:X16} container=0x{containerThis:X16} " +
-					$"item=0x{ReadCtxU64(contextRecord, 168):X16} thread={Environment.CurrentManagedThreadId}");
-				Console.Error.Flush();
+				// rsi is the item being pushed: the job pointer itself.
+				CaptureJobSubmit(
+					0,
+					hit0,
+					containerThis,
+					ReadCtxU64(contextRecord, 168),
+					ReadCtxU64(contextRecord, 136),
+					ReadCtxU64(contextRecord, 128),
+					ReadCtxU64(contextRecord, 184),
+					ReadCtxU64(contextRecord, 192),
+					rsp,
+					ReadCtxU64(contextRecord, 160),
+					ReadCtxU64(contextRecord, 120),
+					rsp != 0 ? *(ulong*)rsp : 0);
 				if (hit0 >= 20)
 				{
 					dr7 &= ~0x1UL;
@@ -7331,12 +8521,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (submitThis == JobManagerSubmitJobThisAddress)
 			{
 				var hit2 = Interlocked.Increment(ref _jobManagerSubmitJobHitCount);
-				ulong callerReturnAddress = rsp != 0 ? *(ulong*)rsp : 0;
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] JobManagerSubmitJob entry hit#{hit2}: t={ElapsedSecondsSinceBoot():F1}s " +
-					$"caller_return=0x{callerReturnAddress:X16} this=0x{submitThis:X16} " +
-					$"thread={Environment.CurrentManagedThreadId}");
-				Console.Error.Flush();
+				CaptureJobSubmit(
+					2,
+					hit2,
+					submitThis,
+					ReadCtxU64(contextRecord, 168),
+					ReadCtxU64(contextRecord, 136),
+					ReadCtxU64(contextRecord, 128),
+					ReadCtxU64(contextRecord, 184),
+					ReadCtxU64(contextRecord, 192),
+					rsp,
+					ReadCtxU64(contextRecord, 160),
+					ReadCtxU64(contextRecord, 120),
+					rsp != 0 ? *(ulong*)rsp : 0);
 				if (hit2 >= 200)
 				{
 					dr7 &= ~0x4UL;
@@ -7347,41 +8544,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (b3 && rip == JobManagerBacktraceAnchorAddress)
 		{
 			// Anchor entry (before its own `push rbp`): rbp still belongs to the
-			// caller and *rsp is the return into the recurring submitter. Emit a
-			// backtrace by first taking *rsp, then walking the frame-pointer
-			// chain ([rbp+8]=return, [rbp]=next frame). Stacks grow down, so a
-			// valid next frame sits at a strictly higher address; stop on any
-			// out-of-order or faulting frame.
+			// caller and *rsp is the return into the recurring submitter, so both
+			// are captured here and the frame-pointer walk itself is done by the
+			// drain thread.
 			var hit3 = Interlocked.Increment(ref _jobManagerPulseTickHitCount);
-			var frame = ReadCtxU64(contextRecord, 160); // Rbp
-			var sb = new System.Text.StringBuilder();
-			sb.Append("0x").Append((rsp != 0 ? *(ulong*)rsp : 0).ToString("X"));
-			for (var i = 0; i < 16 && frame != 0; i++)
-			{
-				ulong ret, next;
-				try
-				{
-					ret = *(ulong*)(frame + 8);
-					next = *(ulong*)frame;
-				}
-				catch
-				{
-					break;
-				}
-
-				sb.Append(" <- 0x").Append(ret.ToString("X"));
-				if (next <= frame)
-				{
-					break;
-				}
-
-				frame = next;
-			}
-
-			Console.Error.WriteLine(
-				$"[LOADER][ERROR] JobManagerSubmitBacktrace hit#{hit3}: t={ElapsedSecondsSinceBoot():F1}s " +
-				$"thread={Environment.CurrentManagedThreadId} backtrace={sb}");
-			Console.Error.Flush();
+			CaptureJobSubmit(
+				3,
+				hit3,
+				ReadCtxU64(contextRecord, 176),
+				ReadCtxU64(contextRecord, 168),
+				ReadCtxU64(contextRecord, 136),
+				ReadCtxU64(contextRecord, 128),
+				ReadCtxU64(contextRecord, 184),
+				ReadCtxU64(contextRecord, 192),
+				rsp,
+				ReadCtxU64(contextRecord, 160),
+				ReadCtxU64(contextRecord, 120),
+				rsp != 0 ? *(ulong*)rsp : 0);
 			if (hit3 >= 40)
 			{
 				dr7 &= ~0x8UL;
