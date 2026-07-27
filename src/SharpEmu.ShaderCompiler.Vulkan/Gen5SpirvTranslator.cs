@@ -21,6 +21,10 @@ public static partial class Gen5SpirvTranslator
     // bytes = 16384 dwords, a power of two so append/consume offsets can wrap
     // cheaply with a mask. The Vulkan backend allocates a matching buffer.
     internal const uint GdsDwordCount = 16384;
+    // Reserved dword for SHARPEMU_TRACE_DS_APPEND_ACTIVATIONS; the game never
+    // addresses the top of the GDS range through M0, so this is safe to reuse
+    // as a debug-only counter. See CompilationContext.TryEmitAppendConsume.
+    internal const uint DsAppendActivationDebugByteOffset = (GdsDwordCount - 1) * sizeof(uint);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -219,6 +223,23 @@ public static partial class Gen5SpirvTranslator
                 Environment.GetEnvironmentVariable("SHARPEMU_FORCE_PIXEL_MAGENTA"),
                 "1",
                 StringComparison.Ordinal);
+
+        // Discriminates two candidate explanations for a ds_append counter
+        // that the host always reads back as zero: (a) the atomic genuinely
+        // never fires because every lane fails an upstream cull test (no
+        // memory-visibility bug at all), or (b) the atomic fires but its
+        // effect never reaches the host-mapped buffer (scope/semantics/
+        // binding bug). When enabled, every ds_append/ds_consume site also
+        // bumps a fixed debug GDS dword (0xFFFC, outside any offset the game
+        // itself uses) under the exact same first-active-lane gate as the
+        // real counter. If that debug dword stays zero across a run, no
+        // wave ever reached the gate -- rules out (b) entirely.
+        private static readonly bool _traceDsAppendActivations =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DS_APPEND_ACTIVATIONS"),
+                "1",
+                StringComparison.Ordinal);
+        private const uint DsAppendActivationDebugDwordIndex = GdsDwordCount - 1; // == DsAppendActivationDebugByteOffset / 4
 
         // Which pixel-shader MRT export target (EXP_MRT0..7 == render-target
         // slot) is routed to the single fragment output. The offscreen draw
@@ -2498,6 +2519,21 @@ public static partial class Gen5SpirvTranslator
 
             var value = EmitFirstActiveLaneCounter(pointer, scope, atomicOp);
             StoreV(instruction.Destinations[0].Value, value);
+
+            if (_traceDsAppendActivations && control.Gds)
+            {
+                // Same first-active-lane gate as the real counter above, on a
+                // dword the game never touches. See _traceDsAppendActivations.
+                // GdsElementPointer takes a SPIR-V id (an already-emitted
+                // instruction result), not a raw literal -- UInt() below
+                // materializes the constant as one, same as every other call
+                // site in this file.
+                EmitFirstActiveLaneCounter(
+                    GdsElementPointer(UInt(DsAppendActivationDebugDwordIndex)),
+                    scope,
+                    SpirvOp.AtomicIAdd);
+            }
+
             return true;
         }
 

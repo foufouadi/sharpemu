@@ -13781,13 +13781,31 @@ public static partial class AgcExports
                              out shaderAddress);
             var shader = resolvedShader ? $"0x{shaderAddress:X10}" : "unresolved";
 
+            // SHARPEMU_TRACE_DS_APPEND_ACTIVATIONS's debug dword: bumped under
+            // the same first-active-lane gate as a real ds_append, on a byte
+            // offset the game never addresses. Staying at 0 across a run rules
+            // out a host-visibility bug outright -- no wave anywhere ever
+            // reached a ds_append site. Read here (best-effort, flushed for
+            // freshness) so one run answers both halves of the discriminant.
+            VulkanVideoPresenter.FlushGpuWorkForGdsReadback();
+            // Must match Gen5SpirvTranslator.DsAppendActivationDebugByteOffset
+            // ((GdsDwordCount - 1) * 4). Duplicated as a literal rather than
+            // referenced: internal consts of SharpEmu.ShaderCompiler.Vulkan
+            // are not guaranteed to survive into its reference assembly for
+            // cross-project const-folding.
+            const uint dsAppendActivationDebugByteOffset = 0xFFFC;
+            var activationsRead = VulkanVideoPresenter.TryReadGdsDword(
+                dsAppendActivationDebugByteOffset,
+                out var activations);
+
             lock (_submitTraceGate)
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] agc.dispatch_reject.provenance source={source} " +
                     $"dims=0x{dimensionsAddress:X16} raw={rawX:X8}/{rawY:X8}/{rawZ:X8} " +
                     $"initiator=0x{initiator:X8} reason={reason} cs={shader} " +
-                    $"{DescribeDmaProvenance(dimensionsAddress, 12)}");
+                    $"{DescribeDmaProvenance(dimensionsAddress, 12)} " +
+                    $"ds_append_activations={(activationsRead ? activations.ToString() : "unavailable")}");
             }
 
             // The rejected dispatch never runs, so ObserveComputeDispatch never
