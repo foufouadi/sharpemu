@@ -2612,10 +2612,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private unsafe nint CreateExceptionHandlerTrampoline(nint managedHandler)
 	{
 		// Live VEH trampoline used by SetupExceptionHandler. Must pre-filter
-		// FastFail / CLR / MSVC C++ / stack-overflow the same way as
-		// WindowsFaultHandling.CreateHandlerThunk: entering managed VEH while
-		// the thread is in cooperative GC mode fail-fasts with
-		// "UnmanagedCallersOnly method from managed code" (tLT18–22).
+		// FastFail / CLR / MSVC C++ / stack-overflow / debug-print / RIP-range
+		// the same way as WindowsFaultHandling.CreateHandlerThunk: entering
+		// managed VEH while the thread is in cooperative GC mode fail-fasts
+		// with "UnmanagedCallersOnly method from managed code" (tLT18–22).
 		// Extra headroom for native tbb abort + recursive managed-entry spinlock.
 		const uint stubSize = 2048u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
@@ -2629,10 +2629,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		ReadOnlySpan<uint> nonManagedExceptionCodes =
 		[
-			0xE0434352u, // CLR managed exception
-			0xE06D7363u, // MSVC C++ exception
-			0xC0000409u, // STATUS_STACK_BUFFER_OVERRUN / FailFast
-			0xC00000FDu, // STATUS_STACK_OVERFLOW
+			Windows.WindowsFaultCodes.ClrManagedException,
+			Windows.WindowsFaultCodes.MsvcCppException,
+			Windows.WindowsFaultCodes.FastFail,
+			Windows.WindowsFaultCodes.StackOverflow,
+			Windows.WindowsFaultCodes.DbgPrintExceptionC,
+			Windows.WindowsFaultCodes.DbgPrintExceptionWideC,
+			Windows.WindowsFaultCodes.MsVcThreadNameException,
 		];
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [rcx]
 		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x00); // mov eax, [rax] ExceptionCode
@@ -2651,11 +2654,28 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 
+		// A fault whose RIP sits in JIT or system code (>= 0x7FF0'0000'0000)
+		// means the thread is in cooperative mode inside managed code; the
+		// reverse-P/Invoke entry itself would FailFast. Guest code, return
+		// sentinels and emitted stubs all live at low addresses, so the
+		// handler still sees everything it is meant to recover.
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x08); // mov rax, [rcx+8] (ContextRecord*)
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x80);                                   // mov rax, [rax+0xF8] (Rip)
+		EmitUInt32(code, ref offset, 0xF8u);
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0xBA);                                                                     // mov r10, imm64
+		*(ulong*)(code + offset) = 0x00007FF000000000UL;
+		offset += sizeof(ulong);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xD0);                                   // cmp rax, r10
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x83);                                                                     // jae pass (rel32, patched below)
+		var ripRangeJumpSlot = offset;
+		EmitUInt32(code, ref offset, 0u);
+
 		EmitByte(code, ref offset, 0xE9); // jmp mainBody (rel32; FastFail breadcrumb sits between)
 		var mainBodyJumpSlot = offset;
 		EmitUInt32(code, ref offset, 0u);
 
 		int passOffset = offset;
+		*(int*)(code + ripRangeJumpSlot) = passOffset - (ripRangeJumpSlot + sizeof(int));
 		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0); // xor eax, eax
 		EmitByte(code, ref offset, 0xC3);
 
