@@ -45,3 +45,18 @@ ehthumbs.db
 .vscode/
 clean_test/
 .debug/
+
+# Local debugging session artifacts (logs, crash dumps, RenderDoc
+# captures) — kept on disk for reference, never pushed.
+/log_*.txt
+/log_*.err
+/crashdumps/
+/renderdoc-captures/
+/*.pid
+/*_stack*.txt
+/*_exports.txt
+/yotei_*.png
+/PROGRESS.md
+/HIZ_INVESTIGATION.md
+/GDS_HANDOFF.md
+/scripts/resolve_got_plt_callers.py
