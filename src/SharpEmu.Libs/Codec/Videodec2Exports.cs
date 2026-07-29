@@ -3,7 +3,6 @@
 
 using System.Collections.Concurrent;
 using SharpEmu.HLE;
-using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Codec;
 
@@ -202,15 +201,26 @@ public static class Videodec2Exports
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
 
-        if (Decoders.TryGetValue(handle, out var decoder) && decoder is not null &&
-            decoder.TryDrain(out var bgraFrame, out var hasPicture, out var width, out var height) &&
-            hasPicture && bgraFrame is not null)
+        if (Decoders.TryGetValue(handle, out var decoder) && decoder is not null)
         {
-            VulkanVideoPresenter.Submit(bgraFrame, width, height);
-            if (ctx.TryWriteUInt64(outputInfoAddress + 0x08, width) &&
-                ctx.TryWriteUInt64(outputInfoAddress + 0x10, height))
+            // Report a frame the worker already finished first; only once
+            // that's caught up do we queue a fresh drain request, so a game
+            // that calls Flush in a loop (per this export's own doc
+            // comment) drains strictly in order. Actual pixels go through
+            // Videodec2Decoder's own scheduler thread -- see that class's
+            // doc comment for why Flush/Decode never call
+            // VulkanVideoPresenter.Submit directly anymore.
+            if (decoder.TryConsumeProtocolReadySignal(out var width, out var height))
             {
-                _ = ctx.Memory.TryWrite(outputInfoAddress, PictureReady);
+                if (ctx.TryWriteUInt64(outputInfoAddress + 0x08, width) &&
+                    ctx.TryWriteUInt64(outputInfoAddress + 0x10, height))
+                {
+                    _ = ctx.Memory.TryWrite(outputInfoAddress, PictureReady);
+                }
+            }
+            else
+            {
+                decoder.RequestDrain();
             }
         }
 
@@ -322,27 +332,23 @@ public static class Videodec2Exports
             return SetReturn(ctx, Ok);
         }
 
-        if (!decoder.TryDecode(auBuffer, out var bgraFrame, out var hasPicture, out var width, out var height))
+        // Decode runs on Videodec2Decoder's own worker/scheduler pipeline,
+        // never on this (guest) thread -- see that class's doc comment for
+        // the full design and why an earlier, decode-worker-only attempt
+        // broke playback (nothing paced frames to real time). This just
+        // queues the AU (sub-millisecond) and reports whatever frame the
+        // pipeline already finished from an EARLIER call (not necessarily
+        // this AU's own result -- H.264 already has multi-frame reordering
+        // delay the game's own loop already tolerates, per this export's
+        // own doc comment on rsi/rdx roles) via TryConsumeProtocolReadySignal.
+        // Actual pixels reach the screen through the decoder's own scheduler
+        // thread on its own paced timer, not through this call at all.
+        decoder.EnqueueAccessUnit(auBuffer);
+
+        if (!decoder.TryConsumeProtocolReadySignal(out var width, out var height))
         {
-            // A hard FFmpeg decode error: keep the movie moving rather than
-            // wedging it -- report "no picture" for this AU like the
-            // no-decoder stub does, instead of failing the whole call.
             return SetReturn(ctx, Ok);
         }
-
-        if (!hasPicture || bgraFrame is null)
-        {
-            return SetReturn(ctx, Ok);
-        }
-
-        // slotPtr/slotSize (the game's own fixed 4096-byte scratch struct)
-        // can't hold a real decoded frame -- see Videodec2Decoder's own doc
-        // comment on OutputPixelFormat for the live evidence. Present
-        // straight to the screen instead, the same host-buffer bypass
-        // Bink2 already uses in this codebase (VulkanVideoPresenter.Submit),
-        // and still satisfy the game's own state machine (dimensions +
-        // picture-ready byte) so it doesn't stall or error out.
-        VulkanVideoPresenter.Submit(bgraFrame, width, height);
 
         if (!ctx.TryWriteUInt64(outputInfoAddress + 0x08, width) ||
             !ctx.TryWriteUInt64(outputInfoAddress + 0x10, height) ||

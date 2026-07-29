@@ -557,6 +557,22 @@ internal static unsafe class VulkanVideoPresenter
     // render thread reaches the previous image, which otherwise starves
     // presentation indefinitely.
     private static readonly Queue<Presentation> _pendingGuestImagePresentations = new();
+    // Submit() (sceVideodec2's own scheduler thread, ~30Hz) used to overwrite
+    // _latestPresentation directly -- a single slot, "latest wins". Measured
+    // live on Ghost of Yotei: 582 frames submitted, only 338 (58%) ever
+    // reached the screen, because the render loop doesn't poll frequently
+    // enough (or is busy draining other GPU work between two Submit() calls)
+    // to catch every one before the next overwrites it -- not a decode bug,
+    // not a Vulkan bug, just frames replaced before they were ever read.
+    // Same fix as _pendingGuestImagePresentations above, same
+    // MaxPendingGuestFlipVersions bound: a small FIFO instead of one slot,
+    // so a render tick that falls a frame or two behind still catches up
+    // instead of silently dropping the intermediate ones. Bounded (not
+    // unbounded) deliberately -- if the renderer falls behind further than
+    // this, showing several-seconds-stale video would be worse than
+    // dropping the overflow, so this still degrades to "latest wins"
+    // beyond the bound rather than growing latency without limit.
+    private static readonly Queue<Presentation> _pendingVideoPresentations = new();
     private static readonly Dictionary<ulong, long> _guestImageWorkSequences = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     // Write-tracker generation last uploaded for a CPU-backed guest image.
@@ -842,6 +858,7 @@ internal static unsafe class VulkanVideoPresenter
         _pendingSyncGuestWorkCount = 0;
         _pendingGuestWorkBytes = 0;
         _pendingGuestImagePresentations.Clear();
+        _pendingVideoPresentations.Clear();
         _guestImageWorkSequences.Clear();
         _availableGuestImages.Clear();
         _cpuBackedUploadGenerations.Clear();
@@ -897,7 +914,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(
+            var presentation = new Presentation(
                 bgraFrame,
                 width,
                 height,
@@ -906,6 +923,21 @@ internal static unsafe class VulkanVideoPresenter
                 TranslatedDraw: null,
                 RequiredGuestWorkSequence: 0,
                 IsSplash: false);
+
+            // Queued (see _pendingVideoPresentations's own comment for why)
+            // instead of just overwriting _latestPresentation -- but still
+            // dual-written there too so a render tick that finds the queue
+            // already drained (normal once caught up) still has a frame to
+            // fall back to via the existing TryTakePresentation path, and
+            // any other code still reading _latestPresentation directly
+            // keeps seeing the most recent frame.
+            _pendingVideoPresentations.Enqueue(presentation);
+            while (_pendingVideoPresentations.Count > MaxPendingGuestFlipVersions)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            _latestPresentation = presentation;
             if (_thread is not null)
             {
                 return;
@@ -2523,6 +2555,24 @@ internal static unsafe class VulkanVideoPresenter
 
                 presentation = default;
                 return false;
+            }
+
+            // sceVideodec2's own scheduler thread (~30Hz) -- see
+            // _pendingVideoPresentations's own comment. Same drop-stale-then-
+            // take-oldest shape as the guest-image queue above; video's
+            // RequiredGuestWorkSequence is always 0 (trivially complete), so
+            // this never blocks the way the guest-image queue's own gating
+            // can.
+            while (_pendingVideoPresentations.Count > 0 &&
+                   _pendingVideoPresentations.Peek().Sequence <= presentedSequence)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            if (_pendingVideoPresentations.Count > 0)
+            {
+                presentation = _pendingVideoPresentations.Dequeue();
+                return true;
             }
 
             if (_latestPresentation is not { } latest ||
