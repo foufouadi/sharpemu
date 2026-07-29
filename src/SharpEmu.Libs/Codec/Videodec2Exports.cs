@@ -1,19 +1,33 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Collections.Concurrent;
 using SharpEmu.HLE;
+using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Codec;
 
 /// <summary>
 /// libSceVideodec2 (hardware compute-based decoder, distinct from the
-/// software-path libSceVideodec above). Only the capability-query surface
-/// needed to let callers finish decoder setup is implemented; actual
-/// hardware-accelerated decode is out of scope.
+/// software-path libSceVideodec above). The capability-query surface keeps
+/// the decoder lifecycle resolvable regardless of whether real decode is
+/// available; sceVideodec2Decode itself now feeds a real FFmpeg H.264
+/// session (Videodec2Decoder) when one could be opened, falling back to the
+/// original "no picture" stub if FFmpeg's native libraries are missing or a
+/// given decoder failed to open -- see docs/ffmpeg-videodec2-groundwork.md.        
 /// </summary>
 public static class Videodec2Exports
 {
     private const int Ok = 0;
+
+    // Real decoder instance per opaque handle, or null when TryCreate()
+    // failed (FFmpeg unavailable, or this particular open failed) -- a null
+    // entry still occupies a valid handle so every other export's lifecycle
+    // bookkeeping (Decode/Flush/Reset/DeleteDecoder all keying off the same
+    // handle) doesn't need a separate "is this a real decoder" branch; it
+    // just falls back to the pre-existing stub behavior per call.
+    private static readonly ConcurrentDictionary<ulong, Videodec2Decoder?> Decoders = new();
+    private static long _nextDecoderHandle = unchecked((long)DecoderToken);
 
     [SysAbiExport(
         Nid = "RnDibcGCPKw",
@@ -39,6 +53,15 @@ public static class Videodec2Exports
     }
 
     private const int VideodecErrorInvalidArg = unchecked((int)0x80620801);
+
+    // Sanity bounds for the AU/output-slot size fields read out of guest
+    // memory before allocating buffers of that size: a real H.264 access
+    // unit is normally well under 1 MB even for a keyframe, and even an 8K
+    // NV12 frame (7680x4320x1.5) is ~50 MB, so both ceilings have generous
+    // headroom while still catching garbage/not-yet-primed struct reads
+    // (observed in practice) before they reach `new byte[...]` and throw.
+    private const ulong MaxPlausibleAuBytes = 32UL * 1024 * 1024;
+    private const ulong MaxPlausibleSlotBytes = 64UL * 1024 * 1024;
 
     // Yotei's movie player (thread MovieDecoder) calls this once during boot
     // (caller 0x800E20206: rdi = out queue on the stack, rsi = compute memory
@@ -104,7 +127,10 @@ public static class Videodec2Exports
     // Caller 0x800E20425: CreateDecoder(config=rdi, memoryInfo=rsi,
     // out decoder=rdx). The handle is opaque to the game — the very next use
     // (0x800E20457) loads it back only to pass as rdi to the next Videodec2
-    // import.
+    // import. Real callers get a fresh handle per call (monotonic counter
+    // seeded at the old fixed token, so it stays in the same address range
+    // callers have always seen); TryCreate() failing just means Decode
+    // falls back to the original stub for this specific handle.
     [SysAbiExport(
         Nid = "CNNRoRYd8XI",
         ExportName = "sceVideodec2CreateDecoder",
@@ -113,8 +139,18 @@ public static class Videodec2Exports
     public static int Videodec2CreateDecoder(CpuContext ctx)
     {
         var decoderAddress = ctx[CpuRegister.Rdx];
-        if (decoderAddress == 0 || !ctx.TryWriteUInt64(decoderAddress, DecoderToken))
+        if (decoderAddress == 0)
         {
+            return SetReturn(ctx, VideodecErrorInvalidArg);
+        }
+
+        var handle = unchecked((ulong)Interlocked.Increment(ref _nextDecoderHandle));
+        Decoders[handle] = Videodec2Decoder.TryCreate();
+
+        if (!ctx.TryWriteUInt64(decoderAddress, handle))
+        {
+            Decoders.TryRemove(handle, out var created);
+            created?.Dispose();
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
 
@@ -159,12 +195,23 @@ public static class Videodec2Exports
         LibraryName = "libSceVideodec2")]
     public static int Videodec2Flush(CpuContext ctx)
     {
+        var handle = ctx[CpuRegister.Rdi];
         var outputInfoAddress = ctx[CpuRegister.Rdx];
-        ReadOnlySpan<byte> noPicture = [0];
-        if (outputInfoAddress == 0 ||
-            !ctx.Memory.TryWrite(outputInfoAddress, noPicture))
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
+        }
+
+        if (Decoders.TryGetValue(handle, out var decoder) && decoder is not null &&
+            decoder.TryDrain(out var bgraFrame, out var hasPicture, out var width, out var height) &&
+            hasPicture && bgraFrame is not null)
+        {
+            VulkanVideoPresenter.Submit(bgraFrame, width, height);
+            if (ctx.TryWriteUInt64(outputInfoAddress + 0x08, width) &&
+                ctx.TryWriteUInt64(outputInfoAddress + 0x10, height))
+            {
+                _ = ctx.Memory.TryWrite(outputInfoAddress, PictureReady);
+            }
         }
 
         return SetReturn(ctx, Ok);
@@ -190,6 +237,12 @@ public static class Videodec2Exports
         LibraryName = "libSceVideodec2")]
     public static int Videodec2DeleteDecoder(CpuContext ctx)
     {
+        var handle = ctx[CpuRegister.Rdi];
+        if (Decoders.TryRemove(handle, out var decoder))
+        {
+            decoder?.Dispose();
+        }
+
         return SetReturn(ctx, Ok);
     }
 
@@ -201,6 +254,24 @@ public static class Videodec2Exports
     // MUST be written 0 explicitly (a stale 1 would publish a garbage frame).
     // Exactly one byte — the notice-screen canary smash came from widening
     // exactly this kind of write.
+    //
+    // rsi/rdx roles were originally guessed backwards (rsi=output,
+    // rdx=input) and swapped after live evidence proved it wrong: rsi's
+    // struct is populated call-to-call by the game's own NAL demuxer
+    // (0x800E25520, confirmed by static disassembly to scan for Annex-B
+    // start codes and write {tag=0x30, ptr, len} entries into a table at
+    // [decoder_state+0x28], stride 0x30 -- exactly the stride Decode's rsi
+    // argument walks one entry per call) with a genuinely varying
+    // pointer/size (e.g. 0x1010c9d2c0/249250, 0x1010cda062/13157); a live
+    // dump of the bytes at that pointer showed real Annex-B data (`00 00 00
+    // 01 06 05 FF FF FF 1F ...`, start code + SEI/slice NAL headers). rdx's
+    // fields, by contrast, are a single fixed address (0x2020cb6500) and
+    // size (4096) on every call, always zero -- an unwritten scratch/output
+    // buffer, not an input. So: rsi's fields (+0x08=AU data pointer,
+    // +0x10=AU byte size) are the Annex-B access unit already demuxed by
+    // the game; rdx's fields (+0x08=destination pointer, +0x10=destination
+    // byte capacity) are the buffer this export decodes NV12 pixels into
+    // when a real decoder is attached.
     [SysAbiExport(
         Nid = "852F5+q6+iM",
         ExportName = "sceVideodec2Decode",
@@ -208,40 +279,83 @@ public static class Videodec2Exports
         LibraryName = "libSceVideodec2")]
     public static int Videodec2Decode(CpuContext ctx)
     {
-        if (DebugDumpEnabled)
-        {
-            var outputSlotObj = ctx[CpuRegister.Rsi];
-            var inputAuStruct = ctx[CpuRegister.Rdx];
-            DumpDebugStruct(ctx, "Decode outputSlotObj", outputSlotObj, 0x18);
-            DumpDebugStruct(ctx, "Decode inputAuStruct", inputAuStruct, 0x18);
-            if (inputAuStruct != 0 &&
-                ctx.TryReadUInt64(inputAuStruct + 0x08, out var auDataPtr) &&
-                ctx.TryReadUInt64(inputAuStruct + 0x10, out var auDataSize))
-            {
-                Console.Error.WriteLine(
-                    $"[VIDEODEC2][DEBUG] Decode AU data ptr=0x{auDataPtr:x} size={auDataSize}");
-                DumpDebugStruct(ctx, "Decode AU bytes", auDataPtr, (int)Math.Min(auDataSize, 64UL));
-            }
-
-            if (outputSlotObj != 0 &&
-                ctx.TryReadUInt64(outputSlotObj, out var slotPtr) &&
-                ctx.TryReadUInt64(outputSlotObj + 0x08, out var slotSize))
-            {
-                Console.Error.WriteLine(
-                    $"[VIDEODEC2][DEBUG] Decode output slot ptr=0x{slotPtr:x} size={slotSize}");
-            }
-        }
-
+        var handle = ctx[CpuRegister.Rdi];
+        var inputAuStruct = ctx[CpuRegister.Rsi];
+        var outputSlotObj = ctx[CpuRegister.Rdx];
         var outputInfoAddress = ctx[CpuRegister.Rcx];
-        ReadOnlySpan<byte> noPicture = [0];
-        if (outputInfoAddress == 0 ||
-            !ctx.Memory.TryWrite(outputInfoAddress, noPicture))
+
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
 
+        if (!Decoders.TryGetValue(handle, out var decoder) || decoder is null)
+        {
+            // No real decoder for this handle (FFmpeg unavailable, or this
+            // CreateDecoder call failed to open one) -- pre-existing stub
+            // behavior: "fed the AU, no picture", never fatal.
+            return SetReturn(ctx, Ok);
+        }
+
+        if (inputAuStruct == 0 ||
+            // +0x00 is a constant tag (observed 0x30 on every call, written
+            // by the game's own NAL demuxer alongside these fields -- see
+            // this export's doc comment); never consumed here.
+            !ctx.TryReadUInt64(inputAuStruct + 0x08, out var auDataPtr) ||
+            !ctx.TryReadUInt64(inputAuStruct + 0x10, out var auDataSize) ||
+            auDataPtr == 0 || auDataSize == 0 || auDataSize > MaxPlausibleAuBytes ||
+            outputSlotObj == 0 ||
+            !ctx.TryReadUInt64(outputSlotObj + 0x08, out var slotPtr) ||
+            !ctx.TryReadUInt64(outputSlotObj + 0x10, out var slotSize) ||
+            slotPtr == 0 || slotSize == 0 || slotSize > MaxPlausibleSlotBytes)
+        {
+            // No AU this call (e.g. a flush-shaped invocation), no
+            // destination slot, or a size field outside plausible bounds --
+            // not an error, just nothing sane to feed/fill this call, same
+            // as the AU==0 case above.
+            return SetReturn(ctx, Ok);
+        }
+
+        var auBuffer = new byte[auDataSize];
+        if (!ctx.Memory.TryRead(auDataPtr, auBuffer))
+        {
+            return SetReturn(ctx, Ok);
+        }
+
+        if (!decoder.TryDecode(auBuffer, out var bgraFrame, out var hasPicture, out var width, out var height))
+        {
+            // A hard FFmpeg decode error: keep the movie moving rather than
+            // wedging it -- report "no picture" for this AU like the
+            // no-decoder stub does, instead of failing the whole call.
+            return SetReturn(ctx, Ok);
+        }
+
+        if (!hasPicture || bgraFrame is null)
+        {
+            return SetReturn(ctx, Ok);
+        }
+
+        // slotPtr/slotSize (the game's own fixed 4096-byte scratch struct)
+        // can't hold a real decoded frame -- see Videodec2Decoder's own doc
+        // comment on OutputPixelFormat for the live evidence. Present
+        // straight to the screen instead, the same host-buffer bypass
+        // Bink2 already uses in this codebase (VulkanVideoPresenter.Submit),
+        // and still satisfy the game's own state machine (dimensions +
+        // picture-ready byte) so it doesn't stall or error out.
+        VulkanVideoPresenter.Submit(bgraFrame, width, height);
+
+        if (!ctx.TryWriteUInt64(outputInfoAddress + 0x08, width) ||
+            !ctx.TryWriteUInt64(outputInfoAddress + 0x10, height) ||
+            !ctx.Memory.TryWrite(outputInfoAddress, PictureReady))
+        {
+            return SetReturn(ctx, Ok);
+        }
+
         return SetReturn(ctx, Ok);
     }
+
+    private static readonly byte[] NoPicture = [0];
+    private static readonly byte[] PictureReady = [1];
 
     private static int SetReturn(CpuContext ctx, int result)
     {
