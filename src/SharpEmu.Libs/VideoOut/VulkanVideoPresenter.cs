@@ -5517,16 +5517,6 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        // Presenter-thread entry point for the GDS readback fence (see the static
-        // FlushGpuWorkForGdsReadback wrapper). FlushBatchedGuestCommands submits
-        // any command buffer still being batched so its fence is pending before
-        // we wait for every guest submission to complete.
-        internal void WaitForSubmittedGuestGpuWork()
-        {
-            FlushBatchedGuestCommands();
-            WaitForAllGuestSubmissions();
-        }
-
         private void WaitForAllGuestSubmissions()
         {
             while (_pendingGuestSubmissions.Count != 0)

@@ -13,7 +13,9 @@ using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Diagnostics;
+using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -245,6 +247,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private ulong _entryPoint;
 
 	private CpuContext? _cpuContext;
+
+	// OS thread id of the guest entry thread (RunGuestEntryStub), used by
+	// LogMainThreadOsLiveness to ask the kernel directly whether that thread
+	// is still alive when a flip stall is being diagnosed.
+	private static int _mainEntryHostThreadId;
+
+	// Previous-sample state for the flip-stall diagnostic snapshot: detects
+	// whether the main thread's RIP or a guest thread's import count moved
+	// since the last snapshot.
+	private ulong _flipStallPrevMainRip;
+	private readonly Dictionary<ulong, long> _flipStallPrevImportCounts = new();
 
 	// Debugger seam; both null when no debugger is attached.
 	private ICpuDebugHook? _debugHook;
@@ -6440,6 +6453,34 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Volatile.Write(ref _lastProgressTimestamp, Stopwatch.GetTimestamp());
 	}
 
+	private static long _lastFlipStallLogTimestamp;
+
+	private static double GetFlipStallLogThresholdSeconds()
+	{
+		if (double.TryParse(
+			Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_THRESHOLD_SECONDS"),
+			System.Globalization.NumberStyles.Float,
+			System.Globalization.CultureInfo.InvariantCulture,
+			out var result))
+		{
+			return Math.Max(0, result);
+		}
+		return 10;
+	}
+
+	private static double GetFlipStallLogIntervalSeconds()
+	{
+		if (double.TryParse(
+			Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_INTERVAL_SECONDS"),
+			System.Globalization.NumberStyles.Float,
+			System.Globalization.CultureInfo.InvariantCulture,
+			out var result))
+		{
+			return Math.Max(0.1, result);
+		}
+		return 5;
+	}
+
 	private static int GetStallWatchdogSeconds()
 	{
 		if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_STALL_WATCHDOG_SECONDS"), out var result))
@@ -7675,8 +7716,41 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private unsafe static bool GetThreadContext(nint hThread, void* lpContext) =>
 		OperatingSystem.IsWindows() && Win32GetThreadContext(hThread, lpContext);
 
+	private unsafe static bool SetThreadContext(nint hThread, void* lpContext) =>
+		OperatingSystem.IsWindows() && Win32SetThreadContext(hThread, lpContext);
+
+	private const uint ThreadQueryLimitedInformation = 0x0800u;
+	private const uint StillActiveExitCode = 0x103u;
+
+	private static bool GetExitCodeThread(nint hThread, out uint exitCode)
+	{
+		if (!OperatingSystem.IsWindows())
+		{
+			exitCode = 0;
+			return false;
+		}
+		return Win32GetExitCodeThread(hThread, out exitCode);
+	}
+
 	private static bool CloseHandle(nint hObject) =>
 		OperatingSystem.IsWindows() && Win32CloseHandle(hObject);
+
+	// Direct execution maps guest virtual addresses 1:1 onto host address
+	// space, so these are plain pointer dereferences -- wrapped in try/catch
+	// since diagnostic callers probe addresses that may be unmapped.
+	private static unsafe bool TryReadGuestMemoryDirect(ulong address, out ulong value)
+	{
+		try
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+		catch
+		{
+			value = 0;
+			return false;
+		}
+	}
 
 	[DllImport("kernel32.dll", EntryPoint = "TlsAlloc")]
 	private static extern uint Win32TlsAlloc();
@@ -7726,6 +7800,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[DllImport("kernel32.dll", EntryPoint = "GetThreadContext", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private unsafe static extern bool Win32GetThreadContext(nint hThread, void* lpContext);
+
+	[DllImport("kernel32.dll", EntryPoint = "SetThreadContext", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private unsafe static extern bool Win32SetThreadContext(nint hThread, void* lpContext);
+
+	[DllImport("kernel32.dll", EntryPoint = "GetExitCodeThread", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private static extern bool Win32GetExitCodeThread(nint hThread, out uint lpExitCode);
 
 	[DllImport("kernel32.dll", EntryPoint = "CloseHandle", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
