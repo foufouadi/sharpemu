@@ -177,19 +177,6 @@ public static class AudioOut2Exports
         return SetReturn(ctx, 0);
     }
 
-    // Context-level attribute updates (3D object counts, submix routing, …)
-    // configure the hardware mixer; the host mixer accepts any configuration,
-    // and a failure aborts Yotei's audio arena bring-up.
-    [SysAbiExport(
-        Nid = "4dq2rblWlg0",
-        ExportName = "sceAudioOut2ContextSetAttributes",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAudioOut2")]
-    public static int AudioOut2ContextSetAttributes(CpuContext ctx)
-    {
-        return SetReturn(ctx, 0);
-    }
-
     // 3D-audio object latency hint; the host mixer has no object pipeline to
     // tune, but failure here makes Yotei tear down its whole ACM context and
     // abort audio arena bring-up.

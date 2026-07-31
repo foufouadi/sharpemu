@@ -16715,34 +16715,6 @@ public static partial class AgcExports
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
-    // Tessellation ring configuration: on hardware these hand the GPU driver a
-    // guest buffer for tessellation factors / offchip HS data. The Vulkan
-    // translator manages its own tessellation storage, so recording the call
-    // and reporting success lets renderer init proceed.
-    [SysAbiExport(
-        Nid = "XlNp7jzGiPo",
-        ExportName = "sceAgcDriverSetTFRing",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAgc")]
-    public static int DriverSetTFRing(CpuContext ctx)
-    {
-        TraceAgc(
-            $"agc.driver_set_tf_ring address=0x{ctx[CpuRegister.Rdi]:X16} size=0x{ctx[CpuRegister.Rsi]:X}");
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-    }
-
-    [SysAbiExport(
-        Nid = "MM4IZSEYytQ",
-        ExportName = "sceAgcDriverSetHsOffchipParam",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAgc")]
-    public static int DriverSetHsOffchipParam(CpuContext ctx)
-    {
-        TraceAgc(
-            $"agc.driver_set_hs_offchip_param param=0x{ctx[CpuRegister.Rdi]:X16} value=0x{ctx[CpuRegister.Rsi]:X}");
-        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
-    }
-
     [SysAbiExport(
         Nid = "U9ueyEhSkF4",
         ExportName = "sceAgcDriverRegisterDefaultOwner",

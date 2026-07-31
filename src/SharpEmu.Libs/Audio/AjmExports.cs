@@ -1409,36 +1409,4 @@ public static class AjmExports
         }
     }
 
-    // On hardware these pin guest direct memory for the codec DMA engine. The
-    // emulator decodes entirely on the host, so registration is bookkeeping
-    // only — but it must report success: Ghost of Yotei's audio arena
-    // bootstrap treats a registration failure as fatal, skips allocating its
-    // global arena table, and later null-derefs it from the mastering path.
-    [SysAbiExport(
-        Nid = "bkRHEYG6lEM",
-        ExportName = "sceAjmMemoryRegister",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAjm")]
-    public static int AjmMemoryRegister(CpuContext ctx)
-    {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AJM"), "1", StringComparison.Ordinal))
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][TRACE] ajm.memory_register instance=0x{ctx[CpuRegister.Rdi]:X} address=0x{ctx[CpuRegister.Rsi]:X16}");
-        }
-
-        ctx[CpuRegister.Rax] = 0;
-        return 0;
-    }
-
-    [SysAbiExport(
-        Nid = "pIpGiaYkHkM",
-        ExportName = "sceAjmMemoryUnregister",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAjm")]
-    public static int AjmMemoryUnregister(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = 0;
-        return 0;
-    }
 }
