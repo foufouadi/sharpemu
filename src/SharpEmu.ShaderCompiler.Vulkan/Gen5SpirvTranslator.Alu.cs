@@ -1443,42 +1443,6 @@ public static partial class Gen5SpirvTranslator
             return value;
         }
 
-        // v_fma_mix_* operand read: op_sel_hi[i] picks the operand's precision —
-        // set means it is an f16 (op_sel[i] selects the high/low 16-bit half, widened
-        // to f32), clear means it is a full f32. neg_hi[i] applies abs, neg_lo[i]
-        // negates (abs before negate, matching hardware modifier order).
-        private uint EmitFmaMixOperand(
-            Gen5ShaderInstruction instruction,
-            Gen5Vop3pControl control,
-            int index)
-        {
-            var raw = GetRawSource(instruction, index);
-            uint value;
-            if (((control.OpSelHiMask >> index) & 1) != 0)
-            {
-                var half = ((control.OpSelMask >> index) & 1) != 0
-                    ? ShiftRightLogical(raw, UInt(16))
-                    : raw;
-                value = Bitcast(_floatType, EmitHalfToFloat(half));
-            }
-            else
-            {
-                value = Bitcast(_floatType, raw);
-            }
-
-            if (((control.NegHiMask >> index) & 1) != 0)
-            {
-                value = Ext(4, _floatType, value);
-            }
-
-            if (((control.NegLoMask >> index) & 1) != 0)
-            {
-                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
-            }
-
-            return value;
-        }
-
         // fminnum_like / fmaxnum_like: if one operand is NaN return the other; if both
         // are NaN return a NaN; otherwise the ordered smaller/larger. The ordering of
         // -0/+0 is unspecified under these opcodes, so the ordered compare is enough.
