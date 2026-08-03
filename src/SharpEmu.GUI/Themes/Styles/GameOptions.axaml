@@ -103,6 +103,57 @@ Contextual per-game options reveal, actions, and selected-game motion.
     <Setter Property="Foreground" Value="White" />
   </Style>
 
+  <Style Selector="Button.optionsCircle.compact, ToggleButton.optionsCircle.compact">
+    <Setter Property="Width" Value="40" />
+    <Setter Property="Height" Value="40" />
+    <Setter Property="CornerRadius" Value="20" />
+  </Style>
+
+  <Style Selector="StackPanel.selectedDetailsHost">
+    <Setter Property="Spacing" Value="18" />
+  </Style>
+
+  <Style Selector="TextBlock.selectedGameTitle">
+    <Setter Property="FontSize" Value="42" />
+  </Style>
+
+  <Style Selector="StackPanel.selectedDetailsHost.gridLayout">
+    <Setter Property="Spacing" Value="12" />
+  </Style>
+
+  <Style Selector="StackPanel.selectedDetailsHost.gridLayout TextBlock.selectedGameTitle">
+    <Setter Property="FontSize" Value="26" />
+  </Style>
+
+  <Style Selector="Border.selectedDetailsDivider">
+    <Setter Property="Height" Value="1" />
+    <Setter Property="MinWidth" Value="440" />
+    <Setter Property="Margin" Value="0,0,0,18" />
+    <Setter Property="HorizontalAlignment" Value="Stretch" />
+    <Setter Property="Background">
+      <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+        <GradientStop Offset="0" Color="#00FFFFFF" />
+        <GradientStop Offset="0.06" Color="#2EFFFFFF" />
+        <GradientStop Offset="0.55" Color="#14FFFFFF" />
+        <GradientStop Offset="1" Color="#00FFFFFF" />
+      </LinearGradientBrush>
+    </Setter>
+  </Style>
+
+  <Style Selector="StackPanel.selectedDetailsHost.gridLayout Button.playButton">
+    <Setter Property="MinHeight" Value="44" />
+    <Setter Property="MinWidth" Value="168" />
+    <Setter Property="Padding" Value="28,10" />
+    <Setter Property="FontSize" Value="15" />
+  </Style>
+
+  <Style Selector="StackPanel.selectedDetailsHost.gridLayout Button.optionsCircle,
+                   StackPanel.selectedDetailsHost.gridLayout ToggleButton.optionsCircle">
+    <Setter Property="Width" Value="44" />
+    <Setter Property="Height" Value="44" />
+    <Setter Property="CornerRadius" Value="22" />
+  </Style>
+
   <Style Selector="Button.gameOptionsLaunch">
     <Setter Property="Width" Value="220" />
     <Setter Property="Height" Value="46" />

@@ -22,6 +22,7 @@ public partial class MainWindow
         "SHARPEMU_LOG_IO",
         "SHARPEMU_LOG_NP",
         "SHARPEMU_GUEST_IMAGE_CPU_SYNC",
+        "SHARPEMU_RENDERDOC",
     ];
 
     private readonly List<string> _gameEnvironmentPassthrough = new();
@@ -86,6 +87,7 @@ public partial class MainWindow
             CloseGameSettings();
             LaunchSelected();
         };
+        GameOptionsCloseButton.Click += (_, _) => CloseGameSettings();
         GameOptionsOpenFolderButton.Click += (_, _) => OpenSelectedGameFolder();
         GameOptionsCopyPathButton.Click += async (_, _) =>
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.Path);
@@ -140,6 +142,7 @@ public partial class MainWindow
             !string.IsNullOrWhiteSpace(game.TitleId);
 
         _isGameSettingsOpen = true;
+        SetGameOptionsPagesSpan(coversConsoleRow: true);
         SetGameOptionsOpenClass(BackdropLayer, active: true);
         SetGameOptionsOpenClass(CarouselHost, active: true);
         SetGameOptionsOpenClass(LibrarySelectedDetails, active: true);
@@ -158,6 +161,7 @@ public partial class MainWindow
         }
 
         _isGameSettingsOpen = false;
+        SetGameOptionsPagesSpan(coversConsoleRow: false);
         SetGameOptionsNavigationIndicator(_gameOptionsIndicatorIndex, animate: false);
         _gameSettingsTitleId = null;
         _gameEnvironmentPassthrough.Clear();
@@ -438,6 +442,11 @@ public partial class MainWindow
             animate);
     }
 
+    private void SetGameOptionsPagesSpan(bool coversConsoleRow)
+    {
+        Grid.SetRowSpan(PagesHost, coversConsoleRow ? 2 : 1);
+    }
+
     private Button[] GameOptionsNavigationButtons() =>
     [
         GameOptionsGeneralNav,
@@ -474,20 +483,9 @@ public partial class MainWindow
         ("SHARPEMU_LOG_IO", GameEnvLogIoToggle),
         ("SHARPEMU_LOG_NP", GameEnvLogNpToggle),
         ("SHARPEMU_GUEST_IMAGE_CPU_SYNC", GameEnvGuestImageCpuSyncToggle),
+        ("SHARPEMU_RENDERDOC", GameEnvRenderDocToggle),
     ];
 
-    private static void SetGameOptionsOpenClass(Control control, bool active)
-    {
-        if (active)
-        {
-            if (!control.Classes.Contains("gameOptionsOpen"))
-            {
-                control.Classes.Add("gameOptionsOpen");
-            }
-        }
-        else
-        {
-            control.Classes.Remove("gameOptionsOpen");
-        }
-    }
+    private static void SetGameOptionsOpenClass(Control control, bool active) =>
+        SetClass(control, "gameOptionsOpen", active);
 }

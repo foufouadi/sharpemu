@@ -1650,8 +1650,11 @@ public static partial class AgcExports
     private const uint SpiShaderPgmRsrc1Hs = 0x10A;
     private const uint SpiShaderPgmLoLs = 0x148;
     private const uint SpiShaderPgmHiLs = 0x149;
-    private const uint SpiShaderPgmLoGs = 0x8A;
-    private const uint SpiShaderPgmHiGs = 0x8B;
+    // Not 0x8A/0x8B - those are SPI_SHADER_PGM_RSRC1/RSRC2_GS, and reading them
+    // as an address yields a 58-bit value (observed live: 0x30004622C008300).
+    private const uint SpiShaderPgmLoGs = 0x88;
+    private const uint SpiShaderPgmHiGs = 0x89;
+    private const uint SpiShaderPgmRsrc1Gs = 0x8A;
     private const uint SpiShaderPgmChksumGs = 0x80;
     private const uint SpiPsInputEna = 0x1B3;
     private const uint SpiPsInputAddr = 0x1B4;
@@ -1694,9 +1697,15 @@ public static partial class AgcExports
     private const uint CbColor0Base = 0x318;
     private const uint CbColorRegisterStride = 15;
     private const uint CbColor0Info = 0x31C;
+    private const uint CbColor0ClearWord0 = 0x323;
+    private const uint CbColor0ClearWord1 = 0x324;
     private const uint CbColor0BaseExt = 0x390;
     private const uint CbColor0Attrib2 = 0x3B0;
     private const uint CbColor0Attrib3 = 0x3B8;
+    // CB_COLORn_INFO.DCC_ENABLE (gc_10_1_0_sh_mask.h). On GFX10 the legacy
+    // FAST_CLEAR and COMPRESSION bits stay clear because DCC, not CMASK,
+    // carries the compression.
+    private const uint CbColorInfoDccEnableMask = 1u << 28;
     private const uint CbBlend0Control = 0x1E0;
     private const uint PaScModeCntl0 = 0x292;
     // GFX10 DB context registers (register byte address minus 0x28000, / 4).
@@ -2310,7 +2319,8 @@ public static partial class AgcExports
         float ClearRed = 0f,
         float ClearGreen = 0f,
         float ClearBlue = 0f,
-        float ClearAlpha = 1f);
+        float ClearAlpha = 1f,
+        bool IsDccFastClear = false);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -4220,6 +4230,18 @@ public static partial class AgcExports
     public static int DcbDrawIndexIndirectGetSize(CpuContext ctx)
     {
         ctx[CpuRegister.Rax] = 5u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
+    }
+
+    [SysAbiExport(
+        Nid = "r98I08t+LOg",
+        ExportName = "sceAgcDcbDrawIndexIndirectMultiGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexIndirectMultiGetSize(CpuContext ctx)
+    {
+        // Eight, matching the packet DcbDrawIndexIndirectMulti emits.
+        ctx[CpuRegister.Rax] = 8u * sizeof(uint);
         return (int)ctx[CpuRegister.Rax];
     }
 
@@ -9384,6 +9406,48 @@ public static partial class AgcExports
     }
 
     /// <summary>
+    /// Test-only view of a parsed graphics context register. False when the
+    /// register was never written.
+    /// </summary>
+    internal static bool TryGetGraphicsContextRegisterForTests(
+        CpuContext ctx,
+        uint registerOffset,
+        out uint value)
+    {
+        value = 0;
+        if (!_submittedGpuStates.TryGetValue(ctx.Memory, out var gpuState))
+        {
+            return false;
+        }
+
+        lock (gpuState.Gate)
+        {
+            return gpuState.Graphics.CxRegisters.TryGetValue(registerOffset, out value);
+        }
+    }
+
+    /// <summary>
+    /// SH-register counterpart of <see cref="TryGetGraphicsContextRegisterForTests"/>;
+    /// the shader stage addresses live here.
+    /// </summary>
+    internal static bool TryGetGraphicsShRegisterForTests(
+        CpuContext ctx,
+        uint registerOffset,
+        out uint value)
+    {
+        value = 0;
+        if (!_submittedGpuStates.TryGetValue(ctx.Memory, out var gpuState))
+        {
+            return false;
+        }
+
+        lock (gpuState.Gate)
+        {
+            return gpuState.Graphics.ShRegisters.TryGetValue(registerOffset, out value);
+        }
+    }
+
+    /// <summary>
     /// GraphicsDcbSetIndexSize writes VGT_INDEX_TYPE via SET_UCONFIG_REG.
     /// Mirror that into <see cref="SubmittedDcbState.IndexSize"/>.
     /// </summary>
@@ -9763,6 +9827,29 @@ public static partial class AgcExports
                     $"agc.hardware_color_resolve_unavailable seq={drawSequence} " +
                     $"src=0x{resolveSource.Address:X16} " +
                     $"dst=0x{resolveDestination.Address:X16}");
+            }
+
+            // A DCC fast clear writes metadata only; the colour block discards
+            // the quad's shaded output. Reset the attachment and drop the draw,
+            // which reproduces the observable effect of a clear to zero without
+            // modelling DCC block state.
+            if (translatedDraw.IsDccFastClear)
+            {
+                foreach (var target in translatedDraw.GuestTargets)
+                {
+                    if (target.Address != 0)
+                    {
+                        VulkanVideoPresenter.RequestGuestColorClear(target.Address);
+                    }
+                }
+
+                ReturnPooledDrawArrays(
+                    translatedDraw,
+                    globals: true,
+                    vertex: true,
+                    index: true);
+                state.TranslatedDraw = null;
+                return;
             }
 
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
@@ -10401,22 +10488,6 @@ public static partial class AgcExports
             }
         }
 
-        state.UcRegisters.TryGetValue(VgtPrimitiveType, out var earlyPrimitiveType);
-        if (IsRectListPrimitive(earlyPrimitiveType) &&
-            (exportEvaluation.VertexInputs is null || exportEvaluation.VertexInputs.Count == 0) &&
-            !VertexProgramExportsParameters(exportState.Program) &&
-            GetInterpolatedAttributeCount(pixelState) != 0)
-        {
-            ReturnPooledEvaluationArrays(exportEvaluation);
-            ReturnPooledEvaluationArrays(pixelEvaluation);
-            error =
-                $"rect-list-no-param-exports ps_inputs={GetInterpolatedAttributeCount(pixelState)}";
-            TraceAgcShader(
-                $"agc.rect_list_skip es=0x{exportShaderAddress:X16} " +
-                $"ps=0x{pixelShaderAddress:X16} {error}");
-            return false;
-        }
-
         // Every bound color target the shader exports to. Deferred renderers
         // draw a multi-render-target G-buffer (up to eight slots) in one pass.
         // Fall back to slot 0 if we cannot match any export to a bound target.
@@ -10697,6 +10768,12 @@ public static partial class AgcExports
             pixelUserData[index] = pixelEvaluation.InitialScalarRegisters[index];
         }
 
+        var renderState = ApplyTransparentPremultipliedFillClear(
+            CreateRenderState(state.CxRegisters, renderTargets, pixelColorExportMasks),
+            textures,
+            vertexInputs,
+            pixelEvaluation.InitialScalarRegisters);
+
         draw = new TranslatedGuestDraw(
             exportShaderAddress,
             pixelShaderAddress,
@@ -10714,11 +10791,7 @@ public static partial class AgcExports
             renderTargets,
             DecodeDepthTarget(state.CxRegisters),
             guestTargets,
-            ApplyTransparentPremultipliedFillClear(
-                CreateRenderState(state.CxRegisters, renderTargets, pixelColorExportMasks),
-                textures,
-                vertexInputs,
-                pixelEvaluation.InitialScalarRegisters),
+            renderState,
             pixelUserData,
             state.CxRegisters.TryGetValue(CbBlend0Control, out var rawBlend) ? rawBlend : 0,
             state.CxRegisters.TryGetValue(
@@ -10732,7 +10805,15 @@ public static partial class AgcExports
             fullscreenClearColor.Red,
             fullscreenClearColor.Green,
             fullscreenClearColor.Blue,
-            fullscreenClearColor.Alpha);
+            fullscreenClearColor.Alpha,
+            IsDccFastClearDraw(
+                state.CxRegisters,
+                renderTargets,
+                textures,
+                vertexInputs,
+                renderState,
+                primitiveType,
+                vertexCount));
         return true;
     }
 
@@ -11009,6 +11090,113 @@ public static partial class AgcExports
         };
     }
 
+    /// <summary>
+    /// Recognises the covering quad a GFX10 driver issues to clear a
+    /// DCC-compressed colour target. There is no clear packet: the driver
+    /// programs CB_COLORn_CLEAR_WORD0/1 and draws a quad that the colour block
+    /// turns into DCC clear codes, discarding whatever the pixel shader
+    /// exported. Executing it as an ordinary draw writes the shaded output
+    /// instead, and because the blend it uses computes
+    /// <c>a &lt;- a_src + a_dst * (1 - a_src)</c> - fixed point 1 - the target's
+    /// alpha then climbs every frame and saturates.
+    ///
+    /// Restricted to clear-to-zero. The reset performed for a match clears the
+    /// attachment to zero, so a nonzero CLEAR_WORD would be cleared to the
+    /// wrong colour; those fall through and are drawn. Zero is zero under every
+    /// encoding the register can carry, so the pair needs no format handling.
+    ///
+    /// The clip-space test is load-bearing rather than belt-and-braces: fills
+    /// sharing the vertex count, topology and blend outnumber the clears by two
+    /// orders of magnitude and sit at coordinates well outside the frame.
+    /// </summary>
+    private const uint TriangleStripPrimitive = 6;
+
+    // A float32x3 vertex position stream (BUF_DATA_FORMAT_32_32_32 / FLOAT).
+    private const uint PositionDataFormat = 13;
+    private const uint PositionNumberFormat = 7;
+
+    private static bool IsDccFastClearDraw(
+        IReadOnlyDictionary<uint, uint> registers,
+        IReadOnlyList<RenderTargetDescriptor> renderTargets,
+        IReadOnlyList<TranslatedImageBinding> textures,
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
+        GuestRenderState renderState,
+        uint primitiveType,
+        uint vertexCount)
+    {
+        if (textures.Count != 0 ||
+            vertexCount != 4 ||
+            primitiveType != TriangleStripPrimitive ||
+            renderTargets.Count == 0 ||
+            renderState.Blends.Count == 0 ||
+            !renderState.Blends.All(IsTransparentPremultipliedFillBlend))
+        {
+            return false;
+        }
+
+        var slotStride = renderTargets[0].Slot * CbColorRegisterStride;
+        return registers.TryGetValue(CbColor0Info + slotStride, out var info) &&
+            (info & CbColorInfoDccEnableMask) != 0 &&
+            registers.TryGetValue(CbColor0ClearWord0 + slotStride, out var clearWord0) &&
+            registers.TryGetValue(CbColor0ClearWord1 + slotStride, out var clearWord1) &&
+            clearWord0 == 0 &&
+            clearWord1 == 0 &&
+            CoversClipSpace(vertexInputs, vertexCount);
+    }
+
+    /// <summary>
+    /// True when the draw's float32x3 position stream spans the full clip
+    /// rectangle, i.e. x and y both reach -1 and +1.
+    /// </summary>
+    private static bool CoversClipSpace(
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
+        uint vertexCount)
+    {
+        const float Tolerance = 0.001f;
+        foreach (var input in vertexInputs)
+        {
+            if (input.DataFormat != PositionDataFormat ||
+                input.NumberFormat != PositionNumberFormat)
+            {
+                continue;
+            }
+
+            var stride = input.Stride == 0 ? 12u : input.Stride;
+            var available = Math.Min(input.DataLength, input.Data.Length);
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+            var seen = 0;
+            for (var vertex = 0u; vertex < vertexCount; vertex++)
+            {
+                var at = (int)(input.OffsetBytes + (vertex * stride));
+                if (at + 12 > available)
+                {
+                    break;
+                }
+
+                var position = input.Data.AsSpan(at);
+                var x = BitConverter.ToSingle(position);
+                var y = BitConverter.ToSingle(position[4..]);
+                if (!float.IsFinite(x) || !float.IsFinite(y))
+                {
+                    return false;
+                }
+
+                minX = Math.Min(minX, x);
+                maxX = Math.Max(maxX, x);
+                minY = Math.Min(minY, y);
+                maxY = Math.Max(maxY, y);
+                seen++;
+            }
+
+            return seen >= 3 &&
+                minX <= -1f + Tolerance && maxX >= 1f - Tolerance &&
+                minY <= -1f + Tolerance && maxY >= 1f - Tolerance;
+        }
+
+        return false;
+    }
+
     private static bool IsTransparentPremultipliedFillBlend(GuestBlendState blend) =>
         blend is
         {
@@ -11192,20 +11380,6 @@ public static partial class AgcExports
         target < ColorTargetCount
             ? (packedMasks >> (int)(target * 4)) & 0xFu
             : 0;
-
-    private static bool VertexProgramExportsParameters(Gen5ShaderProgram program)
-    {
-        foreach (var instruction in program.Instructions)
-        {
-            if (instruction.Control is Gen5ExportControl export &&
-                export.Target is >= 32 and < 64)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
 
     private static uint GetInterpolatedAttributeCount(Gen5ShaderState state)
     {
@@ -15869,13 +16043,16 @@ public static partial class AgcExports
             // GTA V Enhanced HS headers start at RSRC1/RSRC2 (0x10A/0x10B) and
             // omit PGM_LO/HI from the default table. Still succeed: the code VA
             // lives at ShaderCodeOffset and later binder paths republish it.
-            if (shaderType == HsFrontShaderType && firstLo is SpiShaderPgmRsrc1Hs or SpiShaderPgmLoHs)
+            // GS front headers can likewise start at RSRC1_GS (0x8A) instead of
+            // PGM_LO_GS (0x88) - same deal, skip the patch here.
+            if ((shaderType == HsFrontShaderType && firstLo is SpiShaderPgmRsrc1Hs or SpiShaderPgmLoHs) ||
+                (shaderType == GsFrontShaderType && firstLo is SpiShaderPgmRsrc1Gs or SpiShaderPgmLoGs))
             {
                 TraceCreateShader(
                     0,
                     headerAddress,
                     codeAddress,
-                    $"skip-pgm-patch type={HsFrontShaderType} first_lo=0x{firstLo:X8}");
+                    $"skip-pgm-patch type={shaderType} first_lo=0x{firstLo:X8}");
                 return true;
             }
 
@@ -16029,9 +16206,6 @@ public static partial class AgcExports
 
     private static bool IsEsGeometryShaderType(byte shaderType) =>
         shaderType is GsShaderType or GsBackShaderType;
-
-    private static bool IsRectListPrimitive(uint primitiveType) =>
-        AgcPrimitiveHelpers.IsRectListPrimitive(primitiveType);
 
     private static int SetIndirectPatchAddress(CpuContext ctx, string registerSpace)
     {

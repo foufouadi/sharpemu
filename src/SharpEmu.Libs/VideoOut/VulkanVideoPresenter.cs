@@ -3,6 +3,7 @@
 
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
+using System.Collections.Concurrent;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Media;
@@ -1350,6 +1351,25 @@ internal static unsafe class VulkanVideoPresenter
 
             _guestImageWorkSequences[address] = EnqueueGuestWorkLocked(
                 new VulkanGuestImageWrite(address, null, fillValue));
+        }
+    }
+
+    private static readonly ConcurrentDictionary<ulong, byte> _pendingGuestColorClears = new();
+
+    /// <summary>
+    /// Clear a guest colour target to zero at its next render pass.
+    ///
+    /// Deliberately not <see cref="SubmitOffscreenColorClear"/>: that enqueues
+    /// a CmdClearColorImage which lands outside the render pass that follows
+    /// it, so a target cleared this way was still observed reading back its
+    /// previous contents. Dropping <c>Initialized</c> makes the render pass
+    /// itself clear via <see cref="AttachmentLoadOp.Clear"/>.
+    /// </summary>
+    internal static void RequestGuestColorClear(ulong address)
+    {
+        if (address != 0)
+        {
+            _pendingGuestColorClears[address] = 0;
         }
     }
 
@@ -4328,6 +4348,10 @@ internal static unsafe class VulkanVideoPresenter
                 "vkCreateDebugUtilsMessengerEXT");
         }
 
+
+        [ThreadStatic]
+        private static string? _pendingShaderModuleDumpPath;
+
         private static unsafe uint DebugCallback(
             DebugUtilsMessageSeverityFlagsEXT severity,
             DebugUtilsMessageTypeFlagsEXT type,
@@ -4342,6 +4366,24 @@ internal static unsafe class VulkanVideoPresenter
                 _ => "[VULKAN][INFO]",
             };
             Console.Error.WriteLine($"{prefix} {message}");
+
+
+            if (severity == DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt &&
+                message is not null &&
+                message.Contains("vkCreateShaderModule", StringComparison.Ordinal))
+            {
+                var dumpPath = _pendingShaderModuleDumpPath;
+                var dumpHint = dumpPath is null
+                    ? "Set SHARPEMU_SHADER_SPIRV_DUMP_DIR to a directory to "
+                        + "capture every module's .spv bytes for offline "
+                        + "spirv-dis/spirv-val analysis."
+                    : $"Dumped module for this failure: {dumpPath}";
+
+                Console.Error.WriteLine(
+                    "[SHARPEMU][ERROR] A guest shader compiled to invalid SPIR-V."
+                    + "The shader module was created without an API-level error. {dumpHint}");
+            }
+
             return Vk.False;
         }
         private void CreateSurface()
@@ -7167,6 +7209,7 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         private static int _shaderModuleDumpCounter;
+        private static int _shaderModuleDumpSequence;
 
         private ShaderModule CreateShaderModule(byte[] code)
         {
@@ -7177,18 +7220,38 @@ internal static unsafe class VulkanVideoPresenter
                 File.WriteAllBytes(Path.Combine(_spirvDumpDirectory, $"module_{index:D5}.spv"), code);
             }
 
-            fixed (byte* codePointer = code)
+            string? dumpPath = null;
+            var dumpDirectory = Environment.GetEnvironmentVariable("SHARPEMU_SHADER_SPIRV_DUMP_DIR");
+            if (!string.IsNullOrWhiteSpace(dumpDirectory))
             {
-                var createInfo = new ShaderModuleCreateInfo
+                Directory.CreateDirectory(dumpDirectory);
+
+                var sequence = Interlocked.Increment(ref _shaderModuleDumpSequence);
+                dumpPath = Path.Combine(dumpDirectory, $"{sequence:D4}.spv");
+                File.WriteAllBytes(dumpPath, code);
+
+                _pendingShaderModuleDumpPath = dumpPath;
+            }
+
+            try
+            {
+                fixed (byte* codePointer = code)
                 {
-                    SType = StructureType.ShaderModuleCreateInfo,
-                    CodeSize = (nuint)code.Length,
-                    PCode = (uint*)codePointer,
-                };
-                Check(
-                    _vk.CreateShaderModule(_device, &createInfo, null, out var module),
-                    "vkCreateShaderModule");
-                return module;
+                    var createInfo = new ShaderModuleCreateInfo
+                    {
+                        SType = StructureType.ShaderModuleCreateInfo,
+                        CodeSize = (nuint)code.Length,
+                        PCode = (uint*)codePointer,
+                    };
+                    Check(
+                        _vk.CreateShaderModule(_device, &createInfo, null, out var module),
+                        "vkCreateShaderModule");
+                    return module;
+                }
+            }
+            finally
+            {
+                _pendingShaderModuleDumpPath = null;
             }
         }
 
@@ -10479,7 +10542,12 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
-            var endAddress = checked(guestBuffer.BaseAddress + size);
+            if (guestBuffer.BaseAddress > ulong.MaxValue - size)
+            {
+                return CreateTransientGlobalBufferResource(guestBuffer);
+            }
+
+            var endAddress = guestBuffer.BaseAddress + size;
             GuestBufferAllocation? allocation = null;
             foreach (var candidate in _guestBufferAllocations)
             {
@@ -10723,9 +10791,14 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 var size = (ulong)Math.Max(buffer.Length, sizeof(uint));
+                if (buffer.BaseAddress > ulong.MaxValue - size - 3)
+                {
+                    continue;
+                }
+
                 var alignedStart = buffer.BaseAddress &
                     ~(GuestStorageBufferOffsetAlignment - 1);
-                var paddedEnd = checked(buffer.BaseAddress + size + 3) & ~3UL;
+                var paddedEnd = (buffer.BaseAddress + size + 3) & ~3UL;
                 ranges.Add((
                     alignedStart,
                     paddedEnd));
@@ -13261,6 +13334,17 @@ internal static unsafe class VulkanVideoPresenter
                 // format could later be replayed inside a render pass of the
                 // other identity.
                 formats[index] = targets[index].Format;
+
+                // Guest colour attachments load their previous contents on
+                // every pass after the first, so nothing resets one until the
+                // guest clears it. Consume a pending clear here, before the
+                // render pass is built, so the pass uses LoadOp.Clear.
+                if (work.Targets[index].Address != 0 &&
+                    _pendingGuestColorClears.TryRemove(work.Targets[index].Address, out _))
+                {
+                    targets[index].Initialized = false;
+                }
+
                 if (work.Targets[index].Address != 0 &&
                     TakeGuestImageInitialData(work.Targets[index].Address) is { } initialData &&
                     !targets[index].Initialized &&
@@ -16681,6 +16765,7 @@ internal static unsafe class VulkanVideoPresenter
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
+            RenderDocCapture.OnPresent();
             VideoOutExports.ReportPresentedFrame();
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();

@@ -36,7 +36,7 @@ public partial class MainWindow : Window
     private const int MaxConsoleLines = 4000;
     private const int MaxConsoleLinesPerFlush = 500;
     private static readonly TimeSpan NavigationIndicatorAnimationDuration =
-        TimeSpan.FromMilliseconds(240);
+        TimeSpan.FromMilliseconds(180);
 
     private static readonly IBrush DefaultLineBrush = new SolidColorBrush(Color.Parse("#C7CFDE"));
     private static readonly IBrush DimLineBrush = new SolidColorBrush(Color.Parse("#6B7488"));
@@ -123,6 +123,7 @@ public partial class MainWindow : Window
     private bool _isClosing;
     private bool _restoringGameSelection;
     private bool _addFolderInProgress;
+    private bool _isLibraryGridLayout;
     private GameEntry? _lastSelectedGame;
 
     // Bundled key art shown whenever no game-specific backdrop applies; the
@@ -134,6 +135,8 @@ public partial class MainWindow : Window
     private HostGamepadButtons _previousPadButtons;
     private long _navLeftNextAt;
     private long _navRightNextAt;
+    private long _navUpNextAt;
+    private long _navDownNextAt;
 
     //Github http client for latest commit
     private static readonly HttpClient GithubHttpClient = CreateGithubHttpClient();
@@ -219,6 +222,9 @@ public partial class MainWindow : Window
         CloseConsoleButton.Click += (_, _) => ConsoleToggle.IsChecked = false;
         LibraryTabButton.Click += (_, _) => SetActivePage(0);
         OptionsTabButton.Click += (_, _) => SetActivePage(1);
+        LibraryLayoutButton.Click += (_, _) => ToggleLibraryLayout();
+        LibraryPage.SizeChanged += (_, _) => UpdateLibraryGridHeight();
+        LibrarySelectedDetails.SizeChanged += (_, _) => UpdateLibraryGridHeight();
         ConsoleToggle.IsCheckedChanged += (_, _) => ConsolePanel.IsVisible = ConsoleToggle.IsChecked == true && _consoleWindow is null;
         WireOptionsNavigation();
         WireGameOptions();
@@ -284,6 +290,35 @@ public partial class MainWindow : Window
             SetEnvironmentToggle(
                 "SHARPEMU_GUEST_IMAGE_CPU_SYNC",
                 EnvGuestImageCpuSyncToggle.IsChecked == true);
+        DefaultProfileBox.TextChanged += (_, _) =>
+            _settings.DefaultProfile = GuiSettings.NormalizeDefaultProfile(DefaultProfileBox.Text);
+        LanguageBox.SelectionChanged += (_, _) => OnLanguageChanged();
+
+        GameList.AddHandler(ContextRequestedEvent, OnGameContextRequested, RoutingStrategies.Tunnel);
+        AddHandler(KeyDownEvent, OnPreviewKeyDown, RoutingStrategies.Tunnel);
+        CtxLaunch.Click += (_, _) => LaunchSelected();
+        CtxOpenFolder.Click += (_, _) => OpenSelectedGameFolder();
+        CtxCopyPath.Click += async (_, _) =>
+            await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.Path);
+        CtxCopyTitleId.Click += async (_, _) =>
+            await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId);
+        CtxGameSettings.Click += (_, _) => OpenSelectedGameSettings();
+        CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
+
+        Opened += async (_, _) => await OnOpenedAsync();
+        Closing += (_, _) => BeginWindowClosing();
+        Closed += (_, _) => CompleteWindowClosing();
+
+        SdlLauncherGamepad.EnsureStarted();
+        _gamepadTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(50),
+        };
+        EnvRenderDocToggle.IsCheckedChanged += (_, _) =>
+
+            SetEnvironmentToggle(
+                "SHARPEMU_RENDERDOC",
+                EnvRenderDocToggle.IsChecked == true);
         DefaultProfileBox.TextChanged += (_, _) =>
             _settings.DefaultProfile = GuiSettings.NormalizeDefaultProfile(DefaultProfileBox.Text);
         LanguageBox.SelectionChanged += (_, _) => OnLanguageChanged();
@@ -379,18 +414,73 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void SetActiveClass(Button button, bool active)
+    private void SetLibraryLayout(bool grid)
+    {
+        _isLibraryGridLayout = grid;
+        SetClass(GameList, "gridLayout", grid);
+        SetClass(LibrarySelectedDetails, "gridLayout", grid);
+        LibraryPage.RowDefinitions[0].Height = grid
+            ? GridLength.Auto
+            : new GridLength(188);
+        LibraryPage.Margin = grid
+            ? new Thickness(0, 6, 0, 0)
+            : new Thickness(0, 46, 0, 0);
+        UpdateLibraryGridHeight();
+        UpdateLibraryLayoutButton();
+
+        if (GameList.SelectedItem is { } selected)
+        {
+            Dispatcher.UIThread.Post(
+                () => GameList.ScrollIntoView(selected),
+                DispatcherPriority.Loaded);
+        }
+    }
+
+    private void UpdateLibraryGridHeight()
+    {
+        var pageHeight = LibraryPage.Bounds.Height;
+        if (!_isLibraryGridLayout || pageHeight <= 0)
+        {
+            GameList.MaxHeight = double.PositiveInfinity;
+            return;
+        }
+
+        GameList.MaxHeight = Math.Max(
+            0,
+            pageHeight - LibrarySelectedDetails.DesiredSize.Height);
+    }
+
+    private void ToggleLibraryLayout()
+    {
+        SetLibraryLayout(!_isLibraryGridLayout);
+        _settings.LibraryLayout = _isLibraryGridLayout ? "Grid" : "Carousel";
+        _settings.Save();
+    }
+
+    private void UpdateLibraryLayoutButton()
+    {
+        LibraryLayoutGlyph.Text = _isLibraryGridLayout ? "view_carousel" : "grid_view";
+        var label = Localization.Instance.Get(
+            _isLibraryGridLayout ? "Library.View.Carousel" : "Library.View.Grid");
+        ToolTip.SetTip(LibraryLayoutButton, label);
+        AutomationProperties.SetName(LibraryLayoutButton, label);
+    }
+
+    private static void SetActiveClass(Button button, bool active) =>
+        SetClass(button, "active", active);
+
+    private static void SetClass(Control control, string className, bool active)
     {
         if (active)
         {
-            if (!button.Classes.Contains("active"))
+            if (!control.Classes.Contains(className))
             {
-                button.Classes.Add("active");
+                control.Classes.Add(className);
             }
         }
         else
         {
-            button.Classes.Remove("active");
+            control.Classes.Remove(className);
         }
     }
 
@@ -494,7 +584,7 @@ public partial class MainWindow : Window
         translationAnimation.InsertExpressionKeyFrame(
             1f,
             "this.FinalValue",
-            new SineEaseInOut());
+            new CubicEaseOut());
 
         var animations = visual.Compositor.CreateImplicitAnimationCollection();
         animations[nameof(CompositionVisual.Translation)] = translationAnimation;
@@ -676,6 +766,23 @@ public partial class MainWindow : Window
             MoveSelection(1);
         }
 
+        if (_isLibraryGridLayout)
+        {
+            var up = (pad.Buttons & HostGamepadButtons.Up) != 0 || pad.LeftY < 64;
+            var down = (pad.Buttons & HostGamepadButtons.Down) != 0 || pad.LeftY > 192;
+            var rowStep = LibraryRowStep();
+
+            if (ShouldNavigate(up, ref _navUpNextAt, now))
+            {
+                MoveSelection(-rowStep);
+            }
+
+            if (ShouldNavigate(down, ref _navDownNextAt, now))
+            {
+                MoveSelection(rowStep);
+            }
+        }
+
         var pressed = pad.Buttons & ~_previousPadButtons;
         if ((pressed & HostGamepadButtons.Cross) != 0)
         {
@@ -710,6 +817,29 @@ public partial class MainWindow : Window
         }
 
         return false;
+    }
+
+    private int LibraryRowStep()
+    {
+        if (GameList.ContainerFromIndex(0) is not { } first)
+        {
+            return 1;
+        }
+
+        var top = first.Bounds.Top;
+        var columns = 1;
+        for (var index = 1; index < _libraryTiles.Count; index++)
+        {
+            if (GameList.ContainerFromIndex(index) is not { } container ||
+                Math.Abs(container.Bounds.Top - top) > 0.5)
+            {
+                break;
+            }
+
+            columns++;
+        }
+
+        return columns;
     }
 
     private void MoveSelection(int delta)
@@ -747,6 +877,8 @@ public partial class MainWindow : Window
         {
             _ = CheckForUpdatesAsync();
         }
+
+        SeedLibraryFromCache();
         await RescanLibraryAsync();
     }
 
@@ -783,6 +915,7 @@ public partial class MainWindow : Window
         RefreshHostRefreshRates(_settings.RefreshRate);
         RefreshUpdateText();
         UpdateEmptyStateTexts();
+        UpdateLibraryLayoutButton();
         UpdateRunButtons();
     }
 
@@ -1067,6 +1200,7 @@ public partial class MainWindow : Window
         LogToFileToggle.IsChecked = _settings.LogToFile;
         OverrideLogFileToggle.IsChecked = _settings.OverrideLogFile;
         TitleMusicToggle.IsChecked = _settings.PlayTitleMusic;
+        SetLibraryLayout(string.Equals(_settings.LibraryLayout, "Grid", StringComparison.OrdinalIgnoreCase));
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
         AutoUpdateToggle.IsChecked = _settings.CheckForUpdatesOnStartup;
         EnvBthidToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_BTHID_UNAVAILABLE");
@@ -1079,6 +1213,8 @@ public partial class MainWindow : Window
         EnvLogNpToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_NP");
         EnvGuestImageCpuSyncToggle.IsChecked =
             _settings.EnvironmentToggles.Contains("SHARPEMU_GUEST_IMAGE_CPU_SYNC");
+        EnvRenderDocToggle.IsChecked =
+            _settings.EnvironmentToggles.Contains("SHARPEMU_RENDERDOC");
         DefaultProfileBox.Text = _settings.DefaultProfile;
         WindowModeBox.SelectedIndex = ChoiceIndex(_settings.WindowMode, "Windowed", "Borderless", "Exclusive");
         LoadHostDisplayOptions();
@@ -1444,6 +1580,31 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Paints the previous scan's result before the real scan starts. The
+    /// scan that follows reconciles over this, so the cache only ever
+    /// shortens the blank period; it never decides what the library holds.
+    /// </summary>
+    private void SeedLibraryFromCache()
+    {
+        Dispatcher.UIThread.VerifyAccess();
+
+        if (_allGames.Count != 0)
+        {
+            return;
+        }
+
+        var cached = GameLibraryCache.Load(_settings.GameFolders.ToArray());
+        if (cached.Count == 0)
+        {
+            return;
+        }
+
+        _allGames.AddRange(cached);
+        RefreshVisibleGames(new HashSet<GameEntry>(cached));
+        LoadGameDetailsInBackground(cached, cached);
+    }
+
     private async Task RescanLibraryAsync(bool showProgress = true)
     {
         Dispatcher.UIThread.VerifyAccess();
@@ -1473,6 +1634,7 @@ public partial class MainWindow : Window
         LoadingState.IsVisible = false;
         LoadGameDetailsInBackground(reconciliation.CoversToLoad, reconciliation.Games);
         UpdateDiscordPresence();
+        GameLibraryCache.Save(folders, reconciliation.Games);
     }
 
     /// <summary>
