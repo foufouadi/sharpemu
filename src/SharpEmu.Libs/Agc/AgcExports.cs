@@ -14366,7 +14366,9 @@ public static partial class AgcExports
                     dispatch.ThreadCountZ);
                 // Vulkan queue order keeps dependent dispatches coherent. CPU visibility is
                 // published by explicit PM4 release/write actions instead of per dispatch.
-                gpuDispatch = true;
+                // workSequence is 0 when the dispatch was dropped (degenerate/closed presenter)
+                // instead of handed to the guest-work queue.
+                gpuDispatch = workSequence > 0;
                 if (writesGlobalMemory)
                 {
                     var wgwStart = (_timeWaitMonitorEnabled && _inOrphanReplay)
@@ -14445,7 +14447,9 @@ public static partial class AgcExports
             }
         }
 
-        if (evaluationHandledByCpu)
+        // Rejected/CPU-handled dispatches never hand evaluation's pooled buffers to a
+        // consumer that would return them; reclaim here to keep GuestDataPool.Shared bounded.
+        if (evaluationHandledByCpu || !gpuDispatch)
         {
             ReturnPooledEvaluationArrays(evaluation);
         }
