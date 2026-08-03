@@ -468,18 +468,6 @@ public static class KernelExports
     }
 
     [SysAbiExport(
-    Nid = "tU5e3f9gSiU",
-    ExportName = "sceKernelIsTrinityMode",
-    Target = Generation.Gen4 | Generation.Gen5,
-    LibraryName = "libKernel")]
-    public static int KernelIsTrinityMode(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = 0;
-
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-    }
-
-    [SysAbiExport(
     Nid = "DLORcroUqbc",
     ExportName = "sceKernelGetOpenPsId",
     Target = Generation.Gen4 | Generation.Gen5,
