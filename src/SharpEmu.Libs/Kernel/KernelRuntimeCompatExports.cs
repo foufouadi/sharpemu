@@ -1512,6 +1512,19 @@ public static class KernelRuntimeCompatExports
     }
 
     [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx)
+    {
+        // Same ABI as sceKernelGetModuleInfoForUnwind: (address, flags, outInfo).
+        // Unity titles (Outer Wilds) call this during startup for stack unwinding;
+        // delegate to the kernel implementation so module lookups stay consistent.
+        return KernelGetModuleInfoForUnwind(ctx);
+    }
+
+    [SysAbiExport(
         Nid = "WslcK1FQcGI",
         ExportName = "sceKernelIsNeoMode",
         Target = Generation.Gen4 | Generation.Gen5,
