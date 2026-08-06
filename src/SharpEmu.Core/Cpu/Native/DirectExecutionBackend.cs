@@ -3966,6 +3966,51 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					continue;
 				}
 
+				// Diagnostic only (investigation aid, not a behavior change):
+				// resume_rip is the CPU emulator's own recorded continuation
+				// point -- what this thread will execute the instant it wakes
+				// -- unlike the ad-hoc "read [RSP] right now" ret= used
+				// elsewhere (KernelSemaphoreCompatExports.FormatCallSite),
+				// which was found to not even land on a valid instruction
+				// boundary for this livelock's signaler. This one is
+				// authoritative because it's exactly the Rip DirectExecution
+				// resumes the guest CPU context at.
+				var resumeRip = thread.BlockedContinuation.Rip;
+				// Investigation-only: unwind a few RBP-chained frames from the
+				// continuation to find the REAL caller of the Baselib wait
+				// wrapper resume_rip lands in -- resume_rip alone is one frame
+				// too deep (inside the wrapper's own cleanup tail), not the
+				// Unity/job-system code that decided to wait. Standard
+				// [rbp+0]=saved rbp, [rbp+8]=return address chain; best-effort,
+				// bails out on the first bad-looking frame (guest memory is
+				// mapped directly into this process per TryReadGuestMemoryDirect,
+				// so an out-of-range rbp just throws and we stop there).
+				var callerChain = string.Empty;
+				if (string.Equals(wakeKey, "sceKernelWaitSema:00000027", StringComparison.Ordinal))
+				{
+					try
+					{
+						var rbp = thread.BlockedContinuation.Rbp;
+						var frames = new List<string>();
+						for (var depth = 0; depth < 6 && rbp != 0; depth++)
+						{
+							if (!TryReadGuestMemoryDirect(rbp + 8, out var retAddr) || retAddr < 0x100000000UL)
+							{
+								break;
+							}
+							frames.Add($"0x{retAddr:X}");
+							if (!TryReadGuestMemoryDirect(rbp, out var nextRbp) || nextRbp <= rbp)
+							{
+								break;
+							}
+							rbp = nextRbp;
+						}
+						callerChain = frames.Count > 0 ? $" callers=[{string.Join(",", frames)}]" : "";
+					}
+					catch
+					{
+					}
+				}
 				thread.State = GuestThreadRunState.Ready;
 				thread.BlockReason = null;
 				thread.BlockDeadlineTimestamp = 0;
@@ -3973,7 +4018,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
 				Console.Error.WriteLine(
-					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
+					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey} resume_rip=0x{resumeRip:X16}{callerChain}");
 			}
 
 			// TOCTOU guard: a signal can arrive between the export requesting a
@@ -6999,6 +7044,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Interlocked.Decrement(ref _readyGuestThreadCount);
 			if (candidate.State != GuestThreadRunState.Ready)
 			{
+				// Investigation-only: this branch DROPS the dequeued entry --
+				// no re-enqueue -- on the assumption something else already
+				// owns getting this thread running again. If that assumption
+				// is wrong for some code path, this is a silent, permanent
+				// starvation: the thread sits in _guestThreads forever but
+				// never returns to _readyGuestThreads. Logging every drop
+				// (unconditional, not behind _logGuestThreads) to find out
+				// whether that's happening for the threads that never run
+				// again after creation (Outer Wilds: 'Gfx Task Executor' et al).
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] guest_threads.dropped_non_ready_from_queue " +
+					$"handle=0x{candidate.ThreadHandle:X16} name='{candidate.Name}' state={candidate.State} " +
+					$"executor_active={candidate.ExecutorActive}");
 				continue;
 			}
 
@@ -7024,6 +7082,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			candidate.ExecutorActive = true;
 			candidate.State = GuestThreadRunState.Running;
 			thread = candidate;
+			// Investigation-only: unconditional confirmation this thread was
+			// actually claimed and handed to an executor -- the counterpart
+			// to the drop log above, so "created but never seen again" can
+			// be told apart from "claimed, then silent for an untraced reason".
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] guest_threads.claimed_for_execution handle=0x{candidate.ThreadHandle:X16} name='{candidate.Name}'");
 			return true;
 		}
 

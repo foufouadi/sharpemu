@@ -79,7 +79,14 @@ public static class KernelSemaphoreCompatExports
 
         if (_traceSema)
         {
-            TraceSemaphore($"create handle=0x{handle:X8} name='{name}' attr=0x{attr:X} init={initialCount} max={maxCount}");
+            // FormatCallSite here is reliable (unlike the async signal-side
+            // "guest=0x0" case seen elsewhere): CreateSema runs synchronously
+            // on the actual calling guest thread's own stack, so [RSP] really
+            // is that thread's return address into the caller that requested
+            // this semaphore -- exactly what's needed to find out who a
+            // never-signaled semaphore like Gfx Task Executor's belongs to
+            // and what code created it for.
+            TraceSemaphore($"create handle=0x{handle:X8} name='{name}' attr=0x{attr:X} init={initialCount} max={maxCount} {FormatCallSite(ctx)}");
         }
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
@@ -349,6 +356,14 @@ public static class KernelSemaphoreCompatExports
         // Bounding by signalCount (rather than the unbounded default) lets
         // WakeBlockedThreads latch exactly that many units for waiters still
         // mid-registration in the TOCTOU window, instead of just one.
+        //
+        // Investigated as a possible cause of a separate Outer Wilds stall
+        // (a helper thread's private semaphore that's created but never
+        // signaled by anyone): reverting this bound to unconditional and
+        // re-running did NOT fix it (still exactly one block, zero wakes,
+        // even with a full scan every signal) -- ruled out. That stall's
+        // root cause is elsewhere (nothing enqueues the work that would
+        // signal it); keeping the signalCount bound as-is here.
         _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle), signalCount);
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
