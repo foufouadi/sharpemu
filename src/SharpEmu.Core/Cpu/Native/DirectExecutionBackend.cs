@@ -3994,12 +3994,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// its signalCount), latch that many units instead of a flat 1. A
 			// single multi-token signal that finds zero registered waiters
 			// must still be able to rescue every one of them as they finish
-			// registering, not just the first. For unbounded broadcasts
-			// (maxCount left at the int.MaxValue default) the exact remaining
-			// capacity is unknowable here, so fall back to 1 latch unit.
+			// registering, not just the first.
+			//
+			// For unbounded broadcasts (maxCount left at the int.MaxValue
+			// default — event flags, condvars, rwlocks) the exact remaining
+			// capacity isn't knowable here, so this deliberately latches
+			// exactly 1 unit rather than 0 or maxCount:
+			//   - 0 would bring back the original bug for this class of key
+			//     (the TOCTOU-window signal is dropped again).
+			//   - maxCount (i.e. int.MaxValue) would let one broadcast latch
+			//     wake an unbounded number of future registrants for a key
+			//     that was only ever signaled once.
+			// 1 unit only guarantees the *first* thread that registers after
+			// this wake gets rescued; a second thread caught in the same
+			// TOCTOU window is not. That's an acceptable trade-off (not a
+			// silent loss) because these primitives are broadcast/level-style
+			// and get re-signaled on the next relevant state change, unlike a
+			// semaphore's one-shot token — an under-latched waiter here
+			// self-heals on the next signal instead of staying stuck forever.
+			// Math.Max guards against a negative latch count if wakeCount
+			// somehow exceeded maxCount; the loop above already prevents
+			// that (it stops once wakeCount >= maxCount), but the clamp costs
+			// nothing and removes the need to prove it by inspection.
 			if (wakeCount < maxCount)
 			{
-				var latchUnits = maxCount == int.MaxValue ? 1 : maxCount - wakeCount;
+				var latchUnits = maxCount == int.MaxValue ? 1 : Math.Max(0, maxCount - wakeCount);
 				_pendingBlockWakeKeys.TryGetValue(wakeKey, out var pendingCount);
 				_pendingBlockWakeKeys[wakeKey] = pendingCount + latchUnits;
 			}
