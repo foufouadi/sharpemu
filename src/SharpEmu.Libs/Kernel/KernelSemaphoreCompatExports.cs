@@ -346,7 +346,10 @@ public static class KernelSemaphoreCompatExports
 
         // Wake cooperatively-blocked guest threads; their wake predicate
         // acquires the tokens atomically, so this respects the new count.
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        // Bounding by signalCount (rather than the unbounded default) lets
+        // WakeBlockedThreads latch exactly that many units for waiters still
+        // mid-registration in the TOCTOU window, instead of just one.
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle), signalCount);
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
@@ -367,6 +370,7 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        int newCount;
         lock (semaphore.Gate)
         {
             if (waitingThreadsAddress != 0 && !TryWriteUInt32(ctx, waitingThreadsAddress, unchecked((uint)semaphore.WaitingThreads)))
@@ -374,7 +378,8 @@ public static class KernelSemaphoreCompatExports
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            semaphore.Count = setCount < 0 ? semaphore.InitialCount : setCount;
+            newCount = setCount < 0 ? semaphore.InitialCount : setCount;
+            semaphore.Count = newCount;
             semaphore.WaitingThreads = 0;
             Monitor.PulseAll(semaphore.Gate);
             if (_traceSema)
@@ -383,7 +388,10 @@ public static class KernelSemaphoreCompatExports
             }
         }
 
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        // Bound by the resulting token count, same reasoning as
+        // sceKernelSignalSema: lets the TOCTOU latch reflect exactly how many
+        // registering waiters this cancel can satisfy instead of just one.
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle), Math.Max(newCount, 1));
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 

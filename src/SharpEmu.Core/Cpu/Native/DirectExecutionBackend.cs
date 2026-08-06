@@ -732,6 +732,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private int _readyGuestThreadCount;
 
+	// Wake keys signaled while no matching blocked thread was registered yet
+	// (TOCTOU window between RequestCurrentThreadBlock and
+	// RegisterBlockedGuestThreadContinuation). When a thread finally registers
+	// with one of these keys it must be readied immediately so the signal is
+	// not lost — otherwise the guest thread stays Blocked forever and the
+	// guest wedges (observed with Unity AssetGarbageCollectorHelper threads
+	// blocking on sceKernelWaitSema and pthread_cond_wait). Guarded by
+	// _guestThreadGate.
+	private readonly Dictionary<string, int> _pendingBlockWakeKeys = new Dictionary<string, int>(StringComparer.Ordinal);
+
 	private readonly Dictionary<ulong, GuestThreadState> _guestThreads = new Dictionary<ulong, GuestThreadState>();
 
 	private readonly Dictionary<ulong, ExternalGuestThreadState> _externalGuestThreads = new Dictionary<ulong, ExternalGuestThreadState>();
@@ -3965,6 +3975,34 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine(
 					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
 			}
+
+			// TOCTOU guard: a signal can arrive between the export requesting a
+			// cooperative block and RegisterBlockedGuestThreadContinuation
+			// actually parking the thread. Without this latch the wake is lost
+			// and the thread stays Blocked forever (Unity
+			// AssetGarbageCollectorHelper / pthread_cond_wait deadlocks). Record
+			// the key so the subsequent register event-consumes it.
+			//
+			// The counter (rather than a boolean) preserves the number of
+			// signals that arrived while no waiter was registered: each
+			// registering thread consumes one unit, and only if its wake
+			// predicate succeeds (edge-triggered semantics — a semaphore token
+			// already taken by another waiter must leave this thread parked).
+			//
+			// When the caller knows exactly how many waiters this wake can
+			// satisfy (maxCount is bounded — e.g. sceKernelSignalSema passes
+			// its signalCount), latch that many units instead of a flat 1. A
+			// single multi-token signal that finds zero registered waiters
+			// must still be able to rescue every one of them as they finish
+			// registering, not just the first. For unbounded broadcasts
+			// (maxCount left at the int.MaxValue default) the exact remaining
+			// capacity is unknowable here, so fall back to 1 latch unit.
+			if (wakeCount < maxCount)
+			{
+				var latchUnits = maxCount == int.MaxValue ? 1 : maxCount - wakeCount;
+				_pendingBlockWakeKeys.TryGetValue(wakeKey, out var pendingCount);
+				_pendingBlockWakeKeys[wakeKey] = pendingCount + latchUnits;
+			}
 		}
 
 		if (wakeCount == 0)
@@ -3987,6 +4025,38 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		return wakeCount;
+	}
+
+	/// <summary>
+	/// Consumes one unit of a latched wake key for a blocked thread that is
+	/// about to register (or to transition into Blocked). The wake predicate is
+	/// consulted before the latch is consumed, preserving edge-triggered
+	/// semantics: if a semaphore token was already taken by another waiter
+	/// during the TOCTOU window, this thread stays parked even though a signal
+	/// latched the key. Counted latches also let N signals wake N waiters.
+	/// </summary>
+	private bool TryConsumeWakeLatch(string wakeKey, IGuestThreadBlockWaiter? waiter)
+	{
+		if (!_pendingBlockWakeKeys.TryGetValue(wakeKey, out var pendingLatchCount) || pendingLatchCount <= 0)
+		{
+			return false;
+		}
+
+		if (waiter is not null && !waiter.TryWake())
+		{
+			return false;
+		}
+
+		if (pendingLatchCount <= 1)
+		{
+			_pendingBlockWakeKeys.Remove(wakeKey);
+		}
+		else
+		{
+			_pendingBlockWakeKeys[wakeKey] = pendingLatchCount - 1;
+		}
+
+		return true;
 	}
 
 	public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads()
@@ -4036,11 +4106,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return;
 			}
 
+			// Event-consume a wake that arrived during the TOCTOU window before
+			// this continuation was registered. WakeBlockedThreads latches the
+			// key into _pendingBlockWakeKeys when it finds no parked thread; if
+			// that key is present here, the thread must be readied immediately
+			// instead of remaining Blocked forever. The wake predicate is still
+			// consulted (TryConsumeWakeLatch) so a semaphore token already
+			// consumed by another registering waiter leaves this thread parked.
+			var latchHit = !string.IsNullOrEmpty(wakeKey) && TryConsumeWakeLatch(wakeKey, waiter);
+
 			thread.BlockedContinuation = continuation;
 			thread.HasBlockedContinuation = true;
 			thread.BlockWakeKey = wakeKey;
 			thread.BlockWaiter = waiter;
 			thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
+
+			if (latchHit)
+			{
+				thread.State = GuestThreadRunState.Ready;
+				thread.BlockReason = null;
+				thread.BlockDeadlineTimestamp = 0;
+				_readyGuestThreads.Enqueue(thread);
+				Interlocked.Increment(ref _readyGuestThreadCount);
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] cooperative_block_latch_consumed thread=0x{guestThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
+			}
+
 			TraceFocusedContinuation(
 				"register",
 				guestThreadHandle,
@@ -5186,6 +5277,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_pendingGuestExceptions.Clear();
 			Volatile.Write(ref _pendingGuestExceptionCount, 0);
 			_activeGuestExceptionDeliveries.Clear();
+			_pendingBlockWakeKeys.Clear();
 		}
 
 		foreach (var runner in continuationRunners)
@@ -5629,17 +5721,41 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						}
 						break;
 					case GuestNativeCallExitReason.Blocked:
-						thread.State = GuestThreadRunState.Blocked;
-						thread.BlockReason = blockReason;
-						if (thread.HasBlockedContinuation &&
-							thread.BlockWaiter is not null &&
-							thread.BlockWaiter.TryWake())
+						// RegisterBlockedGuestThreadContinuation may have already
+						// consumed a TOCTOU-latched wake and queued this thread as
+						// Ready during the import dispatch. Do not overwrite that
+						// state (double-enqueue would corrupt the ready queue);
+						// otherwise park the thread and check both the waiter and
+						// the wake-key latch before leaving it Blocked.
+						if (thread.State != GuestThreadRunState.Ready)
 						{
-							thread.State = GuestThreadRunState.Ready;
-							thread.BlockReason = null;
-							thread.BlockDeadlineTimestamp = 0;
-							_readyGuestThreads.Enqueue(thread);
-							Interlocked.Increment(ref _readyGuestThreadCount);
+							thread.State = GuestThreadRunState.Blocked;
+							thread.BlockReason = blockReason;
+							if (thread.HasBlockedContinuation &&
+								thread.BlockWaiter is not null &&
+								thread.BlockWaiter.TryWake())
+							{
+								thread.State = GuestThreadRunState.Ready;
+								thread.BlockReason = null;
+								thread.BlockDeadlineTimestamp = 0;
+								_readyGuestThreads.Enqueue(thread);
+								Interlocked.Increment(ref _readyGuestThreadCount);
+							}
+							else if (thread.HasBlockedContinuation &&
+								thread.BlockWakeKey is { } blockWakeKey &&
+								TryConsumeWakeLatch(blockWakeKey, thread.BlockWaiter))
+							{
+								// Signal was latched during the Running->Blocked
+								// transition window: WakeBlockedThreads could not
+								// claim this thread while it was Running, so the
+								// wake key sits in _pendingBlockWakeKeys. Consume
+								// it now and ready the thread immediately.
+								thread.State = GuestThreadRunState.Ready;
+								thread.BlockReason = null;
+								thread.BlockDeadlineTimestamp = 0;
+								_readyGuestThreads.Enqueue(thread);
+								Interlocked.Increment(ref _readyGuestThreadCount);
+							}
 						}
 						break;
 					default:
