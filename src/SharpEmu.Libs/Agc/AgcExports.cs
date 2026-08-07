@@ -5381,6 +5381,82 @@ public static partial class AgcExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    // sce::Agc::getEqContextId(const kevent*) / getEqEventType(const kevent*).
+    // Real Sony encoding of "context id" and "event type" inside a delivered
+    // graphics kevent is not confirmed yet (see KernelEventQueueCompatExports
+    // for the kevent layout these read: ident u64@0x00, filter i16@0x08,
+    // flags u16@0x0A, fflags u32@0x0C, data u64@0x10, udata u64@0x18). Rather
+    // than guess a bit-packing and risk a silent-wrong-value bug that is worse
+    // than the unresolved import it replaces, this stub reports the raw kevent
+    // and returns 0 so we can capture what a real title actually expects here
+    // before committing to a decode.
+    private static long _eqContextIdUnknownLayoutCount;
+    private static long _eqEventTypeUnknownLayoutCount;
+
+    [SysAbiExport(
+        Nid = "Zw7uUVPulbw",
+        ExportName = "sceAgcDriverGetEqContextId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqContextId(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        ReportEqDecodeUnknownLayout(
+            ctx, eventAddress, "sceAgcDriverGetEqContextId", ref _eqContextIdUnknownLayoutCount);
+        // Real return type is uint32_t, not an OrbisGen2Result — Rax carries the
+        // decoded value itself (see KernelGetEventUserData/KernelGetEventId for
+        // the same value-returning pattern).
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "5CdQTZIQPxM",
+        ExportName = "sceAgcDriverGetEqEventType",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqEventType(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        ReportEqDecodeUnknownLayout(
+            ctx, eventAddress, "sceAgcDriverGetEqEventType", ref _eqEventTypeUnknownLayoutCount);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static void ReportEqDecodeUnknownLayout(
+        CpuContext ctx,
+        ulong eventAddress,
+        string export,
+        ref long counter)
+    {
+        var count = Interlocked.Increment(ref counter);
+        if (count > 16 && (count & (count - 1)) != 0)
+        {
+            return;
+        }
+
+        if (eventAddress == 0 ||
+            !TryReadUInt64(ctx, eventAddress, out var ident) ||
+            !TryReadUInt16(ctx, eventAddress + 0x08, out var filter) ||
+            !TryReadUInt16(ctx, eventAddress + 0x0A, out var flags) ||
+            !TryReadUInt32(ctx, eventAddress + 0x0C, out var fflags) ||
+            !TryReadUInt64(ctx, eventAddress + 0x10, out var data) ||
+            !TryReadUInt64(ctx, eventAddress + 0x18, out var udata))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] {export} unknown layout: event=0x{eventAddress:X16} " +
+                $"(unreadable) count={count} — returning 0, decode not yet implemented.");
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] {export} unknown layout: ident=0x{ident:X16} " +
+            $"filter={unchecked((short)filter)} flags=0x{flags:X4} fflags=0x{fflags:X8} " +
+            $"data=0x{data:X16} udata=0x{udata:X16} count={count} — returning 0, " +
+            "decode not yet implemented.");
+    }
+
     [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",
