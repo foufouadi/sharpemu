@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading;
 using SharpEmu.HLE;
 
@@ -15,12 +16,13 @@ namespace SharpEmu.Libs.Kernel;
 // busy-spins forever (millions of calls, no forward progress).
 //
 // This implements wait/wake over the existing cooperative-block scheduler,
-// keyed on the address. The real primitive takes a compare value so the wait
-// only sleeps while the address still holds the expected value; that exact
-// value is not recovered here, so each wait is given a bounded deadline and
-// treated as a spurious-wakeup-tolerant park: a genuinely missed wake
-// self-heals when the deadline expires and the guest re-checks its own
-// condition, which futex callers already tolerate. A matching wake releases
+// keyed on the address. The wait honors the guest's own compare value
+// (expected) and timeout: memory is checked against expected before ever
+// blocking, and a guest-specified timeout is the real deadline, propagated
+// back as a real ETIMEDOUT. The WaitSelfHealTimeout constant below only
+// bounds the "wait forever" case (guest timeout=0) as a rare recovery net
+// for a wake this emulator itself failed to deliver -- it must never be the
+// thing that decides a normal wait's outcome. A matching wake releases
 // waiters immediately through the same key.
 public static class KernelSyncOnAddressCompatExports
 {
@@ -65,31 +67,111 @@ public static class KernelSyncOnAddressCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        // rsi = compare value, rdx = guest timeout in microseconds (0 = wait
+        // forever). Confirmed empirically, not copied from any other
+        // emulator: traced 36k+ real calls from Cult of the Lamb
+        // (PPSA06464) and rsi/rdx/rcx sat at a rock-solid 0x0 the entire
+        // run while r8 (not a real argument at this arity) churned through
+        // unrelated pointer/scratch values -- the classic futex-style
+        // 3-arg (addr, expected, timeout) shape, with this title's
+        // spinlocks always comparing against 0 and never using a timeout.
+        var expected = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var timeoutUsec = unchecked((uint)ctx[CpuRegister.Rdx]);
+
+        // Futex fast path: only block while memory still holds the value the
+        // guest compared against. If it already moved on, the wake this call
+        // would have parked for has effectively already happened -- return
+        // at once instead of blocking on a stale condition.
+        if (!ctx.TryReadUInt32(address, out var currentValue))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (currentValue != expected)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+        }
+
         var observedGeneration = CurrentGeneration(address);
-        var deadline = GuestThreadExecution.ComputeDeadlineTimestamp(WaitSelfHealTimeout);
+
+        // timeout=0 means "wait forever" -- only the self-heal safety net
+        // bounds that case. A nonzero guest timeout is authoritative: it is
+        // the real deadline and self-heal plays no part in it (it only wins
+        // the MIN below if it happens to be the tighter bound, which still
+        // resolves correctly since ResumeWait re-checks the guest deadline
+        // specifically, not just "some deadline fired").
+        var guestDeadline = timeoutUsec == 0
+            ? 0L
+            : GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec));
+        var selfHealDeadline = GuestThreadExecution.ComputeDeadlineTimestamp(WaitSelfHealTimeout);
+        var deadline = guestDeadline != 0 && guestDeadline < selfHealDeadline
+            ? guestDeadline
+            : selfHealDeadline;
+
+        // Pure read, no side effects -- safe to use both as the scheduler's
+        // wake predicate and again in ResumeWait to tell a real wake apart
+        // from a self-heal/guest-timeout expiry.
+        bool WokeForReal() => CurrentGeneration(address) != observedGeneration;
+
+        int ResumeWait()
+        {
+            if (WokeForReal())
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            // Only a guest-specified timeout that has actually elapsed is a
+            // real timeout. An expiry caused solely by the self-heal safety
+            // net (guest asked to wait forever) is a spurious wake: return
+            // OK and let the guest's own re-check loop decide whether to
+            // wait again, same as any futex-style caller must already
+            // tolerate. This is what keeps the self-heal poll a rare
+            // recovery path instead of a second, silently-wrong timeout.
+            if (guestDeadline != 0 && Stopwatch.GetTimestamp() >= guestDeadline)
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
 
         // Cooperative path: stay parked until a wake bumps this address's
-        // generation (or the deadline expires as a self-heal). The guest
-        // re-evaluates its own condition after resuming.
+        // generation, the guest's own timeout elapses, or (failing both) the
+        // self-heal deadline expires. The guest re-evaluates its own
+        // condition after resuming, as any futex-style caller must.
         if (GuestThreadExecution.RequestCurrentThreadBlock(
                 ctx,
                 "sceKernelSyncOnAddressWait",
                 WakeKey(address),
-                resumeHandler: () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
-                wakeHandler: () => CurrentGeneration(address) != observedGeneration,
+                resumeHandler: ResumeWait,
+                wakeHandler: WokeForReal,
                 deadline))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
 
-        // Non-cooperative caller (host main thread): bounded host wait so a
-        // missed wake self-heals instead of hanging.
+        // Non-cooperative caller (host main thread): cannot use the
+        // guest-thread scheduler's block mechanism, so wait directly on a
+        // per-address gate. A guest timeout is honored as the real wait
+        // bound and reported via ETIMEDOUT; an infinite guest wait
+        // (timeout=0) falls back to the self-heal poll purely as a safety
+        // net, same split as the cooperative path above.
         var gate = _hostAddressGates.GetOrAdd(address, static _ => new object());
         lock (gate)
         {
             if (CurrentGeneration(address) == observedGeneration)
             {
-                Monitor.Wait(gate, WaitSelfHealTimeout);
+                var hostWaitTimeout = guestDeadline != 0
+                    ? TimeSpan.FromMicroseconds(timeoutUsec)
+                    : WaitSelfHealTimeout;
+                Monitor.Wait(gate, hostWaitTimeout);
+
+                if (guestDeadline != 0 &&
+                    CurrentGeneration(address) == observedGeneration &&
+                    Stopwatch.GetTimestamp() >= guestDeadline)
+                {
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                }
             }
         }
 
