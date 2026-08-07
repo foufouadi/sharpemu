@@ -5542,6 +5542,221 @@ public static partial class AgcExports
             "decode not yet implemented.");
     }
 
+    // sce::Agc::registerWorkloadStream / DrawCommandBuffer::setWorkloadsActive
+    // / setWorkloadComplete. The AGC driver's "workload" bookkeeping is a
+    // scheduler-facing mechanism, not a hardware-interpreted PM4 packet: it
+    // lets the guest register a named stream and mark GPU workloads on it
+    // active/complete for preemption/power scaling. The Dcb variants below
+    // still go through the normal command-buffer allocator (an IT_NOP/
+    // R_ZERO packet the hardware treats as a no-op) because that is how the
+    // real driver threads the bookkeeping through command-buffer replay.
+    // Constants, packet layout and validation order all cross-checked
+    // against Kyty's GraphicsDriverRegisterWorkloadStream/
+    // GraphicsDcbSetWorkloadsActive/GraphicsDcbSetWorkloadComplete
+    // (agc.cpp) -- none of this was guessed.
+    private const uint WorkloadStreamMinId = 1;
+    private const uint WorkloadStreamMaxId = 31;
+    private const uint WorkloadIdMax = 63;
+    private const uint WorkloadActiveCountMax = 63;
+    private const uint WorkloadStreamRecordSize = 32;
+    private const uint WorkloadActivePacketSizeDwords = 18;
+    private const uint WorkloadCompletePacketSizeDwords = 12;
+
+    // Real AGC5 driver error codes (0x8A6C00xx space) -- distinct from the
+    // generic OrbisGen2Result (0x8002xxxx) kernel-style codes used
+    // elsewhere in this file. Confirmed against Kyty's
+    // GRAPHICS5_DRIVER_ERROR_INVALID_VALUE/INVALID_ARGUMENT constants.
+    private const int Agc5DriverErrorInvalidValue = unchecked((int)0x8A6C0033);
+    private const int Agc5DriverErrorInvalidArgument = unchecked((int)0x8A6C0035);
+
+    private static readonly object _workloadStreamGate = new();
+    private static uint _workloadStreamMask;
+    private static readonly byte[][] _workloadStreamRecords = CreateWorkloadStreamRecords();
+
+    private static byte[][] CreateWorkloadStreamRecords()
+    {
+        var records = new byte[WorkloadStreamMaxId + 1][];
+        for (var i = 0; i < records.Length; i++)
+        {
+            records[i] = new byte[WorkloadStreamRecordSize];
+        }
+
+        return records;
+    }
+
+    private static bool IsWorkloadStreamRegistered(uint streamId)
+    {
+        lock (_workloadStreamGate)
+        {
+            return (_workloadStreamMask & (1u << (int)streamId)) != 0;
+        }
+    }
+
+    private static int SetAgcDriverError(CpuContext ctx, int errorCode)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)errorCode);
+        return errorCode;
+    }
+
+    [SysAbiExport(
+        Nid = "3AyTaWcF-H8",
+        ExportName = "sceAgcDriverRegisterWorkloadStream",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverRegisterWorkloadStream(CpuContext ctx)
+    {
+        var streamId = (uint)ctx[CpuRegister.Rdi];
+        var streamAddress = ctx[CpuRegister.Rsi];
+
+        if (streamId < WorkloadStreamMinId || streamId > WorkloadStreamMaxId)
+        {
+            return SetAgcDriverError(ctx, Agc5DriverErrorInvalidValue);
+        }
+
+        if (streamAddress == 0)
+        {
+            return SetAgcDriverError(ctx, Agc5DriverErrorInvalidArgument);
+        }
+
+        Span<byte> streamBytes = stackalloc byte[(int)WorkloadStreamRecordSize];
+        if (!ctx.Memory.TryRead(streamAddress, streamBytes))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        lock (_workloadStreamGate)
+        {
+            var streamBit = 1u << (int)streamId;
+            if ((_workloadStreamMask & streamBit) != 0)
+            {
+                return SetAgcDriverError(ctx, Agc5DriverErrorInvalidValue);
+            }
+
+            streamBytes.CopyTo(_workloadStreamRecords[streamId]);
+            _workloadStreamMask |= streamBit;
+        }
+
+        TraceAgc($"agc.driver_register_workload_stream id={streamId} addr=0x{streamAddress:X16}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "LFSPFmGc9Hg",
+        ExportName = "sceAgcDcbSetWorkloadsActive",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetWorkloadsActive(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var streamId = (uint)ctx[CpuRegister.Rsi];
+        var workloadIdsAddress = ctx[CpuRegister.Rdx];
+        var workloadCount = (uint)ctx[CpuRegister.Rcx];
+
+        if (commandBufferAddress == 0 ||
+            workloadIdsAddress == 0 ||
+            workloadCount == 0 ||
+            workloadCount > WorkloadActiveCountMax ||
+            streamId < WorkloadStreamMinId ||
+            streamId > WorkloadStreamMaxId ||
+            !IsWorkloadStreamRegistered(streamId))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var workloadMask = 0UL;
+        for (var i = 0u; i < workloadCount; i++)
+        {
+            if (!TryReadUInt32(ctx, workloadIdsAddress + (i * sizeof(uint)), out var workloadId) ||
+                workloadId > WorkloadIdMax)
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            var workloadBit = 1UL << (int)workloadId;
+            if ((workloadMask & workloadBit) != 0)
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            workloadMask |= workloadBit;
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, WorkloadActivePacketSizeDwords, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(WorkloadActivePacketSizeDwords, ItNop, RZero)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        for (var index = 1u; index < WorkloadActivePacketSizeDwords; index++)
+        {
+            if (!TryWriteUInt32(ctx, commandAddress + (index * sizeof(uint)), 0))
+            {
+                return ReturnPointer(ctx, 0);
+            }
+        }
+
+        if (!TryWriteUInt32(ctx, commandAddress + 4, streamId) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(workloadMask & 0xFFFF_FFFFUL)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(workloadMask >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_set_workloads_active buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"stream={streamId} mask=0x{workloadMask:X16}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "hEK26Wdny6s",
+        ExportName = "sceAgcDcbSetWorkloadComplete",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetWorkloadComplete(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var streamId = (uint)ctx[CpuRegister.Rsi];
+        var workloadId = (uint)ctx[CpuRegister.Rdx];
+
+        if (commandBufferAddress == 0 ||
+            streamId < WorkloadStreamMinId ||
+            streamId > WorkloadStreamMaxId ||
+            workloadId > WorkloadIdMax ||
+            !IsWorkloadStreamRegistered(streamId))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, WorkloadCompletePacketSizeDwords, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(WorkloadCompletePacketSizeDwords, ItNop, RZero)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        for (var index = 1u; index < WorkloadCompletePacketSizeDwords; index++)
+        {
+            if (!TryWriteUInt32(ctx, commandAddress + (index * sizeof(uint)), 0))
+            {
+                return ReturnPointer(ctx, 0);
+            }
+        }
+
+        var workloadClearMask = ~(1UL << (int)workloadId);
+        if (!TryWriteUInt32(ctx, commandAddress + 4, streamId) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, workloadId) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(workloadClearMask & 0xFFFF_FFFFUL)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(workloadClearMask >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_set_workload_complete buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"stream={streamId} workload={workloadId}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
     [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",
