@@ -5532,6 +5532,21 @@ public static partial class AgcExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // sceAgcDriverAgrSubmitDcb — a real, distinct symbol (NID AhGvpITrf4M,
+    // confirmed against the actual PS5 hash, not an alias of SubmitDcb's own
+    // NID). Kyty maps this NID to the same handler it uses for
+    // sceAgcDriverSubmitDcb, i.e. it treats the "Agr" submit path as
+    // equivalent rather than giving it separate logic. We do the same here:
+    // same single-packet-pointer ABI in Rdi, same handler. Unconfirmed
+    // against a real trace of a title that calls this NID specifically — if
+    // one turns up with different register usage, split this back out.
+    [SysAbiExport(
+        Nid = "AhGvpITrf4M",
+        ExportName = "sceAgcDriverAgrSubmitDcb",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverAgrSubmitDcb(CpuContext ctx) => DriverSubmitDcb(ctx);
+
     [SysAbiExport(
         Nid = "gSRnr79F8tQ",
         ExportName = "sceAgcDriverSubmitAcb",
@@ -17883,6 +17898,17 @@ public static partial class AgcExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    // sceAgcDriverAgrSubmitMultiDcbs — same reasoning as DriverAgrSubmitDcb
+    // above: real distinct NID (+T8Xo6LtFJI, confirmed against the actual
+    // PS5 hash), Kyty reuses its SubmitMultiDcbs handler for it, so we reuse
+    // ours (same rdi/rsi/rdx array-of-addresses/array-of-sizes/count ABI).
+    [SysAbiExport(
+        Nid = "+T8Xo6LtFJI",
+        ExportName = "sceAgcDriverAgrSubmitMultiDcbs",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverAgrSubmitMultiDcbs(CpuContext ctx) => DriverSubmitMultiDcbs(ctx);
 
     [SysAbiExport(
         Nid = "AOLcoIkQDgM",
