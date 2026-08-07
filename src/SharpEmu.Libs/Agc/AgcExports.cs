@@ -3491,6 +3491,20 @@ public static partial class AgcExports
         // default packet is group-dimensional.
         (modifier & 0xA038u) | 0x41u;
 
+    // Cross-checked against Kyty's GraphicsCbDispatchGetSize (agc.cpp):
+    // returns a hardcoded 20 -- matches our own CbDispatch builder's 5-dword
+    // (20-byte) IT_DISPATCH_DIRECT packet above.
+    [SysAbiExport(
+        Nid = "Abendgtz+3o",
+        ExportName = "sceAgcCbDispatchGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CbDispatchGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 20u;
+        return (int)ctx[CpuRegister.Rax];
+    }
+
     [SysAbiExport(
         Nid = "UZbQjYAwwXM",
         ExportName = "sceAgcCbSetShRegistersDirect",
@@ -4072,6 +4086,24 @@ public static partial class AgcExports
         return ReturnPointer(ctx, drawCommand);
     }
 
+    // Cross-checked against Kyty's GraphicsDcbDrawIndexGetSize (agc.cpp):
+    // hardcoded 6u * 4u = 24, matching the real hardware IT_DRAW_INDEX_2
+    // packet size. Note our own DcbDrawIndex above additionally emits a
+    // separate 5-dword IT_INDEX_BASE/IT_INDEX_BUFFER_SIZE packet ahead of
+    // the draw packet (see its comment) -- that is emulation-side handling
+    // for state real hardware gets via a distinct SetIndexBuffer call, not
+    // part of what GetSize reports here.
+    [SysAbiExport(
+        Nid = "6ee9Hd3EWXQ",
+        ExportName = "sceAgcDcbDrawIndexGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 6u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
+    }
+
     [SysAbiExport(
         Nid = "1q1titRBL6o",
         ExportName = "sceAgcDcbDrawIndirect",
@@ -4451,6 +4483,22 @@ public static partial class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
+    // Cross-checked against Kyty's GraphicsDcbWriteDataGetSize (agc.cpp):
+    // 4u * num_dwords + 16u -- exactly matches DcbWriteData's own
+    // packetDwords = dwordCount + 4 above (four header dwords + the
+    // payload). numDwords is the function's only argument (Rdi).
+    [SysAbiExport(
+        Nid = "p9tI+yTvx68",
+        ExportName = "sceAgcDcbWriteDataGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbWriteDataGetSize(CpuContext ctx)
+    {
+        var numDwords = (uint)ctx[CpuRegister.Rdi];
+        ctx[CpuRegister.Rax] = (4u * numDwords) + 16u;
+        return (int)ctx[CpuRegister.Rax];
+    }
+
     // Narrow companion to TrackCbReleaseMemTarget's arena snapshot: extends
     // the cursor cache to cover trailer packets built AFTER a lap's last
     // release_mem but before the arena switches — those bytes fell outside
@@ -4573,6 +4621,29 @@ public static partial class AgcExports
         }
 
         return ReturnPointer(ctx, commandAddress);
+    }
+
+    // sceAgcDcbWaitOnAddress itself has no builder in SharpEmu yet -- this is
+    // a real, distinct packet from WAIT_REG_MEM above (different dword
+    // counts entirely), not derivable from DcbWaitRegMem's own sizes.
+    // Cross-checked against Kyty's GraphicsDcbWaitOnAddressGetSize
+    // (agc.cpp): size==0 -> 14u*4u=56, size==1 -> 16u*4u=64, anything else
+    // -> 0 (Kyty's own fallback for an invalid size argument).
+    [SysAbiExport(
+        Nid = "43WJ08sSugE",
+        ExportName = "sceAgcDcbWaitOnAddressGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbWaitOnAddressGetSize(CpuContext ctx)
+    {
+        var size = (uint)ctx[CpuRegister.Rdi];
+        ctx[CpuRegister.Rax] = size switch
+        {
+            0 => 14u * sizeof(uint),
+            1 => 16u * sizeof(uint),
+            _ => 0u,
+        };
+        return (int)ctx[CpuRegister.Rax];
     }
 
     [SysAbiExport(
@@ -4773,6 +4844,20 @@ public static partial class AgcExports
         }
 
         return ReturnPointer(ctx, commandAddress);
+    }
+
+    // Cross-checked against Kyty's GraphicsDcbDispatchIndirectGetSize
+    // (agc.cpp): hardcoded 3u * 4u = 12, matching DcbDispatchIndirect's own
+    // 3-dword IT_DISPATCH_INDIRECT packet above.
+    [SysAbiExport(
+        Nid = "w8HVkEeXPv8",
+        ExportName = "sceAgcDcbDispatchIndirectGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDispatchIndirectGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 3u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
     }
 
     [SysAbiExport(
