@@ -683,6 +683,33 @@ public static class VideoOutExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Mirrors VideoOutDeleteVblankEvent above (Kyty: both are
+    // DeleteVideoOutEvent(handle, eq, kind) with only the event kind
+    // differing) -- same validation, same registration-list removal, just
+    // against port.FlipEvents instead of port.VblankEvents.
+    [SysAbiExport(
+        Nid = "-Ozn0F1AFRg",
+        ExportName = "sceVideoOutDeleteFlipEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutDeleteFlipEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        lock (_stateGate)
+        {
+            port.FlipEvents.RemoveAll(registration => registration.Equeue == equeue);
+        }
+
+        TraceVideoOut($"videoout.delete_flip_event eq=0x{equeue:X16} handle={handle}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "U46NwOiJpys",
         ExportName = "sceVideoOutSubmitFlip",
@@ -828,6 +855,37 @@ public static class VideoOutExports
         return ctx.TryWriteUInt64(dataAddress, decodedData)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+    }
+
+    // Kyty: (int)(((uint64_t)ev->data >> 12) & 0xf). This is exactly the
+    // coalesce count TriggerDisplayEvent packs into bits 12-15 of the
+    // delivered kevent's data field below -- self-consistent with our own
+    // producer, not an independent guess.
+    [SysAbiExport(
+        Nid = "Mt4QHHkxkOc",
+        ExportName = "sceVideoOutGetEventCount",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutGetEventCount(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0)
+        {
+            return OrbisVideoOutErrorInvalidAddress;
+        }
+
+        if (!TryReadInt16(ctx, eventAddress + 0x08, out var filter) ||
+            !ctx.TryReadUInt64(eventAddress + 0x10, out var data))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (filter != OrbisKernelEventFilterVideoOut)
+        {
+            return OrbisVideoOutErrorInvalidEvent;
+        }
+
+        return (int)((data >> 12) & 0xF);
     }
 
     public static int SubmitFlipFromAgc(CpuContext ctx, int handle, int bufferIndex, int flipMode, long flipArg) =>
