@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Iced.Intel;
 using SharpEmu.Core.Cpu.Disasm;
 using SharpEmu.HLE;
 
@@ -325,6 +326,11 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverYoteiSndSynthInitNullTable(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverPoisonPointerDereference(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -970,6 +976,133 @@ public sealed partial class DirectExecutionBackend
 			"(malloc(14848) returned NULL from a healthy heap; root cause open, see PROGRESS.md)");
 		Console.Error.Flush();
 		return true; // do not touch RIP: re-execute the same instruction, it now reads valid memory
+	}
+
+	// SharpEmu's own generic import-dispatch-failure return convention: a
+	// 32-bit SCE-style negative error code (top nibble 0x8, e.g.
+	// 0xFFFFFFFF80020002, 0xFFFFFFFF80020102, 0xFFFFFFFF8001FFFA -- not a
+	// fixed small set of literals, an open family) sign-extended into a
+	// 64-bit register because the unresolved/failed import's real ABI
+	// wanted a pointer, not an int32 status. No genuine PS5 guest pointer
+	// ever looks like this: guest address space is 0x000000000-
+	// 0x7FFFFFFFFFFF, while this pattern lands in the canonical *kernel*
+	// half of the address space -- permanently unmappable from user mode,
+	// so dereferencing it always faults cleanly. See the
+	// ghost-of-tsushima-boot-stall memory's 2026-08-09 entry for how this
+	// was distinguished from the earlier (wrong) hypothesis that this was
+	// a TryRecoverUnresolvedSentinel/TryGetPlausibleReturnFromStack gap.
+	private static bool IsSharpEmuPoisonReturnValue(ulong address)
+	{
+		return (address >> 32) == 0xFFFFFFFFuL && (address & 0x80000000uL) != 0;
+	}
+
+	private static int _poisonPointerRecoveries;
+
+	// Generic (title-agnostic) recovery for "guest dereferences one of our
+	// own poison return values as a pointer" -- as opposed to the other
+	// recoveries in this file, which match exact instruction bytes at a
+	// specific title's RIP. Only handles the narrow, well-understood shape
+	// of a plain load (MOV/MOVZX/MOVSX/MOVSXD reg, [mem] with a single
+	// memory operand) into a 32- or 64-bit GPR: patches that register to 0
+	// (as if the failed import had legitimately returned NULL) and steps
+	// past the faulting instruction. Anything else (a store, a
+	// read-modify-write, an 8/16-bit destination, a multi-operand form) is
+	// left alone -- guessing register-repair semantics for those is not
+	// safe, so those still crash exactly as before.
+	private unsafe bool TryRecoverPoisonPointerDereference(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only -- a poison *store* would be a different, real bug
+			rip < 0x10000 ||
+			!IsSharpEmuPoisonReturnValue(exceptionRecord->ExceptionInformation[1]))
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (instruction.OpCount != 2 ||
+			instruction.Op0Kind != OpKind.Register ||
+			instruction.Op1Kind != OpKind.Memory ||
+			instruction.Mnemonic is not (Mnemonic.Mov or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd))
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.Op0Register, out var destOffset))
+		{
+			return false;
+		}
+
+		var faultAddress = exceptionRecord->ExceptionInformation[1];
+		WriteCtxU64(contextRecord, destOffset, 0uL);
+		WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+
+		var recovery = Interlocked.Increment(ref _poisonPointerRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Poison-pointer dereference recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' fault_target=0x{faultAddress:X16} -> {instruction.Op0Register}=0, " +
+				$"rip advanced to 0x{rip + (ulong)instruction.Length:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	// Only the 32- and 64-bit GPR forms: writing either correctly zero-
+	// extends into the full 64-bit context slot per x86-64 rules, so
+	// zeroing that slot is exact for both widths. 8/16-bit destinations are
+	// deliberately not covered -- a real CPU would preserve the untouched
+	// upper bits there, and this recovery only ever needs to write, not
+	// read-modify-write.
+	private static bool TryGetGprContextOffset(Register register, out int offset)
+	{
+		switch (register)
+		{
+			case Register.RAX or Register.EAX: offset = CTX_RAX; return true;
+			case Register.RBX or Register.EBX: offset = CTX_RBX; return true;
+			case Register.RCX or Register.ECX: offset = CTX_RCX; return true;
+			case Register.RDX or Register.EDX: offset = CTX_RDX; return true;
+			case Register.RSI or Register.ESI: offset = CTX_RSI; return true;
+			case Register.RDI or Register.EDI: offset = CTX_RDI; return true;
+			case Register.RBP or Register.EBP: offset = CTX_RBP; return true;
+			case Register.R8 or Register.R8D: offset = CTX_R8; return true;
+			case Register.R9 or Register.R9D: offset = CTX_R9; return true;
+			case Register.R10 or Register.R10D: offset = CTX_R10; return true;
+			case Register.R11 or Register.R11D: offset = CTX_R11; return true;
+			case Register.R12 or Register.R12D: offset = CTX_R12; return true;
+			case Register.R13 or Register.R13D: offset = CTX_R13; return true;
+			case Register.R14 or Register.R14D: offset = CTX_R14; return true;
+			case Register.R15 or Register.R15D: offset = CTX_R15; return true;
+			default: offset = 0; return false;
+		}
 	}
 
 	private static bool IsBenignHostDebugException(uint exceptionCode)
