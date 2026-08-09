@@ -357,6 +357,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _logAllImports;
 
+	// SHARPEMU_LOG_MAIN_THREAD_STACKWALK=1: on a stall watchdog trigger, suspend
+	// the entry thread and scan its live stack for candidate return addresses
+	// resolvable against loaded modules (ntdll/kernel32/coreclr/our own VEH
+	// trampolines), to see *what* the entry thread is actually blocked inside
+	// when the ETW evidence says it's in a genuine OS wait, not spinning
+	// (see the ghost-of-tsushima-boot-stall memory's 2026-08-09 ETW update).
+	private bool _logMainThreadStackWalk;
+
 	private bool _logImportPeriodic;
 
 	private static ulong[]? _watchGuestQwordAddrs;
@@ -1212,6 +1220,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
+		_logMainThreadStackWalk = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_MAIN_THREAD_STACKWALK"), "1", StringComparison.Ordinal);
 		// Periodic Import# spam (every 100k, early bands, NID samples) is on
 		// only when explicitly requested — default stderr traffic was a measurable tax.
 		_logImportPeriodic = string.Equals(
@@ -3001,7 +3010,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
+		// REX=0x4D (W=1,R=1,X=0,B=1): B=1 is required so ModRM.rm=001 resolves to r9,
+		// not rcx. Was 0x4C (B=0) — silently encoded "lock cmpxchg [rcx], r10" instead
+		// of "[r9], r10", operating on whatever the guest last left in rcx instead of
+		// _vehManagedEntryLock. The real lock word was never written by anyone, so
+		// every entrant always observed "unowned" and looped the cmpxchg forever
+		// (Ghost of Tsushima entry-thread livelock, confirmed by disassembling a live
+		// stall capture — see the ghost-of-tsushima-boot-stall memory's 2026-08-09
+		// entry). Fixed at both copies of this acquire (host-side here, guest-side
+		// below).
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostRetryJump = offset;
@@ -3084,8 +3102,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
+		// REX=0x4D, not 0x4C — same fix as the host-side acquire above (guest-side
+		// copy of the same buggy "lock cmpxchg [rcx], r10" encoding).
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestRetryJump = offset;
 		EmitUInt32(code, ref offset, 0u);
@@ -7105,6 +7125,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			ulong rsp = cpuContext[CpuRegister.Rsp];
 			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot: rip=0x{cpuContext.Rip:X16} rsp=0x{rsp:X16} rbp=0x{cpuContext[CpuRegister.Rbp]:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16}");
+			// The flip-stall watchdog already learned (see LogMainThreadOsLiveness's
+			// comment) that _cpuContext.Rip is only refreshed at import boundaries,
+			// so it says nothing about whether the entry thread's real OS thread is
+			// still alive, still running, or genuinely parked elsewhere between
+			// imports. This watchdog fires on a different condition (no import
+			// progress, rather than no flip progress) but was never given the same
+			// OS-level cross-check, so it could only ever report the same stale
+			// import-boundary rip a spinning AND a permanently-parked entry thread
+			// would both leave behind. Ask the kernel directly, same as the flip
+			// path does.
+			LogMainThreadOsLiveness();
+			if (_logMainThreadStackWalk)
+			{
+				LogMainThreadStackWalk();
+			}
 			ulong num = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
 			for (int i = 0; i < _importEntries.Length; i++)
 			{
@@ -8887,6 +8922,159 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			_ = CloseHandle(threadHandle);
 		}
+	}
+
+	// Poor-man's stack walk: no frame-pointer/unwind-info parsing, just scans
+	// raw qwords above the live RSP for values that land inside a loaded
+	// module's image range (or one of our own hand-JIT'd VEH trampoline
+	// stubs, tracked separately since they're VirtualAlloc'd, not a PE
+	// module). Good enough to tell "still inside our trampoline" from
+	// "blocked deep in ntdll/kernel32 on a real wait" from "inside coreclr",
+	// which is exactly the open question the 2026-08-09 ETW capture left:
+	// the entry thread's CSwitch/ReadyThread history proves a genuine
+	// OS-level wait (oldState=Wait), not the earlier dumps' apparent
+	// live-spin at the VEH-lock retry check — this answers *what* it's
+	// waiting inside without needing an external debugger.
+	private unsafe void LogMainThreadStackWalk()
+	{
+		var hostThreadId = Volatile.Read(ref _mainEntryHostThreadId);
+		if (hostThreadId == 0 || !OperatingSystem.IsWindows())
+		{
+			return;
+		}
+
+		var threadHandle = OpenThread(ThreadGetContext | ThreadSuspendResume, false, unchecked((uint)hostThreadId));
+		if (threadHandle == 0)
+		{
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: OpenThread failed, error={Marshal.GetLastWin32Error()}");
+			return;
+		}
+
+		void* contextRecord = null;
+		var suspended = false;
+		try
+		{
+			if (SuspendThread(threadHandle) == uint.MaxValue)
+			{
+				Console.Error.WriteLine("[LOADER][ERROR] Stall main-thread-stackwalk: SuspendThread failed");
+				return;
+			}
+			suspended = true;
+
+			contextRecord = NativeMemory.AllocZeroed((nuint)Win64ContextSize);
+			WriteCtxU32(contextRecord, Win64ContextFlagsOffset, ContextAmd64ControlInteger);
+			if (!GetThreadContext(threadHandle, contextRecord))
+			{
+				Console.Error.WriteLine("[LOADER][ERROR] Stall main-thread-stackwalk: GetThreadContext failed");
+				return;
+			}
+
+			var rip = ReadCtxU64(contextRecord, 248);
+			var rsp = ReadCtxU64(contextRecord, 152);
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: tid={hostThreadId} rip=0x{rip:X16} rsp=0x{rsp:X16}");
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: rip -> {DescribeCodeAddress(rip)}");
+
+			var codeDumpStart = rip - 64;
+			var codeHex = new System.Text.StringBuilder(384);
+			for (var i = 0; i < 128; i++)
+			{
+				var addr = codeDumpStart + (ulong)i;
+				try
+				{
+					codeHex.Append(((byte*)addr)[0].ToString("X2"));
+				}
+				catch
+				{
+					codeHex.Append("??");
+				}
+			}
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: code_dump base=0x{codeDumpStart:X16} rip_offset_into_dump=64 bytes={codeHex}");
+
+			const int slotsToScan = 256;
+			var hits = 0;
+			for (var i = 0; i < slotsToScan; i++)
+			{
+				var slotAddr = rsp + (ulong)(i * 8);
+				if (!TryReadGuestMemoryDirect(slotAddr, out var candidate) || candidate < 0x10000)
+				{
+					continue;
+				}
+				var description = DescribeCodeAddress(candidate);
+				if (description is null)
+				{
+					continue;
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: [rsp+0x{i * 8:X3}]=0x{candidate:X16} -> {description}");
+				if (++hits >= 48)
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: ... capped at {hits} candidate return addresses");
+					break;
+				}
+			}
+			if (hits == 0)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall main-thread-stackwalk: no resolvable candidates in {slotsToScan} scanned slots");
+			}
+		}
+		finally
+		{
+			if (contextRecord != null)
+			{
+				NativeMemory.Free(contextRecord);
+			}
+			if (suspended)
+			{
+				_ = ResumeThread(threadHandle);
+			}
+			_ = CloseHandle(threadHandle);
+		}
+	}
+
+	// Resolves an address against loaded PE modules first, then our own
+	// VirtualAlloc'd VEH trampoline stubs (2048 bytes each, not part of any
+	// module). Returns null if it doesn't land in anything recognized —
+	// most raw stack qwords are data, not return addresses, so most scanned
+	// slots are expected to resolve to nothing.
+	private string? DescribeCodeAddress(ulong address)
+	{
+		if (address == 0)
+		{
+			return null;
+		}
+
+		try
+		{
+			foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
+			{
+				var baseAddr = unchecked((ulong)module.BaseAddress.ToInt64());
+				var size = unchecked((ulong)module.ModuleMemorySize);
+				if (size == 0 || address < baseAddr || address >= baseAddr + size)
+				{
+					continue;
+				}
+				return $"{module.ModuleName}+0x{address - baseAddr:X}";
+			}
+		}
+		catch
+		{
+			// Modules collection can throw transiently (module unload race); not worth failing the whole walk over.
+		}
+
+		const ulong trampolineStubSize = 2048UL;
+		if (_rawExceptionHandlerStub != 0 && address >= (ulong)_rawExceptionHandlerStub && address < (ulong)_rawExceptionHandlerStub + trampolineStubSize)
+		{
+			return $"raw-veh-trampoline+0x{address - (ulong)_rawExceptionHandlerStub:X}";
+		}
+		if (_exceptionHandlerStub != 0 && address >= (ulong)_exceptionHandlerStub && address < (ulong)_exceptionHandlerStub + trampolineStubSize)
+		{
+			return $"veh-trampoline+0x{address - (ulong)_exceptionHandlerStub:X}";
+		}
+		if (_unhandledFilterStub != 0 && address >= (ulong)_unhandledFilterStub && address < (ulong)_unhandledFilterStub + trampolineStubSize)
+		{
+			return $"unhandled-filter-trampoline+0x{address - (ulong)_unhandledFilterStub:X}";
+		}
+
+		return null;
 	}
 
 	private void LogGpuWaitRegistrySnapshot()
