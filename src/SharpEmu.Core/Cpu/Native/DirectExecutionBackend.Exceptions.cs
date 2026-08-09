@@ -1014,8 +1014,99 @@ public sealed partial class DirectExecutionBackend
 	// read-modify-write, an 8/16-bit destination, a multi-operand form) is
 	// left alone -- guessing register-repair semantics for those is not
 	// safe, so those still crash exactly as before.
+	// SHARPEMU_DUMP_CALLSITE_DISASM=<hex,hex,...>: one-shot disassembly dump
+	// (this process's own live/decrypted guest memory, not the on-disk
+	// eboot.bin -- that's encrypted, radare2 -B on it just returns garbage)
+	// around each listed RIP, the first time a poison-pointer recovery hits
+	// it. Diagnostic only, general-purpose (not Tsushima-specific) -- used
+	// to understand unknown interface call sites without guessing. See the
+	// ghost-of-tsushima-boot-stall memory for why this was added.
+	private static HashSet<ulong>? _callsiteDisasmTargets;
+	private static readonly HashSet<ulong> _callsiteDisasmDumped = new();
+
+	private static void MaybeDumpCallSiteDisassembly(ulong rip)
+	{
+		if (_callsiteDisasmTargets == null)
+		{
+			var targets = new HashSet<ulong>();
+			var spec = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_CALLSITE_DISASM");
+			if (!string.IsNullOrWhiteSpace(spec))
+			{
+				foreach (var part in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+				{
+					var text = part.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? part[2..] : part;
+					if (ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var parsedAddr))
+					{
+						targets.Add(parsedAddr);
+					}
+				}
+			}
+
+			Interlocked.CompareExchange(ref _callsiteDisasmTargets, targets, null);
+		}
+
+		if (!_callsiteDisasmTargets.Contains(rip))
+		{
+			return;
+		}
+
+		lock (_callsiteDisasmDumped)
+		{
+			if (!_callsiteDisasmDumped.Add(rip))
+			{
+				return;
+			}
+		}
+
+		const int windowBefore = 0x300;
+		const int windowAfter = 0x120;
+		var start = rip - windowBefore;
+		var bytes = new byte[windowBefore + windowAfter];
+		if (!TryReadHostBytes(start, bytes))
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] callsite_disasm: failed to read bytes around 0x{rip:X16}");
+			return;
+		}
+
+		Console.Error.WriteLine($"[LOADER][INFO] ===== callsite_disasm rip=0x{rip:X16} =====");
+		var addr = start;
+		var offset = 0;
+		var formatter = new IntelFormatter();
+		while (offset < bytes.Length && addr < rip + windowAfter)
+		{
+			Instruction instruction;
+			try
+			{
+				var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes[offset..]));
+				decoder.IP = addr;
+				decoder.Decode(out instruction);
+			}
+			catch
+			{
+				break;
+			}
+
+			if (instruction.Code == Code.INVALID || instruction.Length <= 0)
+			{
+				offset++;
+				addr++;
+				continue;
+			}
+
+			var output = new StringOutput();
+			formatter.Format(instruction, output);
+			var marker = addr == rip ? "  <=== HERE" : string.Empty;
+			Console.Error.WriteLine($"[LOADER][INFO]   0x{addr:X16}: {output}{marker}");
+			offset += instruction.Length;
+			addr += (ulong)instruction.Length;
+		}
+
+		Console.Error.WriteLine("[LOADER][INFO] ===== end callsite_disasm =====");
+	}
+
 	private unsafe bool TryRecoverPoisonPointerDereference(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
 	{
+		MaybeDumpCallSiteDisassembly(rip);
 		if (string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
 				"1",
@@ -1094,6 +1185,7 @@ public sealed partial class DirectExecutionBackend
 	// past the call instruction.
 	private unsafe bool TryRecoverIndirectCallThroughInvalidPointer(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
 	{
+		MaybeDumpCallSiteDisassembly(rip);
 		if (string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
 				"1",
