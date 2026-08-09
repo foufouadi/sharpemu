@@ -11,6 +11,13 @@ namespace SharpEmu.Libs.SystemService;
 public static class SystemServiceExports
 {
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
+    // No system-service event pending. Numeric value cross-checked against
+    // Kyty's SYSTEM_SERVICE_ERROR_NO_EVENT (src/libs/errno.h) -- SharpEmu had
+    // no reference for this one, this codebase's other libSceSystemService
+    // error constants (e.g. OrbisSystemServiceErrorParameter above) already
+    // follow the same 0x80A100xx family, so 0x80A10004 fits.
+    private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
+    private const int SystemServiceEventSize = 4 + 8192; // int32 event_type + uint8[8192] data
     private const int SystemServiceStatusSize = 0x0C;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
     private const int HdrToneMapLuminanceSize = sizeof(float) * 3;
@@ -175,6 +182,34 @@ public static class SystemServiceExports
 
         return ctx.Memory.TryWrite(statusAddress, status)
             ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "656LMQSrg6U",
+        ExportName = "sceSystemServiceReceiveEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceReceiveEvent(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        // SharpEmu doesn't generate any real system-service events (suspend/
+        // resume, notice screens, etc.) yet -- "no event pending" is correct
+        // in every case until one is actually implemented. Zeroing the whole
+        // struct and setting event_type=-1 matches the real SDK's own
+        // documented idiom of leaving *event untouched/cleared on this
+        // specific error, cross-checked against Kyty's implementation.
+        Span<byte> guestEvent = stackalloc byte[SystemServiceEventSize];
+        guestEvent.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(guestEvent, -1);
+
+        return ctx.Memory.TryWrite(eventAddress, guestEvent)
+            ? ctx.SetReturn(OrbisSystemServiceErrorNoEvent)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
