@@ -334,6 +334,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverIndirectCallThroughInvalidPointer(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -1075,6 +1080,87 @@ public sealed partial class DirectExecutionBackend
 
 		return true;
 	}
+
+	// Follow-on to TryRecoverPoisonPointerDereference: once a poison-derived
+	// value has been zeroed by that recovery, guest code that treats it as
+	// an interface/vtable pointer typically does `mov reg,[obj]; call
+	// [reg+slot]` -- a virtual-call dispatch. The load recovers cleanly, but
+	// the very next instruction then indirect-calls through the now-null
+	// "vtable" pointer, one step later. Also covers indirect calls that
+	// dereference a poison value directly (skipping the intermediate load
+	// entirely). Treats the call as if it had happened and returned 0
+	// (success in every convention used in this codebase) rather than
+	// actually performing it -- no return address is pushed, RIP just steps
+	// past the call instruction.
+	private unsafe bool TryRecoverIndirectCallThroughInvalidPointer(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reading the call target, not writing
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		var faultAddress = exceptionRecord->ExceptionInformation[1];
+		// Either our own poison pattern, or a classic near-null indirect
+		// call (e.g. `call [null_obj + smallOffset]`) -- no legitimate
+		// pointer, guest or host, is ever this low.
+		if (!IsSharpEmuPoisonReturnValue(faultAddress) && faultAddress >= 0x10000)
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (instruction.Mnemonic != Mnemonic.Call ||
+			instruction.OpCount != 1 ||
+			instruction.Op0Kind != OpKind.Memory)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, CTX_RAX, 0uL);
+		WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+
+		var recovery = Interlocked.Increment(ref _poisonIndirectCallRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Poison-pointer indirect-call recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' fault_target=0x{faultAddress:X16} -> skipped, rax=0, " +
+				$"rip advanced to 0x{rip + (ulong)instruction.Length:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static int _poisonIndirectCallRecoveries;
 
 	// Only the 32- and 64-bit GPR forms: writing either correctly zero-
 	// extends into the full 64-bit context slot per x86-64 rules, so
