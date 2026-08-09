@@ -91,9 +91,22 @@ public static class AjmExports
 
     public static int AjmInitialize(CpuContext ctx)
     {
-        var reserved = ctx[CpuRegister.Rdi];
+        // First parameter is NOT a "must be zero" reserved field -- confirmed
+        // 2026-08-09 by dumping the real guest call site at runtime on Ghost
+        // of Tsushima (Wwise's AJM backend): `movabs rdi, 0x300000000; call
+        // sceAjmInitialize`, a literal, deliberately-compiled-in nonzero
+        // constant, not corruption. Rejecting it as invalid produced a false
+        // ORBIS_AJM_ERROR_INVALID_PARAMETER that the game/Wwise didn't
+        // handle, and crashed downstream (AddRef on the AJM context object
+        // it never got, `lock inc dword [rdi+0xA4]` on a null pointer) --
+        // see the ghost-of-tsushima-boot-stall memory. Real semantics of
+        // this field are still unknown (likely a packed flags/batch-count
+        // value -- 0x300000000 = 3 in the high 32 bits), but accepting any
+        // value here is strictly more correct than rejecting the one value
+        // real titles are observed to pass.
+        var flags = ctx[CpuRegister.Rdi];
         var outputAddress = ctx[CpuRegister.Rsi];
-        if (reserved != 0 || outputAddress == 0)
+        if (outputAddress == 0)
         {
             return unchecked((int)0x806A0001);
         }
@@ -110,7 +123,7 @@ public static class AjmExports
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AJM"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] ajm.initialize reserved={reserved} out=0x{outputAddress:X16} context={contextId}");
+                $"[LOADER][TRACE] ajm.initialize flags=0x{flags:X16} out=0x{outputAddress:X16} context={contextId}");
         }
 
         ctx[CpuRegister.Rax] = 0;
