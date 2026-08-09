@@ -11,9 +11,13 @@ namespace SharpEmu.Libs.SystemService;
 public static class SystemServiceExports
 {
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
-    // No system-service event pending. Numeric value cross-checked against
-    // Kyty's SYSTEM_SERVICE_ERROR_NO_EVENT (src/libs/errno.h) -- SharpEmu had
-    // no reference for this one, this codebase's other libSceSystemService
+    // No system-service event pending. Numeric value and the struct-zeroing/
+    // event_type=-1 behavior below are cross-checked against Kyty
+    // (https://github.com/KytyPS5/KytyPS5, GPL-2.0-or-later, same as this
+    // project -- commit 05d14f54210d6742afa845f7f1a974d7af8b47e1,
+    // src/libs/libSystemService.cpp SystemServiceReceiveEvent() and
+    // src/libs/errno.h SYSTEM_SERVICE_ERROR_NO_EVENT) -- SharpEmu had no
+    // reference for this value; this codebase's other libSceSystemService
     // error constants (e.g. OrbisSystemServiceErrorParameter above) already
     // follow the same 0x80A100xx family, so 0x80A10004 fits.
     private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
