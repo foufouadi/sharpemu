@@ -220,3 +220,151 @@ public static class CxaGuardExports
             $"[LOADER][TRACE] {op}: guard=0x{guardPtr:X16} result={result} init={initialized} in_progress={inProgress} owner_thread={ownerThreadId}");
     }
 }
+
+// Itanium C++ ABI's global allocation operators -- the compiler emits calls
+// to these (by their mangled names, hence the NIDs below) for every plain
+// `new`/`delete` expression that isn't placement-new or a class with its
+// own operator new/delete overload. Unlike sceLibcMspaceMalloc/Free
+// (astrobot-poison-store-fix, 2026-08-10, ABI genuinely undocumented and
+// guessed from register evidence), these six mangled names and their
+// calling convention are exactly specified by the public Itanium C++ ABI
+// (https://itanium-cxx-abi.github.io/cxx-abi/abi.html#allocation) --
+// nothing to guess here, this is a straight re-implementation. Found
+// needing this on Astro Bot 01.018 immediately after the strtok fix above:
+// _Znwm (plain `new`) was unresolved on literally every call observed
+// (thousands during boot), each one hitting this process's poison-pointer
+// recoveries the same way the mspace allocator's failures did -- likely
+// the single most impactful of the three allocator-shaped gaps found this
+// session, given how much more often a C++ title calls global `new` than
+// either mspace or strtok.
+public static class CxxNewDeleteExports
+{
+    [SysAbiExport(
+        Nid = "fJnpuVVBbKk",
+        ExportName = "_Znwm",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorNew(CpuContext ctx) => AllocateCore(ctx);
+
+    [SysAbiExport(
+        Nid = "hdm0YfMa7TQ",
+        ExportName = "_Znam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorNewArray(CpuContext ctx) => AllocateCore(ctx);
+
+    [SysAbiExport(
+        Nid = "z+P+xCnWLBk",
+        ExportName = "_ZdlPv",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorDelete(CpuContext ctx) => FreeCore(ctx);
+
+    [SysAbiExport(
+        Nid = "MLWl90SFWNE",
+        ExportName = "_ZdaPv",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorDeleteArray(CpuContext ctx) => FreeCore(ctx);
+
+    // C++14 sized-delete overloads: same ABI-visible effect as the
+    // unsized forms above (the compiler passes the size for allocators
+    // that want it; the guest allocator this wraps tracks its own
+    // allocation sizes internally and doesn't need it).
+    [SysAbiExport(
+        Nid = "lYDzBVE5mZs",
+        ExportName = "_ZdlPvm",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorDeleteSized(CpuContext ctx) => FreeCore(ctx);
+
+    [SysAbiExport(
+        Nid = "FOt55ZNaVJk",
+        ExportName = "_ZdaPvm",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int OperatorDeleteArraySized(CpuContext ctx) => FreeCore(ctx);
+
+    private const ulong DefaultNewAlignment = 0x10; // __STDCPP_DEFAULT_NEW_ALIGNMENT__ on x86-64
+
+    private static int AllocateCore(CpuContext ctx)
+    {
+        var size = ctx[CpuRegister.Rdi];
+        if (size == 0)
+        {
+            size = 1; // operator new(0) must still return a valid, distinct, deletable pointer -- unlike malloc(0)
+        }
+
+        if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory(size, DefaultNewAlignment, out var address))
+        {
+            // Real operator new throws std::bad_alloc on failure rather
+            // than returning null; HLE can't synthesize a guest C++
+            // exception from here, so this falls back to the same "best
+            // effort, don't crash" contract as the mspace allocator above
+            // instead. Not standard-conformant, but strictly better than
+            // the poison-pointer crash this NID being unresolved used to
+            // produce on every single call.
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        if (!TryZeroAllocatedMemory(ctx, address, size))
+        {
+            allocator.TryFreeGuestMemory(address);
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        ctx[CpuRegister.Rax] = address;
+        return 0;
+    }
+
+    private static int FreeCore(CpuContext ctx)
+    {
+        var ptr = ctx[CpuRegister.Rdi];
+        if (ptr != 0 && ctx.Memory is IGuestMemoryAllocator allocator)
+        {
+            // delete on a pointer this allocator didn't itself hand out
+            // (e.g. a TryRecoverPoisonPointerStore scratch redirect from
+            // before this fix existed, or a pointer from some other
+            // allocator entirely) is silently ignored -- TryFreeGuestMemory
+            // already returns false for an address it doesn't recognize,
+            // with no side effect either way, matching real free(3)/
+            // operator delete's "undefined behavior" case as a safe no-op
+            // rather than guessing.
+            allocator.TryFreeGuestMemory(ptr);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    // operator new does not itself guarantee zeroed memory, but the arena
+    // this wraps reuses freed ranges, so a fresh allocation can carry
+    // stale bytes from whatever guest object previously lived there.
+    // Chunked through a fixed-size stack buffer instead of one stackalloc
+    // sized by the guest-controlled `size` -- that would be an
+    // uncontrolled stack allocation driven by untrusted guest input.
+    private static bool TryZeroAllocatedMemory(CpuContext ctx, ulong address, ulong size)
+    {
+        Span<byte> zeros = stackalloc byte[256];
+        zeros.Clear();
+
+        var remaining = size;
+        var offset = 0UL;
+        while (remaining > 0)
+        {
+            var chunk = (int)Math.Min(remaining, (ulong)zeros.Length);
+            if (!ctx.Memory.TryWrite(address + offset, zeros[..chunk]))
+            {
+                return false;
+            }
+
+            offset += (ulong)chunk;
+            remaining -= (ulong)chunk;
+        }
+
+        return true;
+    }
+}
