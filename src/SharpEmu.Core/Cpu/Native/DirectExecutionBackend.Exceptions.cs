@@ -370,6 +370,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverNullBaseRegisterCompareRead(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -1206,13 +1211,16 @@ public sealed partial class DirectExecutionBackend
 	private static int _nullGlobalInterfaceLoadRecoveries;
 
 	// Sibling to TryRecoverPoisonPointerDereference, but for a genuine
-	// literal-null dereference (fault target == 0) rather than this
-	// process's own poison-return pattern -- deliberately much narrower in
-	// scope than that recovery to avoid masking real null-pointer bugs
-	// elsewhere: only the bare `mov reg,[baseReg]` addressing mode (no
-	// displacement, no SIB index) where the base register's own live value
-	// is exactly 0, i.e. the base register itself is the null, not
-	// something merely computed to a low address.
+	// literal-null base register (checked directly, not the effective
+	// fault address -- a disp/index-relative load's effective address
+	// isn't 0 even when the base register itself is, same reasoning as
+	// TryRecoverNullBaseRegisterStore on the write side) rather than this
+	// process's own poison-return pattern. Originally restricted to bare
+	// `[reg]` addressing to sidestep exactly that address-vs-register
+	// distinction; relaxed once the store-side sibling proved checking the
+	// base register alone is sufficient (`mov rax,[r15+10h]` with r15=0
+	// was the case that forced this -- the disp=0x10 form never matched
+	// the old bare-only check).
 	//
 	// Found on Astro Bot 01.018 well past the poison-pointer/allocator
 	// fixes above: multiple different, non-deterministic call sites
@@ -1243,11 +1251,20 @@ public sealed partial class DirectExecutionBackend
 				StringComparison.Ordinal) ||
 			exceptionRecord->NumberParameters < 2 ||
 			exceptionRecord->ExceptionInformation[0] != 0 || // reads only
-			exceptionRecord->ExceptionInformation[1] != 0 || // literal null only -- poison is TryRecoverPoisonPointerDereference's job
 			rip < 0x10000)
 		{
 			return false;
 		}
+
+		// No gate on ExceptionInformation[1] (the effective fault address)
+		// here -- a disp/index-relative load's effective address (e.g. the
+		// 0x10 in `[r15+10h]`) is not 0 even when the base register itself
+		// is, so only the base register's own value is worth checking
+		// (below), same reasoning as TryRecoverNullBaseRegisterStore. An
+		// earlier version of this function required bare `[reg]`
+		// addressing specifically to sidestep this, but that's needlessly
+		// narrow now that the store-side sibling proved the base-register
+		// check alone is sufficient.
 
 		var bytes = new byte[16];
 		if (!TryReadHostBytes(rip, bytes))
@@ -1276,8 +1293,6 @@ public sealed partial class DirectExecutionBackend
 			instruction.Op0Kind != OpKind.Register ||
 			instruction.Op1Kind != OpKind.Memory ||
 			instruction.Mnemonic is not (Mnemonic.Mov or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd) ||
-			instruction.MemoryIndex != Register.None ||
-			instruction.MemoryDisplacement64 != 0 ||
 			instruction.MemoryBase == Register.None)
 		{
 			return false;
@@ -1908,6 +1923,89 @@ public sealed partial class DirectExecutionBackend
 				$"[LOADER][WARN] Poison-pointer compare-read recovery #{recovery}: rip=0x{rip:X16} " +
 				$"'{instruction}' fault_target=0x{exceptionRecord->ExceptionInformation[1]:X16} -> " +
 				$"{instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh zeroed scratch page), re-executing");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static int _nullBaseRegisterCompareRecoveries;
+
+	// Sibling to TryRecoverPoisonPointerCompareRead, for a genuine
+	// literal-null base register instead of the poison pattern -- same
+	// relationship TryRecoverNullBaseRegisterStore has to
+	// TryRecoverPoisonPointerStore. Found immediately after that recovery
+	// let boot progress further into yet another instance of the same
+	// root cause (the still-unidentified null global interface at
+	// [0x80EEB4DE8], see TryRecoverNullGlobalInterfaceLoad):
+	// `cmp dword ptr [rdi+1Ch],0F73397C4h` with rdi=0.
+	private unsafe bool TryRecoverNullBaseRegisterCompareRead(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		MaybeDumpCallSiteDisassembly(rip);
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (instruction.Mnemonic is not (Mnemonic.Cmp or Mnemonic.Test) ||
+			instruction.OpCount != 2 ||
+			instruction.MemoryBase == Register.None ||
+			(instruction.Op0Kind != OpKind.Memory && instruction.Op1Kind != OpKind.Memory))
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.MemoryBase, out var baseOffset) ||
+			ReadCtxU64(contextRecord, baseOffset) != 0)
+		{
+			return false; // the base register itself isn't null -- don't guess at a coincidental match
+		}
+
+		void* scratch = GetOrCreateScratchPage(rip);
+		if (scratch == null)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, baseOffset, (ulong)scratch);
+		// RIP deliberately untouched: retry the same instruction now that
+		// the base register points at real, readable (zeroed) memory.
+
+		var recovery = Interlocked.Increment(ref _nullBaseRegisterCompareRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Null-base-register compare-read recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' -> {instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh zeroed scratch page), re-executing");
 			Console.Error.Flush();
 		}
 
