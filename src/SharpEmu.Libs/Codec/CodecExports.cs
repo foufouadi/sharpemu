@@ -35,9 +35,11 @@ public static class CodecExports
     private const int AudiodecErrorInvalidWordLength = unchecked((int)0x807F0010);
     private const int AudiodecErrorInvalidAuSize = unchecked((int)0x807F0011);
     private const int AudiodecErrorInvalidPcmSize = unchecked((int)0x807F0012);
-    private const uint AudiodecTypeAt9 = 1;
-    private const uint AudiodecTypeMp3 = 2;
-    private const uint AudiodecTypeAac = 3;
+    
+    // Centralized codec type definitions - must match AjmExports.CodecType* constants
+    public const uint AudiodecTypeAt9 = 1;
+    public const uint AudiodecTypeMp3 = 2;
+    public const uint AudiodecTypeAac = 3;
     private const int MaxAudioDecoders = 64;
     private const int MaxDecodeBufferBytes = 64 * 1024 * 1024;
 

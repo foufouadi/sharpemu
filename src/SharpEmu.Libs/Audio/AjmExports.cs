@@ -20,12 +20,18 @@ public static class AjmExports
     private const int OrbisAjmErrorCodecNotRegistered = unchecked((int)0x8093000A);
     private const int OrbisAjmErrorJobCreation = unchecked((int)0x80930012);
     private const ulong MaxSilentPcmBytes = 1 << 20;
-    private const uint Atrac9CodecType = 1;
+    
+    // Centralized codec type definitions - shared with CodecExports.AudiodecType*
+    // MP3: AJM uses 0, Audiodec uses 2 - we handle this mapping internally
+    internal const uint CodecTypeMp3 = 0;  // AJM-specific value
+    internal const uint CodecTypeAt9 = 1;  // Matches AudiodecTypeAt9
+    internal const uint CodecTypeAac = 3;  // Matches AudiodecTypeAac
+    
     // Registration is pure bookkeeping (a HashSet.Add), so the only real
     // constraint is that codecType << 14 must not overflow the 32-bit
-    // instanceId it gets packed into (see AjmInstanceCreate) -- not any
-    // hardcoded list of known Sony codec ids, which a retail title's Gen5
-    // codec type (e.g. 24) can legitimately fall outside of.
+    // instanceId it gets packed into (see AjmInstanceCreate).
+    // We allow a reasonable range to accommodate unknown future codec types
+    // while still preventing overflow issues.
     private const uint MaxCodecType = 1u << 18;
     private const int MaxInstanceIndex = 0x2FFF;
     private const int MaxDecodeBufferBytes = 64 * 1024 * 1024;
@@ -44,8 +50,6 @@ public static class AjmExports
     private static readonly ConcurrentDictionary<uint, AjmContextState> Contexts = new();
     private static int _nextContextId;
     private static int _nextBatchId;
-
-    private const uint AjmCodecMp3 = 0;
 
     private sealed class AjmInstanceState
     {
@@ -299,8 +303,8 @@ public static class AjmExports
                     Flags = flags,
                     MaxChannels = maxChannels,
                     Encoding = encoding,
-                    Atrac9 = codecType == Atrac9CodecType ? new Atrac9DecodeState() : null,
-                    Mp3 = codecType == AjmCodecMp3 ? new AjmMp3Decoder() : null,
+                    Atrac9 = codecType == CodecTypeAt9 ? new Atrac9DecodeState() : null,
+                    Mp3 = codecType == CodecTypeMp3 ? new AjmMp3Decoder() : null,
                 });
         }
 
@@ -447,7 +451,7 @@ public static class AjmExports
         var status = Atrac9DecodeState.ResultInvalidParameter;
         if (TryGetInstance(instanceId, out var instance))
         {
-            if (instance.Codec != Atrac9CodecType)
+            if (instance.Codec != CodecTypeAt9)
             {
                 status = 0;
             }
@@ -816,7 +820,7 @@ public static class AjmExports
                 outputAddress,
                 outputSize);
         }
-        else if (instance.Codec != Atrac9CodecType || instance.Atrac9 is null)
+        else if (instance.Codec != CodecTypeAt9 || instance.Atrac9 is null)
         {
             if (outputAddress != 0 &&
                 outputSize is > 0 and <= MaxDecodeBufferBytes)
@@ -903,7 +907,7 @@ public static class AjmExports
         {
             result = new Atrac9DecodeResult(Atrac9DecodeState.ResultInvalidParameter, 0, 0, 0, 0);
         }
-        else if (instance.Codec != Atrac9CodecType || instance.Atrac9 is null)
+        else if (instance.Codec != CodecTypeAt9 || instance.Atrac9 is null)
         {
             foreach (var buffer in outputs)
             {
