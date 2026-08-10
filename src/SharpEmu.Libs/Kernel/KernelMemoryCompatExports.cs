@@ -1445,6 +1445,67 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // puts(3): unlike fputs above, always writes to stdout and always
+    // appends a trailing newline regardless of whether the guest string
+    // already ends with one. Found unresolved on Astro Bot 01.018 right
+    // after strtok, in the same boot phase as bcmp/strcpy_s/sprintf_s
+    // (LibcStdioExports.cs) -- standard, fully-specified signature, no ABI
+    // guessing involved.
+    [SysAbiExport(
+        Nid = "YQ0navp+YIc",
+        ExportName = "puts",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Puts(CpuContext ctx)
+    {
+        var textAddress = ctx[CpuRegister.Rdi];
+        if (textAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryReadNullTerminatedUtf8(ctx, textAddress, MaxGuestStringLength, out var text))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        Console.Out.Write(text);
+        Console.Out.Write('\n');
+        Console.Out.Flush();
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)(text.Length + 1));
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static readonly System.Random _rand = new();
+    private static readonly object _randGate = new();
+
+    // rand(3): RAND_MAX assumed to be 0x7FFFFFFF, the near-universal BSD/
+    // glibc convention (Random.Next(int,int)'s exclusive upper bound gives
+    // [0, int.MaxValue-1] = [0, 0x7FFFFFFE], safely within that range).
+    // Astro Bot doesn't care about reproducing a specific PRNG sequence --
+    // only that calling this repeatedly doesn't crash -- so host-quality
+    // randomness is strictly fine here, no need to match Sony's actual
+    // generator.
+    [SysAbiExport(
+        Nid = "cpCOXWMgha0",
+        ExportName = "rand",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Rand(CpuContext ctx)
+    {
+        int value;
+        lock (_randGate)
+        {
+            value = _rand.Next(0, int.MaxValue);
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)(uint)value);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "6c3rCVE-fTU",
         ExportName = "_open",
