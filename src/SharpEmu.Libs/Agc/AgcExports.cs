@@ -5467,16 +5467,9 @@ public static partial class AgcExports
     }
 
     // sce::Agc::getEqContextId(const kevent*) / getEqEventType(const kevent*).
-    // Real Sony encoding of "context id" and "event type" inside a delivered
-    // graphics kevent is not confirmed yet (see KernelEventQueueCompatExports
-    // for the kevent layout these read: ident u64@0x00, filter i16@0x08,
-    // flags u16@0x0A, fflags u32@0x0C, data u64@0x10, udata u64@0x18). Rather
-    // than guess a bit-packing and risk a silent-wrong-value bug that is worse
-    // than the unresolved import it replaces, this stub reports the raw kevent
-    // and returns 0 so we can capture what a real title actually expects here
-    // before committing to a decode.
-    private static long _eqContextIdUnknownLayoutCount;
-    private static long _eqEventTypeUnknownLayoutCount;
+    // The kevent layout is ident u64@0x00, filter i16@0x08 and data u64@0x10.
+    // Kyty confirms that graphics events expose type=ident/context=data, with
+    // the two fields swapped for non-graphics events.
 
     [SysAbiExport(
         Nid = "Zw7uUVPulbw",
@@ -5485,13 +5478,10 @@ public static partial class AgcExports
         LibraryName = "libSceAgcDriver")]
     public static int DriverGetEqContextId(CpuContext ctx)
     {
-        var eventAddress = ctx[CpuRegister.Rdi];
-        ReportEqDecodeUnknownLayout(
-            ctx, eventAddress, "sceAgcDriverGetEqContextId", ref _eqContextIdUnknownLayoutCount);
         // Real return type is uint32_t, not an OrbisGen2Result — Rax carries the
         // decoded value itself (see KernelGetEventUserData/KernelGetEventId for
         // the same value-returning pattern).
-        ctx[CpuRegister.Rax] = 0;
+        ctx[CpuRegister.Rax] = DecodeEqEventField(ctx, ctx[CpuRegister.Rdi], eventType: false);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -5502,11 +5492,31 @@ public static partial class AgcExports
         LibraryName = "libSceAgcDriver")]
     public static int DriverGetEqEventType(CpuContext ctx)
     {
-        var eventAddress = ctx[CpuRegister.Rdi];
-        ReportEqDecodeUnknownLayout(
-            ctx, eventAddress, "sceAgcDriverGetEqEventType", ref _eqEventTypeUnknownLayoutCount);
-        ctx[CpuRegister.Rax] = 0;
+        ctx[CpuRegister.Rax] = DecodeEqEventField(ctx, ctx[CpuRegister.Rdi], eventType: true);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Kyty's GraphicsDriverGetEqEventType/GetEqContextId (agc.cpp:3995-4021)
+    // establishes this ABI: graphics kevents carry their type in ident and
+    // context in data; non-graphics kevents use the inverse mapping.
+    private static ulong DecodeEqEventField(
+        CpuContext ctx,
+        ulong eventAddress,
+        bool eventType)
+    {
+        if (eventAddress == 0 ||
+            !TryReadUInt64(ctx, eventAddress, out var ident) ||
+            !TryReadUInt16(ctx, eventAddress + 0x08, out var filter) ||
+            !TryReadUInt64(ctx, eventAddress + 0x10, out var data))
+        {
+            return 0;
+        }
+
+        var isGraphics = unchecked((short)filter) ==
+            KernelEventQueueCompatExports.KernelEventFilterGraphics;
+        return eventType
+            ? isGraphics ? ident : data
+            : isGraphics ? data : ident;
     }
 
     private static void ReportEqDecodeUnknownLayout(
