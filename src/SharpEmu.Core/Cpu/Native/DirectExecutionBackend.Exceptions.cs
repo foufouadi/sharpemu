@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
@@ -361,6 +362,11 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverNullDestinationStringStore(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverNullBaseRegisterStore(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -1382,7 +1388,7 @@ public sealed partial class DirectExecutionBackend
 			return false; // destination base register isn't actually the null -- don't guess
 		}
 
-		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		void* scratch = GetOrCreateScratchPage(rip);
 		if (scratch == null)
 		{
 			return false;
@@ -1511,6 +1517,47 @@ public sealed partial class DirectExecutionBackend
 	// unrelated live host allocation, same reasoning as at 64 KiB.
 	private const nuint PoisonPointerScratchPageSize = 16 * 1024 * 1024;
 
+	// Keyed by rip: a redirect at a given call site is reused instead of a
+	// fresh VirtualAlloc every single time that site faults. Without this,
+	// a call site inside an actual loop (rather than hit once) leaks one
+	// 16 MiB region per iteration -- observed on Astro Bot re-deriving a
+	// null pointer from unwritten backing memory (TryRecoverNullBaseRegisterStore's
+	// `mov rcx,[rbx]` reload each pass, [rbx] itself never fixed since
+	// these recoveries only ever patch the CPU register, not memory) and
+	// looping thousands of times before VirtualAlloc itself started
+	// failing and the crash became unrecoverable again -- the same
+	// resource-exhaustion failure this cache exists to prevent, not a new
+	// kind of bug. Shared by all four scratch-redirect recoveries
+	// (TryRecoverPoisonPointerStore/CompareRead,
+	// TryRecoverNullDestinationStringStore/NullBaseRegisterStore) since
+	// they're all instances of the same "give the guest a stable, valid
+	// backing region for this address" idea.
+	private static readonly ConcurrentDictionary<ulong, nint> _scratchPagesByRip = new();
+
+	private static unsafe void* GetOrCreateScratchPage(ulong rip)
+	{
+		if (_scratchPagesByRip.TryGetValue(rip, out var existing))
+		{
+			return (void*)existing;
+		}
+
+		var created = (nint)VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		if (created == 0)
+		{
+			return null;
+		}
+
+		// Another thread may have raced this same rip -- keep whichever
+		// won and free the loser rather than leaking it.
+		var winner = _scratchPagesByRip.GetOrAdd(rip, created);
+		if (winner != created)
+		{
+			VirtualFree((void*)created, 0, 0x8000u /* MEM_RELEASE */);
+		}
+
+		return (void*)winner;
+	}
+
 	private static int _poisonPointerStoreRecoveries;
 
 	// Follow-on to TryRecoverPoisonPointerDereference: that recovery only
@@ -1614,7 +1661,7 @@ public sealed partial class DirectExecutionBackend
 			return false; // the base register itself isn't poison -- don't guess at a coincidental match
 		}
 
-		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		void* scratch = GetOrCreateScratchPage(rip);
 		if (scratch == null)
 		{
 			return false;
@@ -1631,6 +1678,101 @@ public sealed partial class DirectExecutionBackend
 				$"[LOADER][WARN] Poison-pointer store recovery #{recovery}: rip=0x{rip:X16} " +
 				$"'{instruction}' fault_target=0x{exceptionRecord->ExceptionInformation[1]:X16} -> " +
 				$"{instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh scratch page), re-executing");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static int _nullBaseRegisterStoreRecoveries;
+
+	// Sibling to TryRecoverPoisonPointerStore, for a genuine literal-null
+	// base register instead of this process's own poison pattern -- same
+	// relationship TryRecoverNullGlobalInterfaceLoad has to
+	// TryRecoverPoisonPointerDereference. Generalizes
+	// TryRecoverNullDestinationStringStore's fix beyond the STOS/MOVS
+	// shape: found immediately after that recovery let boot progress
+	// further into a *different* instance of the same root cause (the
+	// still-unidentified null global interface at [0x80EEB4DE8], see
+	// TryRecoverNullGlobalInterfaceLoad) -- `mov [rcx+rax+20h],rdx` with
+	// both rcx and rax literally 0. Same SIB-indexed coverage as
+	// TryRecoverPoisonPointerStore (IsCoveredPointerStoreMnemonic, index
+	// register allowed), just keyed on a literal-null base register
+	// instead of the poison pattern.
+	private unsafe bool TryRecoverNullBaseRegisterStore(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		MaybeDumpCallSiteDisassembly(rip);
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 1 || // writes only
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		// No gate on ExceptionInformation[1] (the effective fault address)
+		// here, unlike the bare-[reg]-addressing null recoveries above --
+		// a disp/index-relative store's effective address (e.g. the 0x20
+		// in `[rcx+rax+20h]`) is not 0 even when the base register itself
+		// is, so the only thing worth checking is the base register's own
+		// value (below), exactly like TryRecoverPoisonPointerStore does
+		// for the poison-pattern case.
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (!IsCoveredPointerStoreMnemonic(instruction.Mnemonic) ||
+			instruction.OpCount != 2 ||
+			instruction.Op0Kind != OpKind.Memory ||
+			instruction.MemoryBase == Register.None)
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.MemoryBase, out var baseOffset) ||
+			ReadCtxU64(contextRecord, baseOffset) != 0)
+		{
+			return false; // the base register itself isn't null -- don't guess at a coincidental match
+		}
+
+		void* scratch = GetOrCreateScratchPage(rip);
+		if (scratch == null)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, baseOffset, (ulong)scratch);
+		// RIP deliberately untouched: retry the same instruction now that
+		// the base register points at real, writable memory.
+
+		var recovery = Interlocked.Increment(ref _nullBaseRegisterStoreRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Null-base-register store recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' -> {instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh scratch page), re-executing");
 			Console.Error.Flush();
 		}
 
@@ -1749,7 +1891,7 @@ public sealed partial class DirectExecutionBackend
 			return false; // the base register itself isn't poison -- don't guess at a coincidental match
 		}
 
-		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		void* scratch = GetOrCreateScratchPage(rip);
 		if (scratch == null)
 		{
 			return false;
