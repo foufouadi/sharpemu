@@ -359,6 +359,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverNullDestinationStringStore(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -1293,6 +1298,109 @@ public sealed partial class DirectExecutionBackend
 				$"[LOADER][WARN] Null-global-interface load recovery #{recovery}: rip=0x{rip:X16} " +
 				$"'{instruction}' ({instruction.MemoryBase}=0) -> {instruction.Op0Register}=0, " +
 				$"rip advanced to 0x{rip + (ulong)instruction.Length:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static int _nullDestinationStringStoreRecoveries;
+
+	// Direct follow-on to TryRecoverNullGlobalInterfaceLoad +
+	// TryRecoverIndirectCallThroughInvalidPointer: those two make the
+	// `mov rax,[rdi]; call [rax+10h]` virtual-dispatch pair through the
+	// still-uninitialized global interface a no-op returning 0 -- correct
+	// for a callee whose result is only null-checked, but this particular
+	// slot turned out to be an "Allocate(size)"-shaped method (surrounding
+	// code passes a size/count and immediately fills the result), so a
+	// faked 0 return is then used as a real destination pointer one call
+	// site further down: `rep stosb` (RDI=0, RCX=0x800, AL=0xFF observed --
+	// a 2 KiB 0xFF fill into the "allocated" buffer) faults writing through
+	// the null RDI.
+	//
+	// Same redirect-and-retry shape as TryRecoverPoisonPointerStore, not a
+	// guess at the real allocator's calling convention or a hand-written
+	// trampoline (meaningfully riskier -- getting an invented ABI wrong
+	// here risks silent guest memory corruption instead of a clean crash).
+	// Covers all four STOS widths and the equivalent MOVS-style "copy
+	// through a null destination" case, but ONLY when the destination base
+	// register is exactly 0 -- a real bug writing through a wild-but-
+	// nonzero pointer is deliberately left to crash as before.
+	private unsafe bool TryRecoverNullDestinationStringStore(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		MaybeDumpCallSiteDisassembly(rip);
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 1 || // writes only
+			exceptionRecord->ExceptionInformation[1] != 0 || // literal null only
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		// STOS/MOVS destination addressing is always the implicit ES:[RDI]
+		// form -- Iced represents this as OpKind.MemoryESRDI, not a general
+		// Memory operand with an explicit MemoryBase, so the base register
+		// (RDI) has to be hardcoded here rather than read off the
+		// instruction the way every other recovery in this file does.
+		if (instruction.Mnemonic is not (Mnemonic.Stosb or Mnemonic.Stosw or Mnemonic.Stosd or Mnemonic.Stosq or
+				Mnemonic.Movsb or Mnemonic.Movsw or Mnemonic.Movsd or Mnemonic.Movsq) ||
+			instruction.Op0Kind != OpKind.MemoryESRDI)
+		{
+			return false;
+		}
+
+		const int baseOffset = CTX_RDI;
+		if (ReadCtxU64(contextRecord, baseOffset) != 0)
+		{
+			return false; // destination base register isn't actually the null -- don't guess
+		}
+
+		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		if (scratch == null)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, baseOffset, (ulong)scratch);
+		// RIP deliberately untouched: retry the same instruction now that
+		// the destination base register points at real, writable memory.
+		// A rep-prefixed store naturally continues from wherever it left
+		// off (RCX already reflects remaining iterations if any ran before
+		// the fault, though for RDI=0 none could have).
+
+		var recovery = Interlocked.Increment(ref _nullDestinationStringStoreRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Null-destination string-store recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' -> RDI=0x{(ulong)scratch:X16} (fresh scratch page), re-executing");
 			Console.Error.Flush();
 		}
 
