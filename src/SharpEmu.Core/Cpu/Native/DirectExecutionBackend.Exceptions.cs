@@ -340,6 +340,11 @@ public sealed partial class DirectExecutionBackend
 				return -1;
 			}
 			if (exceptionCode == 3221225477u &&
+				TryRecoverNullGlobalInterfaceLoad(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
 				TryRecoverIndirectCallThroughInvalidPointer(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
@@ -1180,6 +1185,113 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine(
 				$"[LOADER][WARN] Poison-pointer dereference recovery #{recovery}: rip=0x{rip:X16} " +
 				$"'{instruction}' fault_target=0x{faultAddress:X16} -> {instruction.Op0Register}=0, " +
+				$"rip advanced to 0x{rip + (ulong)instruction.Length:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static int _nullGlobalInterfaceLoadRecoveries;
+
+	// Sibling to TryRecoverPoisonPointerDereference, but for a genuine
+	// literal-null dereference (fault target == 0) rather than this
+	// process's own poison-return pattern -- deliberately much narrower in
+	// scope than that recovery to avoid masking real null-pointer bugs
+	// elsewhere: only the bare `mov reg,[baseReg]` addressing mode (no
+	// displacement, no SIB index) where the base register's own live value
+	// is exactly 0, i.e. the base register itself is the null, not
+	// something merely computed to a low address.
+	//
+	// Found on Astro Bot 01.018 well past the poison-pointer/allocator
+	// fixes above: multiple different, non-deterministic call sites
+	// (varying with guest thread scheduling) all crash the same way --
+	// `mov rax,[rdi]` with rdi=0, immediately followed by
+	// `call qword ptr [rax+10h]` (a virtual dispatch through the loaded
+	// "vtable"). Traced rdi back through SHARPEMU_DUMP_CALLSITE_DISASM:
+	// every crashing call site loads it from the exact same guest global,
+	// `[0x80EEB4DE8]` -- a "current global interface" slot (allocator- or
+	// resource-provider-shaped, given the surrounding code's size/count
+	// arguments) that an early static-init routine explicitly zeroes
+	// (`mov qword ptr [80EEB4DE8h],0`) but nothing observed ever writes a
+	// real value into afterward. Whatever guest export is supposed to
+	// install the real interface there was not identified (out of scope
+	// for a narrow recovery); this only stops each individual crash.
+	//
+	// Zeroing the destination register here reduces the very next
+	// instruction to exactly the shape TryRecoverIndirectCallThroughInvalidPointer
+	// already handles (`call [reg+smallOffset]` on a near-null reg) --
+	// composes with that existing, already-validated recovery rather than
+	// duplicating its "treat the call as a no-op returning 0" logic.
+	private unsafe bool TryRecoverNullGlobalInterfaceLoad(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		MaybeDumpCallSiteDisassembly(rip);
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only
+			exceptionRecord->ExceptionInformation[1] != 0 || // literal null only -- poison is TryRecoverPoisonPointerDereference's job
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (instruction.OpCount != 2 ||
+			instruction.Op0Kind != OpKind.Register ||
+			instruction.Op1Kind != OpKind.Memory ||
+			instruction.Mnemonic is not (Mnemonic.Mov or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd) ||
+			instruction.MemoryIndex != Register.None ||
+			instruction.MemoryDisplacement64 != 0 ||
+			instruction.MemoryBase == Register.None)
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.MemoryBase, out var baseOffset) ||
+			ReadCtxU64(contextRecord, baseOffset) != 0)
+		{
+			return false; // base register isn't actually the null -- don't guess
+		}
+
+		if (!TryGetGprContextOffset(instruction.Op0Register, out var destOffset))
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, destOffset, 0uL);
+		WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+
+		var recovery = Interlocked.Increment(ref _nullGlobalInterfaceLoadRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Null-global-interface load recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' ({instruction.MemoryBase}=0) -> {instruction.Op0Register}=0, " +
 				$"rip advanced to 0x{rip + (ulong)instruction.Length:X16}");
 			Console.Error.Flush();
 		}
