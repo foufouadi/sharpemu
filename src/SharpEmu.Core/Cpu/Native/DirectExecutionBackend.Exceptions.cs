@@ -289,6 +289,11 @@ public sealed partial class DirectExecutionBackend
 
 			ulong rip = ReadCtxU64(contextRecord, 248);
 			ulong rsp = ReadCtxU64(contextRecord, 152);
+			// Previously only reachable from inside the poison-pointer
+			// recoveries below; hoisted here so SHARPEMU_DUMP_CALLSITE_DISASM
+			// also covers crash types those recoveries never touch (e.g. a
+			// genuine null-this-pointer AV, not poison-shaped at all).
+			MaybeDumpCallSiteDisassembly(rip);
 			if (exceptionCode == StatusSingleStep &&
 				TryHandleJobManagerPushBackBreakpoint(contextRecord, rip))
 			{

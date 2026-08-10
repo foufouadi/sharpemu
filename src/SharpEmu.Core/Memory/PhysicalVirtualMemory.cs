@@ -28,7 +28,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private const ulong PageSize = 0x1000;
     private const ulong HostAllocationGranularity = 0x10000;
     private const ulong GuestAllocationArenaAddress = 0x00006000_0000_0000;
-    private const ulong GuestAllocationArenaSize = 0x0100_0000;
+    // 512 MiB. Was 16 MiB (0x0100_0000) until Astro Bot 01.018 exhausted
+    // it: this arena originally only served occasional opaque-object
+    // allocations (Font/Json/AudioOut2/KernelPthreadCompat's small guest
+    // "handle" buffers), never remotely close to 16 MiB. The
+    // astrobot-poison-store-fix session (2026-08-10) wired several new
+    // allocator-shaped HLE exports onto it -- operator new/new[] and
+    // sceLibcMspaceMalloc/Memalign in particular -- and a full C++ title's
+    // boot sequence routes many thousands of allocations through those
+    // (one sceLibcMspaceMemalign call alone was observed requesting
+    // ~2 MiB), fixed-size 16 MiB arena had no growth path (TryAllocateGuestMemory
+    // just returns false once full, see below) and games routinely use far
+    // more than that just for boot-time init. Exhaustion showed up as a
+    // *different*, harder-to-diagnose crash than a clean allocation
+    // failure: a caller several frames away from any allocation call
+    // passed the resulting NULL into a placement-construct helper that
+    // never checked for it, producing a null-this-pointer AV several
+    // instructions into a vtable/flag initialization sequence.
+    // Committed guest memory is not physical memory until actually
+    // touched (Windows backs MEM_COMMIT pages on first write), so this is
+    // address space, not RAM -- the same reasoning already applied to
+    // TryRecoverPoisonPointerStore/CompareRead's scratch pages
+    // (DirectExecutionBackend.Exceptions.cs).
+    private const ulong GuestAllocationArenaSize = 0x2000_0000;
     private const ulong GuestAllocationArenaStartOffset = PageSize;
     private const ulong LargeDataReserveThreshold = 0x4000_0000UL; // 1 GiB
     private const ulong FullCommitRegionLimit = 4UL << 30;
