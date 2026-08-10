@@ -2304,18 +2304,28 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		if (!OperatingSystem.IsWindows())
+		// Probe every touched page before reading, on every OS -- was
+		// previously Windows-only-via-try/catch (mirroring TryReadHostQword's
+		// deliberate platform split), but a plain `catch` does NOT actually
+		// catch AccessViolationException on .NET Core/5+: hardware AVs are
+		// fatal by design there regardless of try/catch, unlike classic .NET
+		// Framework. TryReadQword above already gets this right (unconditional
+		// VirtualQuery pre-check); this brings TryReadHostBytes in line with
+		// it instead of relying on a catch that can't actually fire. Found
+		// when a genuinely wild RIP after the poison-pointer/null-global-
+		// interface recoveries (astrobot-poison-store-fix session) took the
+		// whole process down with an unhandled AccessViolationException from
+		// inside this function's old Marshal.Copy try/catch, called from the
+		// exception handler's own diagnostic disassembly path -- i.e. crash
+		// recovery code itself became a crash.
+		ulong end = address + (ulong)buffer.Length;
+		for (ulong page = address & 0xFFFFFFFFFFFFF000uL; page < end; page += 4096)
 		{
-			// See TryReadHostQword: probe every touched page before reading.
-			ulong end = address + (ulong)buffer.Length;
-			for (ulong page = address & 0xFFFFFFFFFFFFF000uL; page < end; page += 4096)
+			if (VirtualQuery((void*)page, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				mbi.State != MEM_COMMIT ||
+				!IsReadableProtection(mbi.Protect))
 			{
-				if (VirtualQuery((void*)page, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
-					mbi.State != MEM_COMMIT ||
-					!IsReadableProtection(mbi.Protect))
-				{
-					return false;
-				}
+				return false;
 			}
 		}
 
