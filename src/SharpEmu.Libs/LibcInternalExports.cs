@@ -219,4 +219,52 @@ public static class LibcInternalExports
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
+
+    // Found needing this immediately after strtok/bcmp/strcpy_s/sprintf_s
+    // (LibcStdioExports.cs) let boot progress far enough to reach it.
+    // Argument order is (mspace, alignment, size) rather than MspaceMalloc's
+    // (mspace, size, alignment) -- taken directly from the well-documented,
+    // open-source dlmalloc "mspace" API this whole family almost certainly
+    // wraps 1:1 (mspace_memalign(mspace, alignment, bytes)), not guessed:
+    // observed rsi=0x4000 (16 KiB, a plausible large/page-ish alignment)
+    // paired with rdx=0x204000 (~2 MiB, a plausible large-buffer size) is
+    // consistent with that order and not the reverse.
+    [SysAbiExport(
+        Nid = "iF1iQHzxBJU",
+        ExportName = "sceLibcMspaceMemalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "LibcInternal")]
+    public static int LibcMspaceMemalign(CpuContext ctx)
+    {
+        var align = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+
+        if (_mspaceDisabled || size == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        if (align == 0 || (align & (align - 1)) != 0)
+        {
+            align = 0x10;
+        }
+
+        if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory(size, align, out var address))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        if (!TryZeroGuestMemory(ctx, address, size))
+        {
+            allocator.TryFreeGuestMemory(address);
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        ctx[CpuRegister.Rax] = address;
+        return 0;
+    }
 }
