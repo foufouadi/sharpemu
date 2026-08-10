@@ -1264,13 +1264,27 @@ public sealed partial class DirectExecutionBackend
 
 	private static int _poisonIndirectCallRecoveries;
 
-	// 64 KiB: matches Windows' own VirtualAlloc allocation granularity, so
-	// this is the largest size that's still guaranteed to come from one
-	// dedicated reserved region -- a SIB-indexed store/compare landing past
-	// the committed size still faults on an uncommitted page in the same
-	// region (a clean, distinguishable crash) rather than risking a stray
-	// index walking into an unrelated live host allocation.
-	private const nuint PoisonPointerScratchPageSize = 65536;
+	// 16 MiB. Started at 64 KiB (Windows' own VirtualAlloc granularity);
+	// raised after Astro Bot showed this genuinely needs to be large.
+	// 2026-08-10: a caller loop that default-constructs successive SSO
+	// container elements (`mov qword[base+28h],0Fh` / capacity=15 -- a
+	// std::string-shaped small-buffer-optimization init) walked clean off
+	// a 64 KiB redirect target, meaning the *count* driving that loop is
+	// itself derived from other already-poisoned/zeroed data further up
+	// the chain -- there's no principled size to compute here without
+	// tracing that back title-specifically, so this is a heuristic
+	// ceiling, not a semantically correct one.
+	//
+	// Committed virtual memory is not physical memory until a guest
+	// actually touches it (Windows backs MEM_COMMIT pages on first write,
+	// same zero-fill-on-demand mechanism as a fresh heap page), so raising
+	// this is nearly free even though every recovery leaks one allocation
+	// for the process's lifetime -- the cost that matters is reserved
+	// *address space*, not RAM, and 64-bit address space is not the
+	// constraint here. A too-large index still faults cleanly on
+	// unreserved address space past this region rather than corrupting an
+	// unrelated live host allocation, same reasoning as at 64 KiB.
+	private const nuint PoisonPointerScratchPageSize = 16 * 1024 * 1024;
 
 	private static int _poisonPointerStoreRecoveries;
 
@@ -1321,6 +1335,7 @@ public sealed partial class DirectExecutionBackend
 	// silently corrupting unrelated host memory.
 	private unsafe bool TryRecoverPoisonPointerStore(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
 	{
+		MaybeDumpCallSiteDisassembly(rip);
 		if (string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
 				"1",
@@ -1455,6 +1470,7 @@ public sealed partial class DirectExecutionBackend
 	// than "the comparison reads zero" would already imply.
 	private unsafe bool TryRecoverPoisonPointerCompareRead(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
 	{
+		MaybeDumpCallSiteDisassembly(rip);
 		if (string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
 				"1",
