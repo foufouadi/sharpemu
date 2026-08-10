@@ -831,4 +831,274 @@ public static class LibcStdioExports
                 return false;
         }
     }
+
+    // Per-guest-thread saved position, mirroring the internal static state
+    // real strtok(3) keeps per calling thread -- keyed by
+    // GuestThreadExecution.CurrentGuestThreadHandle (already used the same
+    // way elsewhere in this codebase, e.g. the Yotei snd_SynthInit
+    // workaround) rather than a single shared static, so two guest threads
+    // tokenizing different strings concurrently don't stomp on each other.
+    // A value of 0 means "no active tokenization on this thread".
+    //
+    // Found needing this via Astro Bot 01.018: unlike sceLibcMspaceMalloc/
+    // Free (astrobot-poison-store-fix, 2026-08-10, ABI genuinely
+    // undocumented), strtok's C signature and behavior are completely
+    // standard -- no guessing involved here, just re-implementing libc.
+    private static readonly ConcurrentDictionary<ulong, ulong> _strtokState = new();
+
+    [SysAbiExport(
+        Nid = "oVkZ8W8-Q8A",
+        ExportName = "strtok",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Strtok(CpuContext ctx)
+    {
+        var str = ctx[CpuRegister.Rdi];
+        var delimAddress = ctx[CpuRegister.Rsi];
+        var threadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+
+        if (!TryReadDelimiterSet(ctx, delimAddress, out var delimiters))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        var position = str != 0 ? str : _strtokState.GetValueOrDefault(threadHandle, 0UL);
+        if (position == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // Skip leading delimiters. A failed read (ran off mapped memory)
+        // ends the scan exactly like a NUL would -- no separate handling
+        // needed, the loop condition already covers it.
+        while (ctx.TryReadByte(position, out var skip) && skip != 0 && delimiters.Contains(skip))
+        {
+            position++;
+        }
+
+        if (!ctx.TryReadByte(position, out var first) || first == 0)
+        {
+            _strtokState[threadHandle] = 0;
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        var tokenStart = position;
+        while (ctx.TryReadByte(position, out var b) && b != 0 && !delimiters.Contains(b))
+        {
+            position++;
+        }
+
+        if (ctx.TryReadByte(position, out var terminator) && terminator != 0)
+        {
+            // Landed on a real delimiter byte -- split the string in place
+            // (real strtok's defining, ABI-visible side effect) and resume
+            // just past it next call.
+            if (TryWriteByte(ctx, position, 0))
+            {
+                _strtokState[threadHandle] = position + 1;
+            }
+            else
+            {
+                _strtokState[threadHandle] = 0; // couldn't mutate the guest string -- stop rather than loop on stale data
+            }
+        }
+        else
+        {
+            _strtokState[threadHandle] = 0; // ran off the end of the string naturally
+        }
+
+        ctx[CpuRegister.Rax] = tokenStart;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool TryReadDelimiterSet(CpuContext ctx, ulong address, out HashSet<byte> delimiters)
+    {
+        delimiters = new HashSet<byte>();
+        if (address == 0)
+        {
+            return true; // NULL delimiter set -- valid C behavior, just never splits
+        }
+
+        const int maxDelimiterLength = 256; // real delimiter sets are always tiny; this is only a runaway-read guard
+        for (var i = 0; i < maxDelimiterLength; i++)
+        {
+            if (!ctx.TryReadByte(address + (ulong)i, out var b))
+            {
+                return false;
+            }
+
+            if (b == 0)
+            {
+                return true;
+            }
+
+            delimiters.Add(b);
+        }
+
+        return true; // hit the cap -- use whatever was collected rather than failing the whole call
+    }
+
+    private static bool TryWriteByte(CpuContext ctx, ulong address, byte value)
+    {
+        Span<byte> buffer = stackalloc byte[1] { value };
+        return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    // Standard, fully-specified C functions (BSD bcmp(3); C11 Annex K
+    // strcpy_s/sprintf_s) -- no ABI guessing involved, unlike
+    // sceLibcMspaceMalloc/Free in LibcInternalExports.cs. Found needing
+    // these on Astro Bot 01.018 right after the _Znwm (operator new) fix
+    // in CxxAbiExports.cs got the boot sequence past its previous
+    // allocator-shaped stalls; register evidence (argument shapes/values
+    // captured live) confirmed each of the three below matches its
+    // standard signature exactly.
+    private const int ErrnoInvalidArgument = 22; // EINVAL
+    private const int ErrnoOutOfRange = 34; // ERANGE
+
+    [SysAbiExport(
+        Nid = "5TjaJwkLWxE",
+        ExportName = "bcmp",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Bcmp(CpuContext ctx)
+    {
+        var left = ctx[CpuRegister.Rdi];
+        var right = ctx[CpuRegister.Rsi];
+        var count = ctx[CpuRegister.Rdx];
+
+        if (count == 0 || left == right)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        Span<byte> leftChunk = stackalloc byte[256];
+        Span<byte> rightChunk = stackalloc byte[256];
+        var offset = 0UL;
+        while (offset < count)
+        {
+            var chunk = (int)Math.Min(count - offset, (ulong)leftChunk.Length);
+            if (!ctx.Memory.TryRead(left + offset, leftChunk[..chunk]) ||
+                !ctx.Memory.TryRead(right + offset, rightChunk[..chunk]))
+            {
+                ctx[CpuRegister.Rax] = 1; // unreadable -- report "different" rather than guessing equal
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            if (!leftChunk[..chunk].SequenceEqual(rightChunk[..chunk]))
+            {
+                ctx[CpuRegister.Rax] = 1;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            offset += (ulong)chunk;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "5Xa2ACNECdo",
+        ExportName = "strcpy_s",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int StrcpySafe(CpuContext ctx)
+    {
+        var dest = ctx[CpuRegister.Rdi];
+        var destSize = ctx[CpuRegister.Rsi];
+        var src = ctx[CpuRegister.Rdx];
+
+        if (dest == 0 || destSize == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)ErrnoInvalidArgument);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (src == 0)
+        {
+            TryWriteByte(ctx, dest, 0);
+            ctx[CpuRegister.Rax] = unchecked((ulong)(long)ErrnoInvalidArgument);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        for (var i = 0UL; i < destSize; i++)
+        {
+            if (!ctx.TryReadByte(src + i, out var b))
+            {
+                TryWriteByte(ctx, dest, 0);
+                ctx[CpuRegister.Rax] = unchecked((ulong)(long)ErrnoInvalidArgument);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (!TryWriteByte(ctx, dest + i, b))
+            {
+                ctx[CpuRegister.Rax] = unchecked((ulong)(long)ErrnoInvalidArgument);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (b == 0)
+            {
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+        }
+
+        // src has no terminator within destSize bytes -- Annex K runtime-constraint
+        // violation: truncate dest to the empty string and report the overflow.
+        TryWriteByte(ctx, dest, 0);
+        ctx[CpuRegister.Rax] = unchecked((ulong)(long)ErrnoOutOfRange);
+        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+    }
+
+    [SysAbiExport(
+        Nid = "xEszJVGpybs",
+        ExportName = "sprintf_s",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int SprintfSafe(CpuContext ctx)
+    {
+        var buffer = ctx[CpuRegister.Rdi];
+        var bufferSize = ctx[CpuRegister.Rsi];
+        var formatAddress = ctx[CpuRegister.Rdx];
+
+        if (buffer == 0 || bufferSize == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!KernelMemoryCompatExports.TryReadNullTerminatedUtf8(ctx, formatAddress, MaxPathLength, out var format))
+        {
+            TryWriteByte(ctx, buffer, 0);
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        // 3 fixed params (buffer, bufferSize, format) occupy rdi/rsi/rdx --
+        // the first variadic argument is the 4th GP slot (rcx), same
+        // "firstGpArgIndex" convention Fprintf/Vfprintf above already use.
+        var rendered = KernelMemoryCompatExports.FormatStringFromVarArgs(ctx, format, firstGpArgIndex: 3);
+        var payload = System.Text.Encoding.UTF8.GetBytes(rendered);
+
+        if ((ulong)payload.Length + 1 > bufferSize)
+        {
+            // Annex K overflow -- truncate to empty string, report the constraint violation
+            TryWriteByte(ctx, buffer, 0);
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx.Memory.TryWrite(buffer, payload) || !TryWriteByte(ctx, buffer + (ulong)payload.Length, 0))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = (ulong)payload.Length;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 }
