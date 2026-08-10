@@ -339,6 +339,16 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverPoisonPointerStore(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverPoisonPointerCompareRead(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -1112,7 +1122,7 @@ public sealed partial class DirectExecutionBackend
 				"1",
 				StringComparison.Ordinal) ||
 			exceptionRecord->NumberParameters < 2 ||
-			exceptionRecord->ExceptionInformation[0] != 0 || // reads only -- a poison *store* would be a different, real bug
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only -- stores are TryRecoverPoisonPointerStore's narrower job
 			rip < 0x10000 ||
 			!IsSharpEmuPoisonReturnValue(exceptionRecord->ExceptionInformation[1]))
 		{
@@ -1253,6 +1263,273 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	private static int _poisonIndirectCallRecoveries;
+
+	// 64 KiB: matches Windows' own VirtualAlloc allocation granularity, so
+	// this is the largest size that's still guaranteed to come from one
+	// dedicated reserved region -- a SIB-indexed store/compare landing past
+	// the committed size still faults on an uncommitted page in the same
+	// region (a clean, distinguishable crash) rather than risking a stray
+	// index walking into an unrelated live host allocation.
+	private const nuint PoisonPointerScratchPageSize = 65536;
+
+	private static int _poisonPointerStoreRecoveries;
+
+	// Follow-on to TryRecoverPoisonPointerDereference: that recovery only
+	// fires on reads (see its comment -- stores are deliberately excluded
+	// there since the poison value merely appearing somewhere in a write's
+	// addressing usually means a different, real bug). But one specific
+	// store shape IS safe to fix up the same way: guest code that treats a
+	// poison return value as a freshly "allocated" object's `this` pointer
+	// and immediately self-initializes it in place, e.g. `this->next =
+	// this; this->prev = this;` for an intrusive-list node. Observed on
+	// Astro Bot right after the two recoveries above stopped masking it:
+	// import #18 (nid=OJjm-QOIHlI, an allocator-shaped call -- rsi=0x28
+	// size, rdx=0x10 align) is unresolved and returns a poison code; the
+	// guest then runs `mov [rax],rax / mov [rax+8],rax / mov [rax+10],rax /
+	// mov word [rax+18],101h` against it and faults on the very first
+	// store, before either of the two read/call recoveries ever gets a
+	// chance to run.
+	//
+	// Unlike the read case, zeroing the base register doesn't help here --
+	// address 0 isn't writable either. Instead this hands the guest a
+	// fresh, zeroed scratch page and retries the *same* instruction (RIP
+	// untouched), matching the shared "the failed import should have
+	// produced something usable" reasoning already applied to reads and
+	// vtable calls. Because it patches the base register itself rather
+	// than special-casing one instruction, the following field stores in
+	// the same init sequence (`[rax+8]`, `[rax+10]`, ...) land on the same
+	// valid page without needing a recovery each -- only the first store
+	// ever faults.
+	//
+	// Deliberately narrow to avoid guessing on shapes that might be a real
+	// bug elsewhere: plain `mov [base(+index*scale+disp)], src` only, and
+	// the store's own *base* register must itself already hold the poison
+	// pattern (not just the computed effective address, which a large
+	// fixed displacement could also make poison-shaped by coincidence).
+	// "mov" covers both the GPR and the plain SSE/AVX-encoded vector forms
+	// (IsCoveredPointerStoreMnemonic) -- compiler-generated struct/object
+	// init sequences on Astro Bot mix scalar field stores with a single
+	// `vmovups [rax], xmm0` for a 128-bit-at-once default value (e.g. an
+	// identity quaternion), and skipping just the scalar half would still
+	// crash one instruction later. A SIB index register is allowed --
+	// `mov [poisonBase+index],eax` (an array/table write into a "container"
+	// built on a failed allocation) was the very next obstacle seen after
+	// the disp-only version of this recovery landed -- the scratch
+	// allocation below is sized generously and Windows reserves a whole
+	// 64 KiB region per VirtualAlloc call, so a too-large index still faults
+	// cleanly on an uncommitted page in that same region rather than
+	// silently corrupting unrelated host memory.
+	private unsafe bool TryRecoverPoisonPointerStore(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 1 || // writes only -- reads are TryRecoverPoisonPointerDereference's job
+			rip < 0x10000 ||
+			!IsSharpEmuPoisonReturnValue(exceptionRecord->ExceptionInformation[1]))
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (!IsCoveredPointerStoreMnemonic(instruction.Mnemonic) ||
+			instruction.OpCount != 2 ||
+			instruction.Op0Kind != OpKind.Memory ||
+			instruction.MemoryBase == Register.None)
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.MemoryBase, out var baseOffset))
+		{
+			return false;
+		}
+
+		if (!IsSharpEmuPoisonReturnValue(ReadCtxU64(contextRecord, baseOffset)))
+		{
+			return false; // the base register itself isn't poison -- don't guess at a coincidental match
+		}
+
+		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		if (scratch == null)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, baseOffset, (ulong)scratch);
+		// RIP deliberately untouched: retry the same instruction now that
+		// the base register points at real, writable memory.
+
+		var recovery = Interlocked.Increment(ref _poisonPointerStoreRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Poison-pointer store recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' fault_target=0x{exceptionRecord->ExceptionInformation[1]:X16} -> " +
+				$"{instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh scratch page), re-executing");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	// Store mnemonics TryRecoverPoisonPointerStore treats as "plain write to
+	// [base(+disp)], safe to redirect the base register for" -- the scalar
+	// GPR move plus the whole-register SSE/AVX moves a compiler emits for
+	// zero/identity-initializing an object's data in one shot. Unlike the
+	// legacy-vs-REX GPR forms (unified under Mnemonic.Mov), Iced gives
+	// VEX-encoded vector instructions their own "V"-prefixed Mnemonic
+	// distinct from the legacy SSE one (Vmovups vs Movups; confirmed live
+	// via a one-shot decode dump on Astro Bot's `C5 F8 11 00` = VEX.128.0F
+	// 11 = VMOVUPS store, which decoded as Mnemonic.Vmovups, not Movups) --
+	// so both spellings are listed explicitly per instruction rather than
+	// relying on Code to distinguish them. Deliberately excludes
+	// read-modify-write, masked/scatter, and non-temporal-with-fencing
+	// forms -- those change behavior in ways this recovery isn't trying to
+	// reason about.
+	private static bool IsCoveredPointerStoreMnemonic(Mnemonic mnemonic) => mnemonic switch
+	{
+		Mnemonic.Mov => true,
+		Mnemonic.Movups or Mnemonic.Vmovups => true,
+		Mnemonic.Movupd or Mnemonic.Vmovupd => true,
+		Mnemonic.Movaps or Mnemonic.Vmovaps => true,
+		Mnemonic.Movapd or Mnemonic.Vmovapd => true,
+		Mnemonic.Movdqu or Mnemonic.Vmovdqu => true,
+		Mnemonic.Movdqa or Mnemonic.Vmovdqa => true,
+		Mnemonic.Movq or Mnemonic.Vmovq => true,
+		Mnemonic.Movd or Mnemonic.Vmovd => true,
+		Mnemonic.Movss or Mnemonic.Vmovss => true,
+		Mnemonic.Movsd or Mnemonic.Vmovsd => true,
+		Mnemonic.Movlps or Mnemonic.Vmovlps => true,
+		Mnemonic.Movhps or Mnemonic.Vmovhps => true,
+		Mnemonic.Movlpd or Mnemonic.Vmovlpd => true,
+		Mnemonic.Movhpd or Mnemonic.Vmovhpd => true,
+		_ => false,
+	};
+
+	private static int _poisonPointerCompareRecoveries;
+
+	// Third follow-on to TryRecoverPoisonPointerDereference. That recovery
+	// only handles MOV-family loads because it has a destination register
+	// to zero. CMP/TEST against a poison-based memory operand have no
+	// destination register -- they only set flags -- so there's nothing to
+	// zero there. Observed on Astro Bot past the store-recovery fixes
+	// above, deeper in the boot sequence: `cmp eax,[r8]` where r8 itself is
+	// the poison pattern (same failed-allocator-import family as the store
+	// case), used as a bound check inside what looks like an associative-
+	// container lookup.
+	//
+	// Same fix shape as TryRecoverPoisonPointerStore: since there's no
+	// register to zero, redirect the memory operand's *base* register to a
+	// fresh zeroed scratch page and retry the same instruction -- the
+	// comparison then reads a real 0 from real memory instead of faulting,
+	// matching "the failed import should have produced something usable"
+	// semantics. Restricted to CMP/TEST specifically because both are
+	// read-only (flags-only side effect, no register or memory write) --
+	// unlike a generic read-modify-write instruction, retrying them after
+	// swapping in a zeroed page can't produce a different visible result
+	// than "the comparison reads zero" would already imply.
+	private unsafe bool TryRecoverPoisonPointerCompareRead(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_POISON_POINTER_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only -- writes are TryRecoverPoisonPointerStore's job
+			rip < 0x10000 ||
+			!IsSharpEmuPoisonReturnValue(exceptionRecord->ExceptionInformation[1]))
+		{
+			return false;
+		}
+
+		var bytes = new byte[16];
+		if (!TryReadHostBytes(rip, bytes))
+		{
+			return false;
+		}
+
+		Instruction instruction;
+		try
+		{
+			var decoder = Decoder.Create(64, new ByteArrayCodeReader(bytes));
+			decoder.IP = rip;
+			decoder.Decode(out instruction);
+		}
+		catch
+		{
+			return false;
+		}
+
+		if (instruction.Code == Code.INVALID || instruction.Length <= 0 || instruction.Length > bytes.Length)
+		{
+			return false;
+		}
+
+		if (instruction.Mnemonic is not (Mnemonic.Cmp or Mnemonic.Test) ||
+			instruction.OpCount != 2 ||
+			instruction.MemoryBase == Register.None ||
+			(instruction.Op0Kind != OpKind.Memory && instruction.Op1Kind != OpKind.Memory))
+		{
+			return false;
+		}
+
+		if (!TryGetGprContextOffset(instruction.MemoryBase, out var baseOffset))
+		{
+			return false;
+		}
+
+		if (!IsSharpEmuPoisonReturnValue(ReadCtxU64(contextRecord, baseOffset)))
+		{
+			return false; // the base register itself isn't poison -- don't guess at a coincidental match
+		}
+
+		void* scratch = VirtualAlloc(null, PoisonPointerScratchPageSize, 4096u | 8192u, 4u);
+		if (scratch == null)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, baseOffset, (ulong)scratch);
+		// RIP deliberately untouched: retry the same instruction now that
+		// the base register points at real, readable (zeroed) memory.
+
+		var recovery = Interlocked.Increment(ref _poisonPointerCompareRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Poison-pointer compare-read recovery #{recovery}: rip=0x{rip:X16} " +
+				$"'{instruction}' fault_target=0x{exceptionRecord->ExceptionInformation[1]:X16} -> " +
+				$"{instruction.MemoryBase}=0x{(ulong)scratch:X16} (fresh zeroed scratch page), re-executing");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
 
 	// Only the 32- and 64-bit GPR forms: writing either correctly zero-
 	// extends into the full 64-bit context slot per x86-64 rules, so
