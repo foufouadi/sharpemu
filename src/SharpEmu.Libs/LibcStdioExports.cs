@@ -1082,11 +1082,54 @@ public static class LibcStdioExports
         // the first variadic argument is the 4th GP slot (rcx), same
         // "firstGpArgIndex" convention Fprintf/Vfprintf above already use.
         var rendered = KernelMemoryCompatExports.FormatStringFromVarArgs(ctx, format, firstGpArgIndex: 3);
+        return WriteBoundedRenderedText(ctx, buffer, bufferSize, rendered);
+    }
+
+    // vsprintf_s: identical to sprintf_s above except the variadic
+    // arguments are already collected into a guest va_list (rcx, the 4th
+    // fixed parameter) rather than read directly off the ABI's own
+    // variadic registers/stack -- exactly the same relationship
+    // Vfprintf above has to Fprintf. Found alongside sprintf_s/putchar/
+    // time/localtime/asctime in the same Astro Bot 01.018 boot phase.
+    [SysAbiExport(
+        Nid = "+qitMEbkSWk",
+        ExportName = "vsprintf_s",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int VsprintfSafe(CpuContext ctx)
+    {
+        var buffer = ctx[CpuRegister.Rdi];
+        var bufferSize = ctx[CpuRegister.Rsi];
+        var formatAddress = ctx[CpuRegister.Rdx];
+        var vaListAddress = ctx[CpuRegister.Rcx];
+
+        if (buffer == 0 || bufferSize == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!KernelMemoryCompatExports.TryReadNullTerminatedUtf8(ctx, formatAddress, MaxPathLength, out var format))
+        {
+            TryWriteByte(ctx, buffer, 0);
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        KernelMemoryCompatExports.TryFormatStringFromVaList(ctx, format, vaListAddress, out var rendered);
+        return WriteBoundedRenderedText(ctx, buffer, bufferSize, rendered);
+    }
+
+    // Shared by sprintf_s/vsprintf_s: writes a rendered string into a
+    // bounded guest buffer under the C11 Annex K contract -- truncate to
+    // an empty string and report the runtime-constraint violation on
+    // overflow rather than a more permissive fallback.
+    private static int WriteBoundedRenderedText(CpuContext ctx, ulong buffer, ulong bufferSize, string rendered)
+    {
         var payload = System.Text.Encoding.UTF8.GetBytes(rendered);
 
         if ((ulong)payload.Length + 1 > bufferSize)
         {
-            // Annex K overflow -- truncate to empty string, report the constraint violation
             TryWriteByte(ctx, buffer, 0);
             ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -1099,6 +1142,34 @@ public static class LibcStdioExports
         }
 
         ctx[CpuRegister.Rax] = (ulong)payload.Length;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // putchar(3): writes a single character to stdout and returns it
+    // (matching putchar's own "return the character written, as an
+    // unsigned char cast to int" contract) or EOF (-1) on failure. Found
+    // alongside vsprintf_s/time/localtime/asctime in the same Astro Bot
+    // 01.018 boot phase.
+    [SysAbiExport(
+        Nid = "m5wN+SwZOR4",
+        ExportName = "putchar",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int Putchar(CpuContext ctx)
+    {
+        var value = (byte)(ctx[CpuRegister.Rdi] & 0xFF);
+        try
+        {
+            Console.Out.Write((char)value);
+            Console.Out.Flush();
+        }
+        catch (IOException)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 }
