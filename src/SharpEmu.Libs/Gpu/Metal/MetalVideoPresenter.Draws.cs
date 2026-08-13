@@ -1030,7 +1030,7 @@ internal static partial class MetalVideoPresenter
                 Math.Max(draw.InstanceCount, 1));
             if (indexBuffer.Pooled)
             {
-                GuestDataPool.Shared.Return(indexBuffer.Data);
+                indexBuffer.TryReturnPooledData();
             }
         }
         else
