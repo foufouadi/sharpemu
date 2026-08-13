@@ -63,7 +63,7 @@ This fork contains **89 commits on `main`, 84 ahead of `upstream/main`**
 
 - Fixed an incorrectly encoded `lock cmpxchg` instruction in the native exception-handling trampoline ([`2055077`](https://github.com/foufouadi/sharpemu/commit/2055077) and three follow-up fixes). The bug left the game's main thread in an infinite spin loop. Ghost of Tsushima now boots and runs continuously at ~60 FPS, although rendering is still incomplete.
 - Got the Ghost of Yotei intro cinematic to play using the diagnostic launch flags documented below.
-- Fixed a GPU arena and fence-tracking stall that blocked the first frame in Demon's Souls ([`05676d35`](https://github.com/foufouadi/sharpemu/commit/05676d35), #770). The game now runs about five times farther before stopping.
+- Fixed a GPU arena and fence-tracking stall that blocked the first frame in Demon's Souls (#770, on the `integration/upstream-latest` branch, not yet merged to `main`). The game now runs about five times farther before stopping.
 - Investigated Quake's wireframe-like rendering artifact. The current evidence points to texture aliasing rather than a rendering mode. Work continues on `fix/quake-render-aliasing`.
 - Added other fixes in the GPU/Vulkan code, shader recompiler (GCN opcode decoding), HLE, and audio code.
 
