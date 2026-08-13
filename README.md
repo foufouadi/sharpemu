@@ -53,7 +53,7 @@ This fork contains **89 commits on `main`, 84 ahead of `upstream/main`**
 
 | Ghost of Yotei — intro cinematic | Ghost of Tsushima — ~60 FPS | Quake — render investigation |
 |:---:|:---:|:---:|
-| <video src="./.github/videos/yotei-cinematic.mov" controls muted width="260"></video> | *media pending* | ![Quake render capture](./.github/images/quake-render.png) |
+| <video src="./.github/videos/yotei-cinematic.mp4" controls muted width="260"></video> | *media pending* | ![Quake render capture](./.github/images/quake-render.png) |
 
 > The Quake capture is a development snapshot from the texture-aliasing investigation
 > described below. It is not reliably reproducible on the current build; see
