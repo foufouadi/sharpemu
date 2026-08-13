@@ -51,9 +51,17 @@ SharpEmu targets the PlayStation 5 exclusively. It does **not** aim to emulate P
 This fork contains **89 commits on `main`, 84 ahead of `upstream/main`**
 (+14.4k / -974 lines), covering the CPU core, GPU/AGC pipeline, shader recompiler, and HLE.
 
-| Ghost of Yotei — intro cinematic | Ghost of Tsushima — ~60 FPS | Quake — render investigation |
-|:---:|:---:|:---:|
-| ![Ghost of Yotei intro cinematic](./.github/videos/yotei-cinematic.gif) | ![Ghost of Tsushima at ~60 FPS](./.github/images/tsushima-60fps.png) | ![Quake render capture](./.github/images/quake-render.png) |
+**Ghost of Yotei — intro cinematic**
+
+![Ghost of Yotei intro cinematic](./.github/videos/yotei-cinematic.gif)
+
+**Ghost of Tsushima — running continuously at ~60 FPS**
+
+![Ghost of Tsushima at ~60 FPS](./.github/images/tsushima-60fps.png)
+
+**Quake — render investigation**
+
+![Quake render capture](./.github/images/quake-render.png)
 
 > The Quake capture is a development snapshot from the texture-aliasing investigation
 > described below. It is not reliably reproducible on the current build; see
