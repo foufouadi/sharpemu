@@ -251,7 +251,7 @@ internal sealed record GuestRenderState(
         Blends.Count == 0 ? GuestBlendState.Default : Blends[0];
 }
 
-/// <summary>Format, NumberType, and ComponentSwap are raw guest render-target codes.</summary>
+/// <summary>Format, NumberType, ComponentSwap, and TileMode are raw guest render-target codes.</summary>
 internal sealed record GuestRenderTarget(
     ulong Address,
     uint Width,
@@ -259,7 +259,8 @@ internal sealed record GuestRenderTarget(
     uint Format,
     uint NumberType,
     uint MipLevels = 1,
-    uint ComponentSwap = 0);
+    uint ComponentSwap = 0,
+    uint TileMode = 0);
 
 /// <summary>Guest DB surface bound alongside a color render target.</summary>
 internal sealed record GuestDepthTarget(
