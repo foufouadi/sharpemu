@@ -11102,10 +11102,6 @@ private static long _indirectDrawProbeCount;
         return draw with
         {
             DepthTarget = depthTarget with { MetadataClear = true },
-            RenderState = draw.RenderState with
-            {
-                Depth = draw.RenderState.Depth with { ClearEnable = true },
-            },
         };
     }
 
