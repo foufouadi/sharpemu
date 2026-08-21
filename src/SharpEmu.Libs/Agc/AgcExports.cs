@@ -72,7 +72,7 @@ public static partial class AgcExports
         ItNop, ItSetBase, ItIndexBufferSize, ItIndexBase, ItDrawIndirect,
         ItDrawIndexIndirect, ItDrawIndex2, ItIndexType, ItDrawIndexAuto,
         ItNumInstances, ItDrawIndexMultiAuto, ItDrawIndexOffset2, ItWriteData,
-        ItMemSemaphore, ItCopyData,
+        ItAtomicMem, ItMemSemaphore, ItCopyData,
         ItDispatchDirect, ItDispatchIndirect, ItCondExec, ItWaitRegMem,
         ItIndirectBuffer, ItEventWrite, ItReleaseMem, ItDmaData,
         ItSetContextReg, ItSetShReg, ItSetUconfigReg, ItGetLodStats,
@@ -1704,6 +1704,12 @@ public static partial class AgcExports
         public bool IsFaulted { get; set; }
         public string? FaultReason { get; set; }
         public bool FaultedSubmissionReported { get; set; }
+        public ulong AtomicReturnMeData { get; set; }
+        public bool AtomicReturnMeValid { get; set; }
+        public bool AtomicReturnMePending { get; set; }
+        public ulong AtomicReturnPfpData { get; set; }
+        public bool AtomicReturnPfpValid { get; set; }
+        public bool AtomicReturnPfpPending { get; set; }
 
         // Set when parsing stops on an INDIRECT_BUFFER packet so the caller can
         // continue into the buffer it links to.
@@ -5430,6 +5436,21 @@ public static partial class AgcExports
                     tracePackets);
             }
 
+            if (op == ItAtomicMem &&
+                HandleSubmittedAtomicMem(
+                    ctx,
+                    gpuState,
+                    state,
+                    commandAddress,
+                    currentAddress,
+                    offset,
+                    length,
+                    dwordCount,
+                    tracePackets))
+            {
+                return true;
+            }
+
             if (op == ItMemSemaphore)
             {
                 if (HandleSubmittedMemSemaphore(
@@ -5993,7 +6014,7 @@ public static partial class AgcExports
             ItDrawIndexAuto or
             ItDrawIndexMultiAuto or
             ItDrawIndexOffset2 ||
-        op is ItMemSemaphore or ItCopyData ||
+        op is ItAtomicMem or ItMemSemaphore or ItCopyData ||
         op == ItDmaData ||
         (op == ItNop && register == RDmaData && length >= 7) ||
         (op == ItNop && register == RFlip && length >= 6) ||
