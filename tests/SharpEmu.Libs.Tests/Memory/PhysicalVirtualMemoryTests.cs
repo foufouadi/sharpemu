@@ -60,6 +60,35 @@ public sealed class PhysicalVirtualMemoryTests
     }
 
     [Fact]
+    public void EnsureRangeCommittedBacksOnlyTheMappedWindow()
+    {
+        using var host = new LazyZeroedHostMemory();
+        using var memory = new PhysicalVirtualMemory(host);
+
+        var address = memory.AllocateAt(0, (4UL << 30) + 0x1000, executable: false);
+        host.CommitCalls.Clear();
+
+        var mappedAddress = address + 0x0800_0000UL;
+        Assert.True(memory.TryEnsureRangeCommitted(mappedAddress, 0x3000));
+
+        Assert.Equal(
+            [
+                (mappedAddress, 0x1000UL, HostPageProtection.ReadWrite),
+                (mappedAddress + 0x1000, 0x1000UL, HostPageProtection.ReadWrite),
+                (mappedAddress + 0x2000, 0x1000UL, HostPageProtection.ReadWrite),
+            ],
+            host.CommitCalls);
+    }
+
+    [Fact]
+    public void EnsureRangeCommittedRejectsAnUnallocatedWindow()
+    {
+        using var memory = new PhysicalVirtualMemory(new FakeHostMemory());
+
+        Assert.False(memory.TryEnsureRangeCommitted(0x0001_0000, 0x1000));
+    }
+
+    [Fact]
     public void TryCopyHandlesOverlappingIdentityMappedRanges()
     {
         using var host = new LazyZeroedHostMemory();

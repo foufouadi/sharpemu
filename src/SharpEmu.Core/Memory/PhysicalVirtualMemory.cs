@@ -982,6 +982,36 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return _hostMemory.Protect(address, size, ResolveProtection(protection), out _);
     }
 
+    public bool TryEnsureRangeCommitted(ulong address, ulong size)
+    {
+        if (size == 0 || ulong.MaxValue - address < size - 1)
+        {
+            return false;
+        }
+
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(address, size);
+            if (region is null || !EnsureRangeCommitted(address, size, region))
+            {
+                return false;
+            }
+
+            if (region.IsReservedOnly)
+            {
+                TraceVmem(
+                    $"Committed mapped guest range: 0x{address:X16} - 0x{address + size:X16} ({size} bytes)");
+            }
+
+            return true;
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+    }
+
     // Reproduces the decomposition KernelMemoryCompatExports.ResolveHostProtection
     // performed before this seam existed; the Windows backend maps each case back
     // to the identical PAGE_* value.

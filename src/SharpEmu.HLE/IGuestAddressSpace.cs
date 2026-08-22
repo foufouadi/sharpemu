@@ -28,5 +28,11 @@ public interface IGuestAddressSpace : IGuestMemoryAllocator
 
     bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress);
 
+    /// <summary>
+    /// Makes an allocated guest range accessible to native guest code.
+    /// A sparse reservation can stay uncommitted until the guest maps this range.
+    /// </summary>
+    bool TryEnsureRangeCommitted(ulong address, ulong size);
+
     bool TryProtect(ulong address, ulong size, GuestPageProtection protection);
 }
