@@ -16955,6 +16955,10 @@ GuestImageWriteTracker.Track(
     {
         switch (version)
         {
+            case RegisterDefaultsVersion7:
+                publicDefaults = PublicRegisterDefaultsVersion7;
+                internalDefaults = InternalRegisterDefaultsVersion7;
+                return true;
             case RegisterDefaultsVersion8:
                 publicDefaults = PublicRegisterDefaultsVersion8;
                 internalDefaults = InternalRegisterDefaultsVersion8;
