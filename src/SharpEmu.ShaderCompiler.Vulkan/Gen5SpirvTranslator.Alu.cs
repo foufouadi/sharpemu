@@ -721,6 +721,21 @@ public static partial class Gen5SpirvTranslator
                             GetRawSource(instruction, 1)),
                         GetRawSource(instruction, 2));
                     break;
+                case "VSadU32":
+                {
+                    var source0 = GetRawSource(instruction, 0);
+                    var source1 = GetRawSource(instruction, 1);
+                    var minimum = Ext(38, _uintType, source0, source1);
+                    var maximum = Ext(41, _uintType, source0, source1);
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            maximum,
+                            minimum),
+                        GetRawSource(instruction, 2));
+                    break;
+                }
                 case "VMinU32":
                     result = Ext(
                         38,
