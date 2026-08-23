@@ -2357,7 +2357,6 @@ internal static unsafe partial class VulkanVideoPresenter
             texture.Height == depthHeight &&
             texture.Type == Gen5TextureType2D &&
             texture.Depth == 1 &&
-            !texture.ArrayedView &&
             texture.ArrayLayers == 1 &&
             texture.MipLevel == 0 &&
             texture.BaseMipLevel == 0 &&
@@ -4233,7 +4232,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public Image Image;
             public DeviceMemory Memory;
             public ImageView View;
-            public Dictionary<uint, ImageView> SampleViews { get; } = new();
+            public Dictionary<(uint DstSelect, bool Arrayed), ImageView> SampleViews { get; } = new();
             public bool Initialized;
             public ImageLayout Layout = ImageLayout.Undefined;
             public float GuestClearDepth = 1f;
@@ -9657,6 +9656,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             $"texture={texture.Width}x{texture.Height} " +
                             $"fmt={texture.Format}/{texture.NumberType} " +
                             $"tile={texture.TileMode} pitch={texture.Pitch} " +
+                            $"arrayed={texture.ArrayedView} array_layers={texture.ArrayLayers} " +
                             $"depth=0x{depth.Address:X16} " +
                             $"surface={depth.LogicalWidth}x{depth.LogicalHeight} " +
                             $"zfmt={depth.GuestFormat}");
@@ -9666,7 +9666,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 var view = GetOrCreateGuestDepthSampleView(
                     depth,
-                    texture.DstSelect);
+                    texture.DstSelect,
+                    texture.ArrayedView);
 
                 if ((_traceGuestImageEvents || _traceVulkanShaderEnabled) &&
                     _tracedDepthTextureAliases.Add(
@@ -9716,9 +9717,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private ImageView GetOrCreateGuestDepthSampleView(
             GuestDepthResource depth,
-            uint dstSelect)
+            uint dstSelect,
+            bool arrayed)
         {
-            if (depth.SampleViews.TryGetValue(dstSelect, out var view))
+            var key = (dstSelect, arrayed);
+            if (depth.SampleViews.TryGetValue(key, out var view))
             {
                 return view;
             }
@@ -9727,7 +9730,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = depth.Image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D,
                 Format = DepthFormat,
                 Components = ToVkComponentMapping(dstSelect),
                 SubresourceRange = new ImageSubresourceRange(
@@ -9745,7 +9748,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 view.Handle,
                 $"SharpEmu guest depth sample 0x{depth.Address:X16} " +
                 $"dst=0x{dstSelect:X3}");
-            depth.SampleViews.Add(dstSelect, view);
+            depth.SampleViews.Add(key, view);
             return view;
         }
 
@@ -9758,7 +9761,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 Image = source.Image,
                 View = GetOrCreateGuestDepthSampleView(
                     source,
-                    texture.DstSelect),
+                    texture.DstSelect,
+                    texture.ArrayedView),
                 Width = source.Width,
                 Height = source.Height,
                 RowLength = source.Width,
