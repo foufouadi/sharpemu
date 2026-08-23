@@ -1637,6 +1637,11 @@ public static partial class AgcExports
         ulong ExportShaderAddress,
         IReadOnlyList<Gen5VertexInputBinding> Bindings);
 
+    private sealed class SubmittedCompletionState
+    {
+        public bool RaisedQueuedInterrupt { get; set; }
+    }
+
     private sealed class SubmittedDcbState
     {
         public readonly record struct PendingSubmission(
@@ -1673,6 +1678,7 @@ public static partial class AgcExports
         // sceAgcDriverAddEqEvent.
         public ulong CompletionEventId { get; set; }
         public ulong ActiveSubmissionId { get; set; }
+        public SubmittedCompletionState? ActiveCompletionState { get; set; }
         public ulong ActiveSubmissionPublicationGeneration { get; set; }
         public Dictionary<ulong, SubmittedIndexSnapshot>? ActiveIndexSnapshots { get; set; }
         public SubmittedIndexSnapshot? CurrentIndexSnapshot { get; set; }
@@ -5164,6 +5170,7 @@ public static partial class AgcExports
         {
             state.HasActiveSubmission = true;
             state.ActiveSubmissionId = submission.SubmissionId;
+            state.ActiveCompletionState = new SubmittedCompletionState();
             state.ActiveSubmissionPublicationGeneration =
                 submission.PublicationGeneration;
             state.ActiveIndexSnapshots = submission.IndexSnapshots;
@@ -5211,17 +5218,22 @@ public static partial class AgcExports
         }
 
         state.CompletionEventNotifiedSubmissionId = submissionId;
-        // Hardware raises an end-of-pipe interrupt for every submission on every
-        // queue, so this is unconditional. It stays safe for titles that do not
-        // want it because delivery is registration-gated: TriggerRegisteredEvents
-        // only queues onto equeues that registered this exact ident through
-        // sceAgcDriverAddEqEvent. Graphics keeps ident 0; a compute queue uses the
-        // owner handle it was submitted under.
+        var completionState = state.ActiveCompletionState;
         var completionEventId = state.CompletionEventId;
         var isGraphics = ReferenceEquals(state, gpuState.Graphics);
         var queueName = state.QueueName;
         void TriggerCompletionEvents()
         {
+            // A queued interrupt already reports the ordered completion. Do not
+            // add a second event for the same submission.
+            if (completionState?.RaisedQueuedInterrupt == true)
+            {
+                TraceAgc(
+                    $"agc.completion_event_suppressed queue={queueName} " +
+                    $"submission={submissionId} reason=queued_interrupt");
+                return;
+            }
+
             var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
                 completionEventId,
                 KernelEventQueueCompatExports.KernelEventFilterGraphics,
@@ -8730,6 +8742,7 @@ public static partial class AgcExports
                                       destination is 0 or 1 &&
                                       writeLength != 0;
         var writesGuestMemory = expectsGuestMemoryWrite && destinationAddress != 0;
+        var submissionCompletionState = state.ActiveCompletionState;
 
         if (tracePacket || _logGpuCacheOperations)
         {
@@ -8806,6 +8819,11 @@ public static partial class AgcExports
                         KernelEventQueueCompatExports.KernelEventFilterGraphics,
                         interruptContextId & 0x07FF_FFFFu)
                     : 0;
+                if (interruptDecision.RaisesInterrupt &&
+                    submissionCompletionState is not null)
+                {
+                    submissionCompletionState.RaisedQueuedInterrupt = true;
+                }
 
                 if (tracePacket)
                 {
@@ -8955,6 +8973,7 @@ public static partial class AgcExports
         };
         var expectsGuestMemoryWrite = staticDecision.WritesData && writeLength != 0;
         var writesGuestMemory = expectsGuestMemoryWrite && destinationAddress != 0;
+        var submissionCompletionState = state.ActiveCompletionState;
         if (tracePacket || _logGpuCacheOperations)
         {
             TraceUniqueGpuCacheOperation(
@@ -9032,6 +9051,11 @@ public static partial class AgcExports
                         KernelEventQueueCompatExports.KernelEventFilterGraphics,
                         interruptContextId & 0x07FF_FFFFu)
                     : 0;
+                if (interruptDecision.RaisesInterrupt &&
+                    submissionCompletionState is not null)
+                {
+                    submissionCompletionState.RaisedQueuedInterrupt = true;
+                }
 
                 if (tracePacket)
                 {
