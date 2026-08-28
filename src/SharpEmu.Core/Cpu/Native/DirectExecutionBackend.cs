@@ -3099,6 +3099,26 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		int belowStackJump = offset;
 		EmitUInt32(code, ref offset, 0u);
 
+		// A host-stack access violation can originate in managed or JIT code.
+		// Do not enter a managed VEH callback from that state. Direct guest code
+		// uses the guest stack and keeps the existing managed recovery path.
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x8B);
+		EmitByte(code, ref offset, 0x45); EmitByte(code, ref offset, 0x00); // mov rax, [r13]
+		EmitByte(code, ref offset, 0x81); EmitByte(code, ref offset, 0x38);
+		EmitUInt32(code, ref offset, 0xC0000005u);
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
+		int hostNotAccessViolationJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xE4); // mov rsp, r12
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C);
+		EmitByte(code, ref offset, 0xC3);
+		int hostManagedOffset = offset;
+		*(int*)(code + hostNotAccessViolationJump) =
+			hostManagedOffset - (hostNotAccessViolationJump + sizeof(int));
+
 		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
 		// Serialize managed VEH entry (recursive spinlock). Concurrent UnmanagedCallersOnly
 		// FailFast was the tLTQ silent mid-TBB pattern (enter without abort breadcrumb).
@@ -7447,6 +7467,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_runtimeSymbolsByName.Clear();
 		StopReadyThreadDispatcher();
 		StopStallWatchdog();
+		if (_guestImageWriteFaultHandler != 0)
+		{
+			RemoveVectoredExceptionHandler((void*)_guestImageWriteFaultHandler);
+			_guestImageWriteFaultHandler = 0;
+		}
 		if (_exceptionHandler != 0)
 		{
 			RemoveVectoredExceptionHandler((void*)_exceptionHandler);
@@ -7461,6 +7486,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			VirtualFree((void*)_rawExceptionHandlerStub, 0u, 32768u);
 			_rawExceptionHandlerStub = 0;
+		}
+		if (_guestImageWriteFaultHandlerStub != 0)
+		{
+			VirtualFree((void*)_guestImageWriteFaultHandlerStub, 0u, 32768u);
+			_guestImageWriteFaultHandlerStub = 0;
 		}
 		if (_exceptionHandlerStub != 0)
 		{
