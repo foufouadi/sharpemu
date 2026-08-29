@@ -308,6 +308,7 @@ public static partial class AgcExports
         public Dictionary<uint, uint> CxRegisters { get; } = new();
         public Dictionary<uint, uint> ShRegisters { get; } = new();
         public Dictionary<uint, uint> UcRegisters { get; } = new();
+        public uint? CompositeDepthSizeXy { get; set; }
         public TextureDescriptor? PresenterTexture { get; set; }
         public GuestDrawKind GuestDrawKind { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
