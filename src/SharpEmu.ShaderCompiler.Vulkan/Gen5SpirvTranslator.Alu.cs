@@ -2043,6 +2043,11 @@ public static partial class Gen5SpirvTranslator
                     StoreS(destination, result);
                     return true;
                 }
+                case "SAbsI32":
+                    result = Ext(5, _uintType, left);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
                 case "SBitset1B32":
                     result = _module.AddInstruction(
                         SpirvOp.BitFieldInsert,

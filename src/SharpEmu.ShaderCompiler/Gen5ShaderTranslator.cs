@@ -964,6 +964,7 @@ public static class Gen5ShaderTranslator
             0x14 => "SFF1I32B64",
             0x15 => "SFlbitI32B32",
             0x1D => "SBitset1B32",
+            0x34 => "SAbsI32",
             0x1F => "SGetpcB64",
             0x20 => "SSetpcB64",
             0x21 => "SSwappcB64",

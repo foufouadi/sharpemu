@@ -1869,6 +1869,7 @@ public static partial class Gen5ShaderScalarEvaluator
             "SBcnt1I32B32" or
             "SFF1I32B32" or
             "SFlbitI32B32" or
+            "SAbsI32" or
             "SBitset1B32")
         {
             registers[destination.Value] = instruction.Opcode switch
@@ -1880,9 +1881,10 @@ public static partial class Gen5ShaderScalarEvaluator
                 "SBcnt1I32B32" => (uint)BitOperations.PopCount(left),
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
                 "SFlbitI32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.LeadingZeroCount(left),
+                "SAbsI32" => left == 0x8000_0000u ? left : (uint)Math.Abs(unchecked((int)left)),
                 _ => registers[destination.Value] | (1u << ((int)left & 31)),
             };
-            if (instruction.Opcode is "SNotB32" or "SWqmB32" or "SBcnt1I32B32")
+            if (instruction.Opcode is "SNotB32" or "SWqmB32" or "SBcnt1I32B32" or "SAbsI32")
             {
                 scalarConditionCode = registers[destination.Value] != 0;
             }
