@@ -2083,16 +2083,22 @@ public static partial class Gen5SpirvTranslator
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
+                case "DsReadB64":
                 case "DsReadB96":
                 case "DsReadB128":
                 {
-                    // ds_read_b96 loads 3 consecutive dwords, ds_read_b128 loads
-                    // 4, into dest..dest+N from the address's offset.
-                    var dwordCount = instruction.Opcode == "DsReadB128" ? 4 : 3;
+                    // ds_read_b64/b96/b128 load 2/3/4 consecutive dwords into
+                    // dest..dest+N from the address's offset.
+                    var dwordCount = instruction.Opcode switch
+                    {
+                        "DsReadB128" => 4,
+                        "DsReadB96" => 3,
+                        _ => 2,
+                    };
                     if (instruction.Destinations.Count < dwordCount ||
                         instruction.Sources.Count < 1)
                     {
-                        error = "missing LDS read128 operand";
+                        error = "missing LDS wide read operand";
                         return false;
                     }
 
@@ -2106,6 +2112,32 @@ public static partial class Gen5SpirvTranslator
                         StoreV(instruction.Destinations[dword].Value, value);
                     }
 
+                    return true;
+                }
+                case "DsRead2B64":
+                {
+                    if (instruction.Destinations.Count < 4 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read2b64 operand";
+                        return false;
+                    }
+
+                    var address64 = GetRawSource(instruction, 0);
+                    var pair0 = control.Offset0 * 8u;
+                    var pair1 = control.Offset1 * 8u;
+                    StoreV(
+                        instruction.Destinations[0].Value,
+                        Load(_uintType, LdsPointer(address64, pair0)));
+                    StoreV(
+                        instruction.Destinations[1].Value,
+                        Load(_uintType, LdsPointer(address64, pair0 + sizeof(uint))));
+                    StoreV(
+                        instruction.Destinations[2].Value,
+                        Load(_uintType, LdsPointer(address64, pair1)));
+                    StoreV(
+                        instruction.Destinations[3].Value,
+                        Load(_uintType, LdsPointer(address64, pair1 + sizeof(uint))));
                     return true;
                 }
                 case "DsRead2B32":

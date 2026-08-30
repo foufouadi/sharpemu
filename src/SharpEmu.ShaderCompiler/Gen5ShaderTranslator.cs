@@ -1577,6 +1577,8 @@ public static class Gen5ShaderTranslator
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            0x76 => "DsReadB64",
+            0x77 => "DsRead2B64",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
             0x4D => "DsWriteB64",
@@ -2487,7 +2489,7 @@ public static class Gen5ShaderTranslator
                     "DsReadB32" or "DsSwizzleB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsRead2B32" or "DsRead2St64B32" => [
+                    "DsRead2B32" or "DsRead2St64B32" or "DsReadB64" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
                     ],
@@ -2496,7 +2498,7 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorDestination + 1),
                         Gen5Operand.Vector(vectorDestination + 2),
                     ],
-                    "DsReadB128" => [
+                    "DsReadB128" or "DsRead2B64" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
                         Gen5Operand.Vector(vectorDestination + 2),
