@@ -2083,6 +2083,52 @@ public static partial class Gen5SpirvTranslator
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
+                case "DsSwizzleB32":
+                {
+                    if (instruction.Destinations.Count < 1 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS swizzle operand";
+                        return false;
+                    }
+
+                    // ds_swizzle_b32 is a pure lane exchange (no LDS traffic). The
+                    // 16-bit DS offset is the swizzle control, scoped to groups of 32.
+                    var data = GetRawSource(instruction, 0);
+                    var pattern = control.Offset0 | (control.Offset1 << 8);
+                    var localLane = BitwiseAnd(GuestWaveLane(), UInt(31));
+                    uint sourceLane;
+                    if ((pattern & 0x8000u) != 0)
+                    {
+                        // Bit mode: src = ((lane & and) | or) ^ xor, 5-bit masks.
+                        sourceLane = BitwiseXor(
+                            BitwiseOr(
+                                BitwiseAnd(localLane, UInt(pattern & 0x1Fu)),
+                                UInt((pattern >> 5) & 0x1Fu)),
+                            UInt((pattern >> 10) & 0x1Fu));
+                    }
+                    else
+                    {
+                        // Quad mode: lane (quadBase + pattern[2*(lane&3) +: 2]).
+                        var quadBase = BitwiseAnd(localLane, UInt(0xFFFF_FFFCu));
+                        var laneInQuad = BitwiseAnd(localLane, UInt(3));
+                        var sel = BitwiseAnd(
+                            ShiftRightLogical(
+                                UInt(pattern & 0xFFu),
+                                ShiftLeftLogical(laneInQuad, UInt(1))),
+                            UInt(3));
+                        sourceLane = IAdd(quadBase, sel);
+                    }
+
+                    var shuffled = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        data,
+                        BitwiseAnd(sourceLane, UInt(31)));
+                    StoreV(instruction.Destinations[0].Value, shuffled);
+                    return true;
+                }
                 case "DsReadB64":
                 case "DsReadB96":
                 case "DsReadB128":
@@ -6090,7 +6136,7 @@ public static partial class Gen5SpirvTranslator
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32" or
-                    "DsAppend" or "DsConsume");
+                    "DsAppend" or "DsConsume" or "DsSwizzleB32");
 
         private bool UsesSubgroupBroadcast() =>
             _state.Program.Instructions.Any(instruction =>
