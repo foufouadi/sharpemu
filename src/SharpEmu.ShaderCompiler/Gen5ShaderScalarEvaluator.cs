@@ -1868,6 +1868,7 @@ public static partial class Gen5ShaderScalarEvaluator
             "SBrevB32" or
             "SBcnt1I32B32" or
             "SFF1I32B32" or
+            "SFlbitI32B32" or
             "SBitset1B32")
         {
             registers[destination.Value] = instruction.Opcode switch
@@ -1878,6 +1879,7 @@ public static partial class Gen5ShaderScalarEvaluator
                 "SBrevB32" => ReverseBits(left),
                 "SBcnt1I32B32" => (uint)BitOperations.PopCount(left),
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
+                "SFlbitI32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.LeadingZeroCount(left),
                 _ => registers[destination.Value] | (1u << ((int)left & 31)),
             };
             if (instruction.Opcode is "SNotB32" or "SWqmB32" or "SBcnt1I32B32")

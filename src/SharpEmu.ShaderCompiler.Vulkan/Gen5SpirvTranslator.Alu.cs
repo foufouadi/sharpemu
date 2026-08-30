@@ -2033,6 +2033,16 @@ public static partial class Gen5SpirvTranslator
                     result = Ext(73, _uintType, left);
                     StoreS(destination, result);
                     return true;
+                case "SFlbitI32B32":
+                {
+                    // Count leading zero bits, 0xFFFFFFFF when the source is zero.
+                    var msb = Ext(74, _uintType, left);
+                    var clz = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), msb);
+                    result = _module.AddInstruction(
+                        SpirvOp.Select, _uintType, IsNotZero(left), clz, UInt(0xFFFFFFFFu));
+                    StoreS(destination, result);
+                    return true;
+                }
                 case "SBitset1B32":
                     result = _module.AddInstruction(
                         SpirvOp.BitFieldInsert,
