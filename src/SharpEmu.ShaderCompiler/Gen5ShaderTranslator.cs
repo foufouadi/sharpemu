@@ -1274,6 +1274,7 @@ public static class Gen5ShaderTranslator
             0x35 => "VMulF16",
             0x39 => "VMaxF16",
             0x3A => "VMinF16",
+            0x3C => "VPkFmacF16",
             _ => string.Empty,
         };
 
@@ -2323,6 +2324,14 @@ public static class Gen5ShaderTranslator
                 }
 
                 destinations = [Gen5Operand.Vector((word >> 17) & 0xFF)];
+                if (opcode == "VPkFmacF16")
+                {
+                    // Packed-f16 fused multiply-accumulate: vdst = pk_fma(src0, src1, vdst),
+                    // natural op_sel (low->low, high->high), no negate/clamp.
+                    sources = [.. sources, Gen5Operand.Vector((word >> 17) & 0xFF)];
+                    control = new Gen5Vop3pControl(0u, 7u, 0u, 0u, false);
+                }
+
                 break;
             case Gen5ShaderEncoding.Vopc:
                 if (isDpp8)

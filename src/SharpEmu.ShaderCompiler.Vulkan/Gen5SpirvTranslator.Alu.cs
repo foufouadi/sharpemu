@@ -1013,6 +1013,7 @@ public static partial class Gen5SpirvTranslator
                 case "VPkMinF16":
                 case "VPkMaxF16":
                 case "VPkFmaF16":
+                case "VPkFmacF16":
                     if (!TryEmitPackedF16(instruction, out result, out error))
                     {
                         return false;
@@ -1153,7 +1154,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var sourceCount = instruction.Opcode == "VPkFmaF16" ? 3 : 2;
+            var sourceCount = instruction.Opcode is "VPkFmaF16" or "VPkFmacF16" ? 3 : 2;
             for (var index = 0; index < sourceCount; index++)
             {
                 var source = instruction.Sources[index];
@@ -1285,7 +1286,7 @@ public static partial class Gen5SpirvTranslator
             var left = EmitPackedF16Operand(instruction, control, 0, highLane);
             var right = EmitPackedF16Operand(instruction, control, 1, highLane);
             uint value;
-            if (instruction.Opcode == "VPkFmaF16")
+            if (instruction.Opcode is "VPkFmaF16" or "VPkFmacF16")
             {
                 var addend = EmitPackedF16Operand(instruction, control, 2, highLane);
                 value = EmitPackedF16FusedMultiplyAdd(left, right, addend);
