@@ -896,9 +896,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return *(ulong*)((byte*)contextRecord + offset);
 	}
 
-	private unsafe static int CallNativeEntry(void* entry)
+	private unsafe static ulong CallNativeEntry(void* entry)
 	{
-		var nativeEntry = (delegate* unmanaged[Cdecl]<int>)entry;
+		var nativeEntry = (delegate* unmanaged[Cdecl]<ulong>)entry;
 		return nativeEntry();
 	}
 
@@ -4474,6 +4474,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong returnValue,
 		out string? error)
 	{
+		return TryCallGuestFunction(
+			callerContext,
+			entryPoint,
+			arg0,
+			arg1,
+			arg2,
+			0,
+			stackAddress,
+			stackSize,
+			reason,
+			out returnValue,
+			out error);
+	}
+
+	public bool TryCallGuestFunction(
+		CpuContext callerContext,
+		ulong entryPoint,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2,
+		ulong arg3,
+		ulong stackAddress,
+		ulong stackSize,
+		string reason,
+		out ulong returnValue,
+		out string? error)
+	{
 		returnValue = 0;
 		error = null;
 		if (_forcedGuestExit)
@@ -4549,7 +4576,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rdi] = arg0;
 		context[CpuRegister.Rsi] = arg1;
 		context[CpuRegister.Rdx] = arg2;
-		context[CpuRegister.Rcx] = 0;
+		context[CpuRegister.Rcx] = arg3;
 		context[CpuRegister.R8] = 0;
 		context[CpuRegister.R9] = 0;
 		if (!InitializeGuestThreadFrame(context))
@@ -6225,7 +6252,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				// TBB execute-AV recover needs native-worker TLS (eligible/done).
 				// Other guests stay on CallNativeEntry — full native-worker migration
 				// increased splash hangs / UnmanagedCallersOnly (tLTN/tLTO).
-				int nativeReturn;
+				ulong nativeReturn;
 				if (name == "tbb_thead")
 				{
 					nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
@@ -6249,7 +6276,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				context[CpuRegister.Rax] = nativeReturn;
+				reason = $"returned 0x{nativeReturn:X16}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -6388,7 +6416,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				int nativeReturn;
+				ulong nativeReturn;
 				if (name == "tbb_thead")
 				{
 					nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
@@ -6412,7 +6440,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				context[CpuRegister.Rax] = nativeReturn;
+				reason = $"returned 0x{nativeReturn:X16}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -6728,7 +6757,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
-			int num6 = -1;
+			ulong num6 = ulong.MaxValue;
 			try
 			{
 				num6 = CallNativeEntry(ptr);
@@ -6749,13 +6778,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine("  1. Invalid memory access in guest code");
 				Console.Error.WriteLine("  2. Unpatched import/TLS call");
 				Console.Error.WriteLine("  3. Stack corruption");
-				num6 = -1;
+				num6 = ulong.MaxValue;
 			}
 			catch (Exception ex2)
 			{
 				Console.Error.WriteLine("[LOADER][ERROR] Exception during execution: " + ex2.GetType().Name + ": " + ex2.Message);
 				LastError = "Exception during execution: " + ex2.GetType().Name + ": " + ex2.Message;
-				num6 = -1;
+				num6 = ulong.MaxValue;
 			}
 			if (ActiveForcedGuestExit)
 			{
