@@ -1979,6 +1979,30 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode == "SBitreplicateB64B32")
+            {
+                // Spread each of the 32 source bits into a pair of result bits:
+                // dst[2i] = dst[2i+1] = src[i].
+                uint Replicate(uint half16)
+                {
+                    var x = BitwiseAnd(
+                        BitwiseOr(half16, ShiftLeftLogical(half16, UInt(8))),
+                        UInt(0x00FF00FFu));
+                    x = BitwiseAnd(
+                        BitwiseOr(x, ShiftLeftLogical(x, UInt(4))), UInt(0x0F0F0F0Fu));
+                    x = BitwiseAnd(
+                        BitwiseOr(x, ShiftLeftLogical(x, UInt(2))), UInt(0x33333333u));
+                    x = BitwiseAnd(
+                        BitwiseOr(x, ShiftLeftLogical(x, UInt(1))), UInt(0x55555555u));
+                    return BitwiseOr(x, ShiftLeftLogical(x, UInt(1)));
+                }
+
+                var source = GetRawSource(instruction, 0);
+                StoreS(destination, Replicate(BitwiseAnd(source, UInt(0xFFFFu))));
+                StoreS(destination + 1, Replicate(ShiftRightLogical(source, UInt(16))));
+                return true;
+            }
+
             if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
                 instruction.Opcode is "SWqmB64" or "SBfeU64" or "SBfeI64")
             {

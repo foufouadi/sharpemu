@@ -1892,6 +1892,28 @@ public static partial class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode == "SBitreplicateB64B32")
+        {
+            if (destination.Value >= ScalarRegisterCount - 1)
+            {
+                error =
+                    $"unsupported-scalar-destination pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            ulong replicated = 0;
+            for (var bit = 0; bit < 32; bit++)
+            {
+                if (((left >> bit) & 1u) != 0)
+                {
+                    replicated |= 3UL << (bit * 2);
+                }
+            }
+
+            WriteScalarPair(registers, destination.Value, replicated, ref execMask);
+            return true;
+        }
+
         if (instruction.Sources.Count < 2 ||
             !TryEvaluateScalarOperand(
                 instruction.Sources[1],
