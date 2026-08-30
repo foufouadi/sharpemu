@@ -96,9 +96,9 @@ public static class Gen5ShaderTranslator
     private sealed class ShaderDecodeCache
     {
         public object Gate { get; } = new();
-        public Dictionary<ulong, Gen5ShaderProgram> Programs { get; } = new();
+        public Dictionary<(ulong Address, uint Checksum), Gen5ShaderProgram> Programs { get; } = new();
         public Dictionary<ulong, FusedShaderParts> FusedPrograms { get; } = new();
-        public Dictionary<ulong, Gen5ShaderMetadata?> Metadata { get; } = new();
+        public Dictionary<(ulong Header, uint Checksum), Gen5ShaderMetadata?> Metadata { get; } = new();
     }
 
     private sealed record FusedShaderParts(
@@ -132,7 +132,12 @@ public static class Gen5ShaderTranslator
                 entryHeaderAddress,
                 continuationAddress,
                 continuationHeaderAddress);
-            cache.Programs.Remove(entryAddress);
+            foreach (var key in cache.Programs.Keys
+                         .Where(key => key.Address == entryAddress)
+                         .ToArray())
+            {
+                cache.Programs.Remove(key);
+            }
         }
     }
 
@@ -236,16 +241,18 @@ public static class Gen5ShaderTranslator
         out Gen5ShaderState state,
         out string error,
         Gen5ComputeSystemRegisters? computeSystemRegisters = null,
-        uint userDataScalarRegisterBase = 0)
+        uint userDataScalarRegisterBase = 0,
+        uint shaderChecksum = 0)
     {
         ValidateUserSgprCountDecoding();
         state = default!;
         error = string.Empty;
         var cache = _decodeCaches.GetValue(ctx.Memory, static _ => new ShaderDecodeCache());
+        var programKey = (Address: shaderAddress, Checksum: shaderChecksum);
         Gen5ShaderProgram? program;
         lock (cache.Gate)
         {
-            cache.Programs.TryGetValue(shaderAddress, out program);
+            cache.Programs.TryGetValue(programKey, out program);
         }
 
         if (program is null)
@@ -257,17 +264,18 @@ public static class Gen5ShaderTranslator
 
             lock (cache.Gate)
             {
-                cache.Programs.TryAdd(shaderAddress, program);
+                cache.Programs.TryAdd(programKey, program);
             }
         }
 
         Gen5ShaderMetadata? metadata = null;
         if (shaderHeaderAddress != 0)
         {
+            var metadataKey = (Header: shaderHeaderAddress, Checksum: shaderChecksum);
             var metadataCached = false;
             lock (cache.Gate)
             {
-                metadataCached = cache.Metadata.TryGetValue(shaderHeaderAddress, out metadata);
+                metadataCached = cache.Metadata.TryGetValue(metadataKey, out metadata);
             }
 
             if (!metadataCached)
@@ -282,7 +290,7 @@ public static class Gen5ShaderTranslator
 
                 lock (cache.Gate)
                 {
-                    cache.Metadata.TryAdd(shaderHeaderAddress, metadata);
+                    cache.Metadata.TryAdd(metadataKey, metadata);
                 }
             }
         }
@@ -311,7 +319,8 @@ public static class Gen5ShaderTranslator
             userData,
             metadata,
             computeSystemRegisters,
-            userDataScalarRegisterBase);
+            userDataScalarRegisterBase,
+            shaderChecksum);
         return true;
     }
 
