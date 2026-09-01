@@ -1590,6 +1590,7 @@ public static partial class Gen5SpirvTranslator
                         _uintType,
                         localId,
                         component);
+                    StoreV(component, localComponent, guardWithExec: false);
                     var groupComponent = _module.AddInstruction(
                         SpirvOp.CompositeExtract,
                         _uintType,
@@ -1608,7 +1609,6 @@ public static partial class Gen5SpirvTranslator
                             groupComponent,
                             UInt(localSize)),
                         localComponent);
-                    StoreV(component, globalComponent, guardWithExec: false);
                     var limitPointer = _module.AddInstruction(
                         SpirvOp.AccessChain,
                         _pushConstantUintPointer,
