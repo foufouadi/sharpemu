@@ -2030,12 +2030,18 @@ public static class Gen5ShaderTranslator
 
         // IMAGE_LOAD itself is read-only and maps naturally to OpImageFetch,
         // including for block-compressed textures which Vulkan cannot expose
-        // as storage images. Keep it as storage only when the same resolved
-        // descriptor is also written in this shader stage, preserving coherent
-        // read/write access through one storage-image representation.
+        // as storage images. Keep it as storage when the same guest image
+        // resource is also written in this shader stage. The guest may bind
+        // the same surface through format aliases (for example UNORM for the
+        // store and SRGB for the load), so comparing the descriptor words here
+        // would split one read/write resource into a sampled image plus a
+        // storage image. Kyty merges those operations by the image resource
+        // source before descriptor materialization.
         return stageBindings.Any(candidate =>
             IsStorageImageOperation(candidate.Opcode) &&
-            binding.ResourceDescriptor.SequenceEqual(candidate.ResourceDescriptor));
+            binding.Control.ScalarResource == candidate.Control.ScalarResource &&
+            binding.Control.Dimension == candidate.Control.Dimension &&
+            binding.Control.A16 == candidate.Control.A16);
     }
 
     public static bool IsArrayedImageBinding(Gen5ImageBinding binding) =>
