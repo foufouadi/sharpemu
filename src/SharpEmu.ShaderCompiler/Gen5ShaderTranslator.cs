@@ -1619,6 +1619,7 @@ public static class Gen5ShaderTranslator
             0x3D => "DsConsume",
             0x3E => "DsAppend",
             0x4D => "DsWriteB64",
+            0xB0 => "DsWriteAddTidB32",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -2494,6 +2495,12 @@ public static class Gen5ShaderTranslator
                     "DsWriteB32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
+                    ],
+                    // DS_WRITE_ADDTID uses DATA0 as the value and M0 as the
+                    // 16-bit base address; the hardware adds lane_id * 4.
+                    "DsWriteAddTidB32" => [
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Scalar(124),
                     ],
                     "DsWriteB64" => [
                         Gen5Operand.Vector(vectorAddress),
