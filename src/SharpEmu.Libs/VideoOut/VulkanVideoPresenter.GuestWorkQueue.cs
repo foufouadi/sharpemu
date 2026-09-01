@@ -1411,14 +1411,31 @@ internal static unsafe partial class VulkanVideoPresenter
         foreach (var texture in textures)
         {
             if (!texture.IsStorage ||
-                texture.Address == 0 ||
-                texture.RgbaPixels.Length != 0)
+                texture.Address == 0)
             {
                 continue;
             }
 
+            // A logical guest queue can be submitted on either the graphics
+            // or dedicated compute queue. A Vulkan image barrier recorded in
+            // the consumer command buffer cannot order that consumer after a
+            // writer on the other queue; it only describes access once both
+            // submissions are executing. The writer sequence is already
+            // tracked for present, so use it here as the cross-queue
+            // dependency for every storage-image access. This is deliberately
+            // conservative for storage reads, but preserves the guest's
+            // read-after-write order without requiring a host wait for every
+            // unrelated submission.
+            if (_guestImageWorkSequences.TryGetValue(
+                    texture.Address,
+                    out var imageWorkSequence))
+            {
+                required = Math.Max(required, imageWorkSequence);
+            }
+
             var format = GetGuestTextureFormat(texture.Format, texture.NumberType);
-            if (_pendingGuestImageUploads.TryGetValue(
+            if (texture.RgbaPixels.Length == 0 &&
+                _pendingGuestImageUploads.TryGetValue(
                     (texture.Address, format),
                     out var pendingUpload))
             {
