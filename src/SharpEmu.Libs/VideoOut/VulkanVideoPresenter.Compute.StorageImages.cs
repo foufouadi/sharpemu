@@ -497,20 +497,27 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
+                // GetOrCreateGuestImage transitions every newly allocated color
+                // image from Undefined to ShaderReadOnlyOptimal before it is
+                // returned.  Initialized is a content-validity bit, not a
+                // Vulkan-layout bit, so a fresh image is still in
+                // ShaderReadOnlyOptimal here even when Initialized is false.
+                // Using Undefined as OldLayout made the first storage-image
+                // write of a newly created deferred target an invalid layout
+                // transition and left the writer with undefined behavior.
+                var hasPriorContents =
+                    guestImage.Initialized || guestImage.InitialUploadPending;
                 var barrier = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
                     SrcAccessMask =
-                        guestImage.Initialized || guestImage.InitialUploadPending
+                        hasPriorContents
                         ? AccessFlags.ShaderReadBit
                         : 0,
                     DstAccessMask =
                         AccessFlags.ShaderReadBit |
                         AccessFlags.ShaderWriteBit,
-                    OldLayout =
-                        guestImage.Initialized || guestImage.InitialUploadPending
-                        ? ImageLayout.ShaderReadOnlyOptimal
-                        : ImageLayout.Undefined,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
                     NewLayout = ImageLayout.General,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -519,7 +526,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
-                    guestImage.Initialized || guestImage.InitialUploadPending
+                    hasPriorContents
                         ? shaderStage
                         : PipelineStageFlags.TopOfPipeBit,
                     shaderStage,
