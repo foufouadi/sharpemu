@@ -1616,6 +1616,19 @@ public static partial class Gen5MslTranslator
                     StoreLds(LdsIndex(address, control.SingleOffsetBytes), RawSource(instruction, 1));
                     return true;
                 }
+                case "DsWriteAddTidB32":
+                {
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = "missing LDS write addtid source";
+                        return false;
+                    }
+
+                    var m0 = Temp("uint", $"{RawSource(instruction, 1)} & 0xFFFFu");
+                    var address = Temp("uint", $"{m0} + (sharpemu_lane << 2u)");
+                    StoreLds(LdsIndex(address, 0), RawSource(instruction, 0));
+                    return true;
+                }
                 case "DsWriteB64":
                 {
                     var address = Temp("uint", RawSource(instruction, 0));
@@ -1658,6 +1671,22 @@ public static partial class Gen5MslTranslator
                     StoreVector(
                         instruction.Destinations[0].Value,
                         $"sharpemu_lds[{LdsIndex(address, control.SingleOffsetBytes)}]");
+                    return true;
+                }
+                case "DsReadAddTidB32":
+                {
+                    if (instruction.Destinations.Count < 1 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read addtid operand";
+                        return false;
+                    }
+
+                    var m0 = Temp("uint", $"{RawSource(instruction, 0)} & 0xFFFFu");
+                    var address = Temp("uint", $"{m0} + (sharpemu_lane << 2u)");
+                    StoreVector(
+                        instruction.Destinations[0].Value,
+                        $"sharpemu_lds[{LdsIndex(address, 0)}]");
                     return true;
                 }
                 case "DsReadB96":

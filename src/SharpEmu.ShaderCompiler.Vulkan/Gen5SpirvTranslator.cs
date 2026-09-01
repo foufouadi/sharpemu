@@ -2034,6 +2034,26 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 0));
                     return true;
                 }
+                case "DsReadAddTidB32":
+                {
+                    if (instruction.Destinations.Count < 1 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read addtid operand";
+                        return false;
+                    }
+
+                    // DS_READ_ADDTID_B32 uses the low 16 bits of M0 as the
+                    // base address and adds lane_id * 4, matching Kyty's
+                    // DS_ADDTID lowering. The encoded address field is not
+                    // an operand for this form.
+                    var m0 = BitwiseAnd(GetRawSource(instruction, 0), UInt(0xFFFF));
+                    var laneOffset = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    var address = IAdd(m0, laneOffset);
+                    var value = Load(_uintType, LdsPointer(address, 0));
+                    StoreV(instruction.Destinations[0].Value, value);
+                    return true;
+                }
                 case "DsWriteB64":
                 {
                     if (instruction.Sources.Count < 3)
@@ -6186,7 +6206,7 @@ public static partial class Gen5SpirvTranslator
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode == "DsWriteAddTidB32") ||
+                 instruction.Opcode is "DsWriteAddTidB32" or "DsReadAddTidB32") ||
              _state.Program.Instructions.Any(static instruction =>
                  instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
 

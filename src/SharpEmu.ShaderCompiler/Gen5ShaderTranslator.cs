@@ -1620,6 +1620,7 @@ public static class Gen5ShaderTranslator
             0x3E => "DsAppend",
             0x4D => "DsWriteB64",
             0xB0 => "DsWriteAddTidB32",
+            0xB1 => "DsReadAddTidB32",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -2502,6 +2503,9 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Scalar(124),
                     ],
+                    // DS_READ_ADDTID reads from the low 16 bits of M0 plus
+                    // lane_id * 4; it has no encoded address operand.
+                    "DsReadAddTidB32" => [Gen5Operand.Scalar(124)],
                     "DsWriteB64" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
@@ -2544,7 +2548,7 @@ public static class Gen5ShaderTranslator
                     "DsAppend" or "DsConsume" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsReadB32" or "DsSwizzleB32" => [
+                    "DsReadB32" or "DsReadAddTidB32" or "DsSwizzleB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsRead2B32" or "DsRead2St64B32" or "DsReadB64" => [
