@@ -1172,6 +1172,10 @@ public static class Gen5ShaderTranslator
             0x00 => "VNop",
             0x01 => "VMovB32",
             0x02 => "VReadfirstlaneB32",
+            // Same reason as the float image atomics: no f64 support here
+            // yet, but decoding the conversion exposes the rest of the
+            // program to the binding analysis.
+            0x04 => "VCvtF64I32",
             0x05 => "VCvtF32I32",
             0x06 => "VCvtF32U32",
             0x07 => "VCvtU32F32",
@@ -1195,7 +1199,14 @@ public static class Gen5ShaderTranslator
             0x2A => "VRcpF32",
             0x2B => "VRcpIflagF32",
             0x2E => "VRsqF32",
+            // The f64 transcendentals sit in the gaps between their f32
+            // neighbours. There is no f64 path here, so they still fail at
+            // emission; naming them turns "unknown opcode" into a precise
+            // report of which shader needs double precision.
+            0x2F => "VRcpF64",
+            0x30 => "VRsqF64",
             0x33 => "VSqrtF32",
+            0x34 => "VSqrtF64",
             0x35 => "VSinF32",
             0x36 => "VCosF32",
             0x37 => "VNotB32",
@@ -1870,6 +1881,13 @@ public static class Gen5ShaderTranslator
             0x1A => "ImageAtomicXor",
             0x1B => "ImageAtomicInc",
             0x1C => "ImageAtomicDec",
+            // The float image atomics close the gfx10 atomic block. No
+            // backend emits them yet, so they still fail - but naming them
+            // lets the decoder finish the program, which is what makes the
+            // shader's bindings and global-memory usage visible in the trace.
+            0x1D => "ImageAtomicFcmpswap",
+            0x1E => "ImageAtomicFmin",
+            0x1F => "ImageAtomicFmax",
             0x20 => "ImageSample",
             0x22 => "ImageSampleD",
             0x24 => "ImageSampleL",
