@@ -1883,6 +1883,7 @@ public static class Gen5ShaderTranslator
             0x47 => "ImageGather4Lz",
             0x48 => "ImageGather4C",
             0x4E => "ImageGather4CBCl",
+            0x4F => "ImageGather4CLz",
             0x57 => "ImageGather4LzO",
             0x5F => "ImageGather4CLzO",
             _ => string.Empty,

@@ -1172,10 +1172,16 @@ public static partial class Gen5SpirvTranslator
             for (var index = 0; index < sourceCount; index++)
             {
                 var source = instruction.Sources[index];
-                if (source.Kind is not (Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister))
+                // Inline constants read like any other 32-bit source here: the
+                // op_sel half of their bit pattern is the f16 lane, which is how
+                // Kyty's ReadF16LaneAsF32 treats everything but a float inline
+                // constant (handled in EmitPackedF16Operand). A literal is the
+                // one encoding whose packed halves are not defined for VOP3P,
+                // so it keeps failing loudly.
+                if (source.Kind is Gen5OperandKind.LiteralConstant)
                 {
                     error =
-                        $"unsupported vop3p operand {source} for {instruction.Opcode} (first slice: registers only)";
+                        $"unsupported vop3p operand {source} for {instruction.Opcode} (literal constant)";
                     return false;
                 }
             }
@@ -1418,9 +1424,22 @@ public static partial class Gen5SpirvTranslator
         {
             var raw = GetRawSource(instruction, index);
             var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
-            var half = ((selectMask >> index) & 1) != 0
-                ? ShiftRightLogical(raw, UInt(16))
-                : raw;
+            var selectsHighHalf = ((selectMask >> index) & 1) != 0;
+            var source = instruction.Sources[index];
+            uint half;
+            if (source.Kind == Gen5OperandKind.EncodedConstant &&
+                source.Value >= FirstFloatInlineConstant)
+            {
+                // A float inline constant is one f32 value, not a packed pair of
+                // f16s: it narrows to f16 for the lane that reads it, and a lane
+                // whose op_sel picks the half it does not have reads zero.
+                half = EmitFloatToHalf(selectsHighHalf ? UInt(0) : raw);
+            }
+            else
+            {
+                half = selectsHighHalf ? ShiftRightLogical(raw, UInt(16)) : raw;
+            }
+
             var value = Bitcast(_floatType, EmitHalfToFloat(half));
             var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
             if (((negateMask >> index) & 1) != 0)
@@ -4262,6 +4281,11 @@ public static partial class Gen5SpirvTranslator
                 differentSourceSign,
                 resultSignChanged);
         }
+
+        // Source encodings from here up are float inline constants
+        // (0.5 .. 4.0 and 1/2pi); everything below is an integer inline
+        // constant or a status bit, whose raw bits are used as-is.
+        private const uint FirstFloatInlineConstant = 240;
 
         private static bool TryDecodeInlineConstant(uint encoded, out uint value) =>
             Gen5InlineConstants.TryDecode(encoded, out value);
