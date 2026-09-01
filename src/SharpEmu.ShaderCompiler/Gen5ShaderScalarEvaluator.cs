@@ -1682,6 +1682,36 @@ public static partial class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode is "SBitset0B64" or "SBitset1B64")
+        {
+            if (destination.Value >= ScalarRegisterCount - 1 ||
+                instruction.Sources.Count < 1 ||
+                !TryEvaluateScalarOperand(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    scalarConditionCode,
+                    out var bitIndex))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            // SSRC0 is a plain 32-bit bit index, and the destination pair is
+            // read-modify-written. Neither form writes SCC.
+            var current = registers[destination.Value] |
+                ((ulong)registers[destination.Value + 1] << 32);
+            var selected = 1UL << (int)(bitIndex & 63);
+            WriteScalarPair(
+                registers,
+                destination.Value,
+                instruction.Opcode == "SBitset1B64"
+                    ? current | selected
+                    : current & ~selected,
+                ref execMask);
+            return true;
+        }
+
         if (instruction.Opcode is "SBcnt1I32B64" or "SFF1I32B64")
         {
             if (!TryEvaluateScalarOperand64(
@@ -1870,6 +1900,7 @@ public static partial class Gen5ShaderScalarEvaluator
             "SFF1I32B32" or
             "SFlbitI32B32" or
             "SAbsI32" or
+            "SBitset0B32" or
             "SBitset1B32")
         {
             registers[destination.Value] = instruction.Opcode switch
@@ -1882,6 +1913,7 @@ public static partial class Gen5ShaderScalarEvaluator
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
                 "SFlbitI32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.LeadingZeroCount(left),
                 "SAbsI32" => left == 0x8000_0000u ? left : (uint)Math.Abs(unchecked((int)left)),
+                "SBitset0B32" => registers[destination.Value] & ~(1u << ((int)left & 31)),
                 _ => registers[destination.Value] | (1u << ((int)left & 31)),
             };
             if (instruction.Opcode is "SNotB32" or "SWqmB32" or "SBcnt1I32B32" or "SAbsI32")

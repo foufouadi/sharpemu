@@ -2070,6 +2070,94 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 2));
                     return true;
                 }
+                case "DsAddU64":
+                case "DsOrB64":
+                {
+                    if (instruction.Sources.Count < 3)
+                    {
+                        error = "missing LDS 64-bit atomic source";
+                        return false;
+                    }
+
+                    // LDS is modelled as an array of dwords, so a 64-bit atomic
+                    // is lowered to the two dword atomics that make it up.
+                    // Neither of these opcodes returns the old value, which is
+                    // what makes the split exact: only the final memory state is
+                    // observable, and both operations reconstruct it regardless
+                    // of the order concurrent lanes land in.
+                    var atomicAddress = GetRawSource(instruction, 0);
+                    var lowPointer = LdsPointer(
+                        atomicAddress,
+                        control.SingleOffsetBytes);
+                    var highPointer = LdsPointer(
+                        atomicAddress,
+                        control.SingleOffsetBytes + sizeof(uint));
+                    var isOr = instruction.Opcode == "DsOrB64";
+                    EmitExecConditional(() =>
+                    {
+                        var lowValue = GetRawSource(instruction, 1);
+                        var highValue = GetRawSource(instruction, 2);
+                        if (isOr)
+                        {
+                            // OR is bitwise-independent: no dword influences the
+                            // other, so two 32-bit ORs are the 64-bit OR.
+                            EmitAtomic(
+                                SpirvOp.AtomicOr,
+                                _uintType,
+                                lowPointer,
+                                scope: 2,
+                                semantics: 0x108,
+                                value: () => lowValue,
+                                comparator: () => lowValue);
+                            EmitAtomic(
+                                SpirvOp.AtomicOr,
+                                _uintType,
+                                highPointer,
+                                scope: 2,
+                                semantics: 0x108,
+                                value: () => highValue,
+                                comparator: () => highValue);
+                            return;
+                        }
+
+                        // ADD needs the carry out of the low dword folded into
+                        // the high one. Each lane detects its own wrap from the
+                        // pre-add value its atomic returned and adds exactly one
+                        // carry, so the high dword ends up with the true count of
+                        // wraps however the lanes interleave.
+                        var originalLow = EmitAtomic(
+                            SpirvOp.AtomicIAdd,
+                            _uintType,
+                            lowPointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => lowValue,
+                            comparator: () => lowValue);
+                        var sumLow = IAdd(originalLow, lowValue);
+                        var wrapped = _module.AddInstruction(
+                            SpirvOp.ULessThan,
+                            _boolType,
+                            sumLow,
+                            originalLow);
+                        var carry = _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            wrapped,
+                            UInt(1),
+                            UInt(0));
+                        var highWithCarry = IAdd(highValue, carry);
+                        EmitAtomic(
+                            SpirvOp.AtomicIAdd,
+                            _uintType,
+                            highPointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => highWithCarry,
+                            comparator: () => highWithCarry);
+                    });
+
+                    return true;
+                }
                 case "DsWriteB96":
                 case "DsWriteB128":
                 {

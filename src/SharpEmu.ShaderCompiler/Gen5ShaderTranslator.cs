@@ -963,7 +963,10 @@ public static class Gen5ShaderTranslator
             0x13 => "SFF1I32B32",
             0x14 => "SFF1I32B64",
             0x15 => "SFlbitI32B32",
+            0x1B => "SBitset0B32",
+            0x1C => "SBitset0B64",
             0x1D => "SBitset1B32",
+            0x1E => "SBitset1B64",
             0x34 => "SAbsI32",
             0x3B => "SBitreplicateB64B32",
             0x1F => "SGetpcB64",
@@ -1618,6 +1621,13 @@ public static class Gen5ShaderTranslator
             0x77 => "DsRead2B64",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
+            // gfx10 groups the 64-bit LDS atomics at 0x40..0x4C, directly
+            // ahead of DS_WRITE_B64 (0x4D). Only the no-return forms the
+            // captured titles use are named here: the RTN variants cannot be
+            // split into two 32-bit atomics without losing the atomicity of
+            // the returned pair, so they stay unknown and fail loudly.
+            0x40 => "DsAddU64",
+            0x4A => "DsOrB64",
             0x4D => "DsWriteB64",
             0xB0 => "DsWriteAddTidB32",
             0xB1 => "DsReadAddTidB32",
@@ -2507,6 +2517,12 @@ public static class Gen5ShaderTranslator
                     // lane_id * 4; it has no encoded address operand.
                     "DsReadAddTidB32" => [Gen5Operand.Scalar(124)],
                     "DsWriteB64" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData0 + 1),
+                    ],
+                    // 64-bit LDS atomics take ADDR plus a DATA0 register pair.
+                    "DsAddU64" or "DsOrB64" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData0 + 1),

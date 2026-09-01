@@ -2120,12 +2120,16 @@ public static partial class Gen5SpirvTranslator
                     StoreS(destination, result);
                     Store(_scc, IsNotZero(result));
                     return true;
+                case "SBitset0B32":
                 case "SBitset1B32":
+                    // S_BITSET*_B32 is a read-modify-write of the destination:
+                    // it sets the single bit selected by SSRC0[4:0]. Neither
+                    // form writes SCC.
                     result = _module.AddInstruction(
                         SpirvOp.BitFieldInsert,
                         _uintType,
                         LoadS(destination),
-                        UInt(1),
+                        UInt(instruction.Opcode == "SBitset1B32" ? 1u : 0u),
                         BitwiseAnd(left, UInt(31)),
                         UInt(1));
                     StoreS(destination, result);
@@ -2602,6 +2606,38 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode is "SBitset0B64" or "SBitset1B64")
+            {
+                // SSRC0 is a plain 32-bit bit index here, not a register pair,
+                // so this runs ahead of the 64-bit source read below. Built
+                // from shifts rather than OpBitFieldInsert, which the
+                // MoltenVK/SPIRV-Cross path rejects for 64-bit integers.
+                var bitIndex = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var selected = ShiftLeftLogical64(
+                    _module.Constant64(_ulongType, 1),
+                    bitIndex);
+                var current = LoadS64(destination);
+                var updated = instruction.Opcode == "SBitset1B64"
+                    ? _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        current,
+                        selected)
+                    : _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        current,
+                        _module.AddInstruction(
+                            SpirvOp.Not,
+                            _ulongType,
+                            selected));
+                StoreS64(destination, updated);
+                return true;
+            }
+
             var left = GetRawSource64(instruction, 0);
             if (instruction.Opcode.EndsWith("SaveexecB64", StringComparison.Ordinal))
             {
