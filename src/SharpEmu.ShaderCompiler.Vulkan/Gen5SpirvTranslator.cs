@@ -240,6 +240,13 @@ public static partial class Gen5SpirvTranslator
         // with "Fragment input(s) `user(locnN)` ... not written by vertex shader".
         private readonly int _requiredVertexOutputCount;
         private readonly uint _localSizeX;
+        // Host workgroup shape and, per guest axis, the host LocalInvocationId
+        // component that carries it. Identity unless the guest declared its
+        // only non-unit extent on an axis the host is too small for.
+        private readonly uint _hostLocalSizeX;
+        private readonly uint _hostLocalSizeY;
+        private readonly uint _hostLocalSizeZ;
+        private readonly uint[] _hostLocalIdAxis = [0, 1, 2];
         private readonly uint _localSizeY;
         private readonly uint _localSizeZ;
         private readonly int _globalBufferBase;
@@ -390,6 +397,26 @@ public static partial class Gen5SpirvTranslator
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
+            (_hostLocalSizeX, _hostLocalSizeY, _hostLocalSizeZ) =
+                Gen5ComputeWorkgroupLayout.GetHostWorkgroupSize(
+                    localSizeX,
+                    localSizeY,
+                    localSizeZ);
+            if (Gen5ComputeWorkgroupLayout.TryMoveLongAxisToX(
+                    localSizeX,
+                    localSizeY,
+                    localSizeZ,
+                    out _,
+                    out var movedGuestAxis))
+            {
+                // The moved guest axis now reads host X. Every other axis has
+                // extent 1 on both sides, so pointing it at host Y - also extent
+                // 1 - gives the 0 it is always meant to see.
+                _hostLocalIdAxis[0] = 1;
+                _hostLocalIdAxis[1] = 1;
+                _hostLocalIdAxis[2] = 1;
+                _hostLocalIdAxis[movedGuestAxis] = 0;
+            }
             _globalBufferBase = globalBufferBase;
             _totalGlobalBufferCount = totalGlobalBufferCount < 0
                 ? evaluation.GlobalMemoryBindings.Count
@@ -695,9 +722,9 @@ public static partial class Gen5SpirvTranslator
                     _module.AddExecutionMode(
                         main,
                         SpirvExecutionMode.LocalSize,
-                        _localSizeX,
-                        _localSizeY,
-                        _localSizeZ);
+                        _hostLocalSizeX,
+                        _hostLocalSizeY,
+                        _hostLocalSizeZ);
                 }
 
                 var attributeCount = _stage == Gen5SpirvStage.Vertex
@@ -1589,7 +1616,7 @@ public static partial class Gen5SpirvTranslator
                         SpirvOp.CompositeExtract,
                         _uintType,
                         localId,
-                        component);
+                        _hostLocalIdAxis[component]);
                     StoreV(component, localComponent, guardWithExec: false);
                     var groupComponent = _module.AddInstruction(
                         SpirvOp.CompositeExtract,

@@ -4,6 +4,7 @@
 namespace SharpEmu.Libs.VideoOut;
 
 using System.Diagnostics;
+using SharpEmu.ShaderCompiler;
 using Silk.NET.Vulkan;
 
 // This partial executes translated Vulkan compute dispatches.
@@ -303,12 +304,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (work.LocalSizeX > _maxComputeWorkGroupSizeX ||
-                work.LocalSizeY > _maxComputeWorkGroupSizeY ||
-                work.LocalSizeZ > _maxComputeWorkGroupSizeZ)
+            // The translator declares the group on the host axes, which is not the
+            // guest shape when a long extent had to move to X; check what the
+            // pipeline actually asks the device for.
+            var (hostLocalSizeX, hostLocalSizeY, hostLocalSizeZ) =
+                Gen5ComputeWorkgroupLayout.GetHostWorkgroupSize(
+                    work.LocalSizeX,
+                    work.LocalSizeY,
+                    work.LocalSizeZ);
+            if (hostLocalSizeX > _maxComputeWorkGroupSizeX ||
+                hostLocalSizeY > _maxComputeWorkGroupSizeY ||
+                hostLocalSizeZ > _maxComputeWorkGroupSizeZ)
             {
                 error =
-                    $"local-size-exceeds-device({work.LocalSizeX}x{work.LocalSizeY}x{work.LocalSizeZ}>" +
+                    $"local-size-exceeds-device({work.LocalSizeX}x{work.LocalSizeY}x{work.LocalSizeZ}" +
+                    $"/host={hostLocalSizeX}x{hostLocalSizeY}x{hostLocalSizeZ}>" +
                     $"{_maxComputeWorkGroupSizeX}x{_maxComputeWorkGroupSizeY}x{_maxComputeWorkGroupSizeZ})";
                 return false;
             }
