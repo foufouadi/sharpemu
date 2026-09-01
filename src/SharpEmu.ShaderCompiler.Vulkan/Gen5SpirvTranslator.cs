@@ -682,6 +682,10 @@ public static partial class Gen5SpirvTranslator
                     _ => SpirvExecutionModel.GLCompute,
                 };
                 _module.AddEntryPoint(model, main, "main", _interfaces);
+                _module.AddExecutionMode(
+                    main,
+                    SpirvExecutionMode.SignedZeroInfNanPreserve,
+                    32);
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
@@ -721,6 +725,13 @@ public static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
+            // RDNA2 preserves signed zero / Inf / NaN through float arithmetic per
+            // IEEE-754; without SignedZeroInfNanPreserve the host driver may assume
+            // no NaN/Inf and fast-math-optimise (x*0 -> 0, x-x -> 0, reassociation)
+            // which produces NaN where the guest does not. Ghost of Yotei's bloom /
+            // HDR passes surface this (bloom target all fp16 NaN -> frame black).
+            // Ported from KytyPS5.
+            _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
             if (_evaluation.ImageBindings.Any(
                     static binding =>
                         (binding.Opcode.StartsWith(

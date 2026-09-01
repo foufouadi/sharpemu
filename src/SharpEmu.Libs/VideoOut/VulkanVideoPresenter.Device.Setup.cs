@@ -712,6 +712,34 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
+
+            // RDNA2 preserves signed zero / Inf / NaN through float arithmetic per
+            // IEEE-754. Without this the host driver may assume no NaN/Inf and
+            // fast-math-optimise (x*0 -> 0, x-x -> 0, reassociation), producing NaN
+            // where the guest does not. Ghost of Yotei's bloom / HDR passes surface
+            // this (bloom target all fp16 NaN -> frame black). The translator now
+            // emits the SPIR-V SignedZeroInfNanPreserve execution mode (ported from
+            // KytyPS5, which sets it on every shader); that mode is only legal when
+            // this driver property reports support. It is a property, not an
+            // enableable feature, so there is nothing to add to the device pNext.
+            var floatControls = new PhysicalDeviceFloatControlsProperties
+            {
+                SType = StructureType.PhysicalDeviceFloatControlsProperties,
+            };
+            var propertiesQuery = new PhysicalDeviceProperties2
+            {
+                SType = StructureType.PhysicalDeviceProperties2,
+                PNext = &floatControls,
+            };
+            _vk.GetPhysicalDeviceProperties2(_physicalDevice, &propertiesQuery);
+            if (!floatControls.ShaderSignedZeroInfNanPreserveFloat32)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not preserve signed-zero/Inf/NaN for " +
+                    "float32 (shaderSignedZeroInfNanPreserveFloat32=false) " +
+                    "translated shaders may fast-math-optimise and produce NaN/Inf " +
+                    "where the guest does not (bloom/HDR passes may render black).");
+            }
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;

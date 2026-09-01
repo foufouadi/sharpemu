@@ -196,6 +196,7 @@ public enum SpirvCapability : uint
     GroupNonUniformVote = 62,
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
+    SignedZeroInfNanPreserve = 4466,
     RuntimeDescriptorArray = 5302,
 }
 
@@ -225,6 +226,7 @@ public enum SpirvExecutionMode : uint
     OriginUpperLeft = 7,
     DepthReplacing = 12,
     LocalSize = 17,
+    SignedZeroInfNanPreserve = 4461,
 }
 
 public enum SpirvDecoration : uint
