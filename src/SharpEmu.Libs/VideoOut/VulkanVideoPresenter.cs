@@ -253,6 +253,15 @@ internal readonly record struct VulkanGuestQueueIdentity(
 internal static unsafe partial class VulkanVideoPresenter
 {
     private static int _nativeSubgroupSize;
+    private static int _signedZeroInfNanPreserveFloat32;
+
+    // Set from the device properties query at setup. Translated shaders declare
+    // the matching SPIR-V capability only when this is true.
+    internal static bool SignedZeroInfNanPreserveSupported =>
+        Volatile.Read(ref _signedZeroInfNanPreserveFloat32) != 0;
+
+    private static void SetSignedZeroInfNanPreserveSupported(bool supported) =>
+        Volatile.Write(ref _signedZeroInfNanPreserveFloat32, supported ? 1 : 0);
 
     internal static bool GraphicsSubgroupOperationsEnabled =>
         VulkanGraphicsSubgroupPolicy.Resolve(

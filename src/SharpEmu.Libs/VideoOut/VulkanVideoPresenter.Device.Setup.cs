@@ -713,7 +713,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
 
-            // Query support before accepting shaders that request the float-controls execution mode.
+            // Shaders declare the float-controls execution mode only when the
+            // device reports it, so the answer has to be recorded, not just logged.
             var floatControls = new PhysicalDeviceFloatControlsProperties
             {
                 SType = StructureType.PhysicalDeviceFloatControlsProperties,
@@ -724,13 +725,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 PNext = &floatControls,
             };
             _vk.GetPhysicalDeviceProperties2(_physicalDevice, &propertiesQuery);
+            SetSignedZeroInfNanPreserveSupported(
+                floatControls.ShaderSignedZeroInfNanPreserveFloat32);
             if (!floatControls.ShaderSignedZeroInfNanPreserveFloat32)
             {
                 Console.Error.WriteLine(
                     "[LOADER][WARN] GPU does not preserve signed-zero/Inf/NaN for " +
-                    "float32 (shaderSignedZeroInfNanPreserveFloat32=false) " +
-                    "translated shaders may fast-math-optimise and produce NaN/Inf " +
-                    "where the guest does not (bloom/HDR passes may render black).");
+                    "float32 (shaderSignedZeroInfNanPreserveFloat32=false); " +
+                    "translated shaders drop the execution mode and may " +
+                    "fast-math-optimise, producing NaN/Inf where the guest does " +
+                    "not (bloom/HDR passes may render black).");
             }
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;

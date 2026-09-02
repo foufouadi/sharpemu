@@ -33,7 +33,8 @@ public static partial class Gen5SpirvTranslator
         uint pixelInputAddress = 0,
         IReadOnlyList<uint>? pixelInputCntl = null,
         ulong storageBufferOffsetAlignment = 1,
-        bool enableGraphicsSubgroupOperations = true) =>
+        bool enableGraphicsSubgroupOperations = true,
+        bool preserveFloatSpecials = true) =>
         TryCompilePixelShader(
             state,
             evaluation,
@@ -48,7 +49,8 @@ public static partial class Gen5SpirvTranslator
             pixelInputAddress,
             pixelInputCntl,
             storageBufferOffsetAlignment,
-            enableGraphicsSubgroupOperations);
+            enableGraphicsSubgroupOperations,
+            preserveFloatSpecials);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -64,7 +66,8 @@ public static partial class Gen5SpirvTranslator
         uint pixelInputAddress = 0,
         IReadOnlyList<uint>? pixelInputCntl = null,
         ulong storageBufferOffsetAlignment = 1,
-        bool enableGraphicsSubgroupOperations = true)
+        bool enableGraphicsSubgroupOperations = true,
+        bool preserveFloatSpecials = true)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
         {
@@ -107,7 +110,8 @@ public static partial class Gen5SpirvTranslator
             pixelInputAddress: pixelInputAddress,
             pixelInputCntl: pixelInputCntl,
             storageBufferOffsetAlignment: storageBufferOffsetAlignment,
-            enableGraphicsSubgroupOperations: enableGraphicsSubgroupOperations);
+            enableGraphicsSubgroupOperations: enableGraphicsSubgroupOperations,
+            preserveFloatSpecials: preserveFloatSpecials);
         return context.TryCompile(out shader, out error);
     }
 
@@ -122,7 +126,8 @@ public static partial class Gen5SpirvTranslator
         int initialScalarBufferIndex = -1,
         int requiredVertexOutputCount = 0,
         ulong storageBufferOffsetAlignment = 1,
-        bool enableGraphicsSubgroupOperations = true)
+        bool enableGraphicsSubgroupOperations = true,
+        bool preserveFloatSpecials = true)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -138,7 +143,8 @@ public static partial class Gen5SpirvTranslator
             initialScalarBufferIndex,
             requiredVertexOutputCount: requiredVertexOutputCount,
             storageBufferOffsetAlignment: storageBufferOffsetAlignment,
-            enableGraphicsSubgroupOperations: enableGraphicsSubgroupOperations);
+            enableGraphicsSubgroupOperations: enableGraphicsSubgroupOperations,
+            preserveFloatSpecials: preserveFloatSpecials);
         return context.TryCompile(out shader, out error);
     }
 
@@ -153,7 +159,8 @@ public static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int initialScalarBufferIndex = -1,
         uint waveLaneCount = 32,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        bool preserveFloatSpecials = true)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Compute,
@@ -168,7 +175,8 @@ public static partial class Gen5SpirvTranslator
             0,
             initialScalarBufferIndex,
             waveLaneCount: waveLaneCount,
-            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment,
+            preserveFloatSpecials: preserveFloatSpecials);
         return context.TryCompile(out shader, out error);
     }
 
@@ -198,6 +206,10 @@ public static partial class Gen5SpirvTranslator
         private readonly IReadOnlyList<Gen5PixelOutputBinding> _pixelOutputBindings;
         private readonly bool _usesPixelValidMask;
         private readonly bool _enableGraphicsSubgroupOperations;
+        // Whether the device preserves signed zero, Inf and NaN for float32.
+        // Declaring the execution mode on a device that does not support the
+        // capability makes every pipeline using this module fail to create.
+        private readonly bool _preserveFloatSpecials;
         private readonly uint _waveLaneCount;
         private readonly bool _emulateWave64;
 
@@ -376,9 +388,11 @@ public static partial class Gen5SpirvTranslator
             int requiredVertexOutputCount = 0,
             uint waveLaneCount = 32,
             ulong storageBufferOffsetAlignment = 1,
-            bool enableGraphicsSubgroupOperations = true)
+            bool enableGraphicsSubgroupOperations = true,
+            bool preserveFloatSpecials = true)
         {
             _stage = stage;
+            _preserveFloatSpecials = preserveFloatSpecials;
             _requiredVertexOutputCount = requiredVertexOutputCount;
             _state = state;
             _evaluation = evaluation;
@@ -709,10 +723,13 @@ public static partial class Gen5SpirvTranslator
                     _ => SpirvExecutionModel.GLCompute,
                 };
                 _module.AddEntryPoint(model, main, "main", _interfaces);
-                _module.AddExecutionMode(
-                    main,
-                    SpirvExecutionMode.SignedZeroInfNanPreserve,
-                    32);
+                if (_preserveFloatSpecials)
+                {
+                    _module.AddExecutionMode(
+                        main,
+                        SpirvExecutionMode.SignedZeroInfNanPreserve,
+                        32);
+                }
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
@@ -752,8 +769,16 @@ public static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
-            // Preserve IEEE-754 special values required by HDR/bloom workloads; ported from KytyPS5.
-            _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
+            if (_preserveFloatSpecials)
+            {
+                // Preserve IEEE-754 special values required by HDR/bloom
+                // workloads; ported from KytyPS5. Gated on the device actually
+                // reporting shaderSignedZeroInfNanPreserveFloat32: the
+                // capability is a hard requirement once declared, so on a device
+                // without it every pipeline built from this module would fail to
+                // create rather than merely lose precision guarantees.
+                _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
+            }
             if (_evaluation.ImageBindings.Any(
                     static binding =>
                         (binding.Opcode.StartsWith(
