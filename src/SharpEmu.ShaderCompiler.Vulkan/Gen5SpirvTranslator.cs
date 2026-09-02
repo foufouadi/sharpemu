@@ -2740,6 +2740,19 @@ public static partial class Gen5SpirvTranslator
                         StringComparison.Ordinal) ? 4u : 2u,
                     out var bindingIndex))
             {
+                // Two very different situations reach this point, and zeroing
+                // both is what made a missing constant buffer indistinguishable
+                // from a guest that deliberately bound nothing.
+                if (_evaluation.UnboundScalarLoadPcs?.Contains(instruction.Pc) != true)
+                {
+                    error =
+                        $"missing scalar-memory binding pc=0x{instruction.Pc:X} " +
+                        $"op={instruction.Opcode} s{scalarAddress}";
+                    return false;
+                }
+
+                // The guest itself left the resource unbound: a null or
+                // zero-sized descriptor reads zero on the hardware too.
                 foreach (var destination in instruction.Destinations)
                 {
                     if (destination.Kind == Gen5OperandKind.ScalarRegister)

@@ -375,6 +375,7 @@ public static partial class Gen5ShaderScalarEvaluator
         var resolved = new List<Gen5ImageBinding>();
         var globalMemoryBindings = new List<Gen5GlobalMemoryBinding>();
         var globalMemoryByAddress = new Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>();
+        var unboundScalarLoadPcs = new HashSet<uint>();
         var vertexInputBindings = new List<Gen5VertexInputBinding>();
         // Absolute element address plus record layout identifies the guest
         // stream view an attribute reads, so every fetch that resolves to it
@@ -602,6 +603,7 @@ public static partial class Gen5ShaderScalarEvaluator
                         runtimeScalarRegisters,
                         laneRestoredScalarRegisters,
                         recordBinding,
+                        unboundScalarLoadPcs,
                         out error))
                 {
                     return false;
@@ -1038,7 +1040,8 @@ public static partial class Gen5ShaderScalarEvaluator
             globalMemoryBindings,
             state.ComputeSystemRegisters,
             runtimeScalarRegisters,
-            vertexInputBindings);
+            vertexInputBindings,
+            unboundScalarLoadPcs);
         pooledData.TransferOwnership();
         return true;
     }
@@ -2626,6 +2629,7 @@ public static partial class Gen5ShaderScalarEvaluator
         IReadOnlySet<uint> runtimeScalarRegisters,
         IReadOnlySet<uint> laneRestoredScalarRegisters,
         bool recordBinding,
+        HashSet<uint> unboundScalarLoadPcs,
         out string error)
     {
         error = string.Empty;
@@ -2681,6 +2685,10 @@ public static partial class Gen5ShaderScalarEvaluator
             TraceDivergentDescriptor(state, instruction, scalarBase.Value, baseAddress);
         }
 
+        // A descriptor that diverges across the shader's paths is still a
+        // descriptor: the binding below is built from one of the reaching
+        // definitions, which addresses the right buffer for the dominating
+        // path. Only a missing or empty descriptor means nothing is bound.
         var bufferUnbound =
             isBufferLoad &&
             (!hasBufferDescriptor ||
@@ -2695,6 +2703,14 @@ public static partial class Gen5ShaderScalarEvaluator
                 isBufferLoad,
                 address,
                 _strictScalarLoad);
+        if (bufferUnbound || scalarPointerUnbound)
+        {
+            // The guest left this resource unbound. Zero is the hardware's own
+            // answer, so the translator may emit it without a binding; record
+            // the PC so it can tell that case from a binding it failed to
+            // resolve, which is an emulator gap rather than guest intent.
+            unboundScalarLoadPcs.Add(instruction.Pc);
+        }
         if (scalarPointerUnbound)
         {
             TraceScalarPointerFallback(

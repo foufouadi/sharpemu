@@ -425,7 +425,13 @@ public sealed record Gen5ShaderEvaluation(
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
     IReadOnlySet<uint>? RuntimeScalarRegisters = null,
-    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null);
+    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null,
+    // PCs of scalar memory loads the guest itself left unbound: a null or
+    // zero-sized descriptor, or an out-of-range record. Reading zero is the
+    // hardware's own answer there. Kept separate from a load the evaluator
+    // simply failed to resolve, which is an emulator gap and must not be
+    // silently turned into zero.
+    IReadOnlySet<uint>? UnboundScalarLoadPcs = null);
 
 public sealed record Gen5ShaderInstruction(
     uint Pc,
