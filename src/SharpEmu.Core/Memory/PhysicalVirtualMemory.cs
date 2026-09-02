@@ -1236,7 +1236,21 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             for (var i = 0; i < _regions.Count; i++)
             {
                 var region = _regions[i];
-                var protection = GuestMemoryProtection.Read;
+                // Read and write come from the page protection, not from
+                // IsExecutable: reporting every mapping read-only here would
+                // make the same HLE query answer differently depending on
+                // which IVirtualMemory implementation is live.
+                var protection = GuestMemoryProtection.None;
+                if (IsReadableProtection(region.Protection))
+                {
+                    protection |= GuestMemoryProtection.Read;
+                }
+
+                if (IsWritableProtection(region.Protection))
+                {
+                    protection |= GuestMemoryProtection.Write;
+                }
+
                 if (region.IsExecutable)
                 {
                     protection |= GuestMemoryProtection.Execute;
