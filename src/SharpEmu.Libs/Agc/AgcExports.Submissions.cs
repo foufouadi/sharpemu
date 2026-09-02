@@ -388,6 +388,18 @@ public static partial class AgcExports
         }
     }
 
+    // Give every submitted queue a fair pass so an unrelated WAIT cannot starve its producer.
+    private static void PumpAllSubmittedQueues(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
+        foreach (var queue in gpuState.ComputeQueues.Values.ToArray())
+        {
+            PumpSubmittedQueue(ctx, gpuState, queue);
+        }
+    }
+
     private static void ApplySubmittedDmaData(
         CpuContext ctx,
         SubmittedGpuState gpuState,

@@ -49,6 +49,76 @@ public sealed class GpuWaitRegistryProducedRetentionTests
     }
 
     [Fact]
+    public void CircularBreakPrefersAgedComputeWaitersInHandshakeRange()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        var graphics = NewWaiter(memory, 0x4002_02DC0UL);
+        graphics.QueueName = "dcb.graphics";
+        var compute = NewWaiter(memory, 0x4002_03980UL);
+        compute.QueueName = "acb.compute[40]";
+        GpuWaitRegistry.Register(graphics.WaitAddress, graphics);
+        GpuWaitRegistry.Register(compute.WaitAddress, compute);
+        GpuWaitRegistry.RecordProduced(memory, graphics.WaitAddress, 1);
+        GpuWaitRegistry.RecordProduced(memory, compute.WaitAddress, 1);
+
+        var broken = GpuWaitRegistry.CollectCircularComputeBreaks(
+            memory,
+            nowTicks: 1_000_000,
+            minAgeTicks: 1);
+
+        var resumed = Assert.Single(
+            Assert.IsType<List<GpuWaitRegistry.WaitingDcb>>(broken));
+        Assert.Equal(compute.WaitAddress, resumed.WaitAddress);
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
+    public void CircularBreakIsNotBoundedByAnAddressWindow()
+    {
+        // The selection used to be restricted to 0x400200000..0x400210000, a
+        // window taken from one capture. A satisfied, aged compute waiter is
+        // released wherever its label lives; the queue kind, age, published
+        // value and frame generation are what decide.
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        var compute = NewWaiter(memory, 0x0000_0008_1234_5000UL);
+        compute.QueueName = "acb.compute[7]";
+        GpuWaitRegistry.Register(compute.WaitAddress, compute);
+        GpuWaitRegistry.RecordProduced(memory, compute.WaitAddress, 1);
+
+        var broken = GpuWaitRegistry.CollectCircularComputeBreaks(
+            memory,
+            nowTicks: 1_000_000,
+            minAgeTicks: 1);
+
+        var resumed = Assert.Single(
+            Assert.IsType<List<GpuWaitRegistry.WaitingDcb>>(broken));
+        Assert.Equal(compute.WaitAddress, resumed.WaitAddress);
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
+    public void CircularBreakIgnoresProducedValueFromAnOlderFrame()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        GpuWaitRegistry.RecordProduced(memory, 0x4002_02DC0UL, 1);
+        GpuWaitRegistry.AdvanceFrame();
+        var waiter = NewWaiter(memory, 0x4002_02DC0UL);
+        waiter.QueueName = "acb.compute[40]";
+        GpuWaitRegistry.Register(waiter.WaitAddress, waiter);
+
+        var broken = GpuWaitRegistry.CollectCircularComputeBreaks(
+            memory,
+            nowTicks: 1_000_000,
+            minAgeTicks: 1);
+
+        Assert.Null(broken);
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
     public void UnwatchedProducedValuesArePrunedAtTheBound()
     {
         GpuWaitRegistry.Clear();

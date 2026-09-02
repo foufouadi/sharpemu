@@ -722,6 +722,7 @@ public static partial class AgcExports
                 if (before != 0)
                 {
                     var resumed = DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
+                    PumpAllSubmittedQueues(ctx, gpuState);
                     remaining = GpuWaitRegistry.CountForMemory(ctx.Memory);
                     madeProgress = resumed != 0;
                     if (_traceAgc && resumed != 0)
@@ -877,8 +878,11 @@ public static partial class AgcExports
             // been reset for reuse) is released using that produced value. Only
             // fires for genuinely wedged waits, so fast-resolving ones on working
             // titles are untouched.
-            var deadlockBroken = GpuWaitRegistry.CollectDeadlockBroken(
-                ctx.Memory, System.Diagnostics.Stopwatch.GetTimestamp(), _gpuDeadlockBreakTicks);
+            var deadlockNowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            var deadlockBroken = GpuWaitRegistry.CollectCircularComputeBreaks(
+                ctx.Memory, deadlockNowTicks, _gpuDeadlockBreakTicks) ??
+                GpuWaitRegistry.CollectDeadlockBroken(
+                    ctx.Memory, deadlockNowTicks, _gpuDeadlockBreakTicks);
             if (deadlockBroken is not null)
             {
                 foreach (var waiter in deadlockBroken)

@@ -75,6 +75,8 @@ internal static class GpuWaitRegistry
         // A delayed parser can reach this wait after the producer publishes
         // and resets the label. Only newer publications can satisfy it.
         public ulong SubmissionPublicationGeneration;
+        // Frame ID prevents deadlock recovery from reusing stale label history.
+        public long WaitFrameId;
         // Stopwatch timestamp captured at registration. Stale waiters remain
         // registered; this only controls one-shot diagnostics.
         public long RegisteredTicks;
@@ -107,6 +109,13 @@ internal static class GpuWaitRegistry
     // WAIT_REG_MEM in frame N+1 is not satisfied by a stale write from frame N.
     private static readonly Dictionary<(object, ulong), long> _labelFrameIds = new();
     private static long _currentFrameId;
+    private static long _lastCircularBreakTicks;
+    private static int _circularBreaksThisWindow;
+    // Releasing a wait the producer has not really satisfied is a correctness
+    // risk, so the recovery is rate-limited rather than run to a fixed point:
+    // a genuinely wedged frame needs a couple of releases to make progress,
+    // while a mis-fire cannot cascade through the whole registry.
+    private const int MaxCircularBreaksPerSecond = 2;
     private readonly record struct VirtualLabelValue(
         uint Value,
         GuestGpuLabelDependency Dependency,
@@ -262,6 +271,7 @@ internal static class GpuWaitRegistry
     {
         waiter.WaitAddress = address;
         waiter.Memory = Canonicalize(waiter.Memory);
+        waiter.WaitFrameId = System.Threading.Volatile.Read(ref _currentFrameId);
         lock (_gate)
         {
             RegisterLocked(address, waiter);
@@ -307,6 +317,7 @@ internal static class GpuWaitRegistry
         currentValue = 0;
         dependency = default;
         waiter.Memory = Canonicalize(waiter.Memory);
+        waiter.WaitFrameId = System.Threading.Volatile.Read(ref _currentFrameId);
         if (waiter.Memory is null)
         {
             return WaitRegistrationResult.Unreadable;
@@ -1512,6 +1523,7 @@ internal static class GpuWaitRegistry
                         waiter.IsMemSemaphore ||
                         nowTicks - waiter.RegisteredTicks < minAgeTicks ||
                         !_lastProduced.TryGetValue((memory, address), out var produced) ||
+                        IsProducedValueStaleLocked(memory, address, waiter) ||
                         !Compare(waiter, produced))
                     {
                         continue;
@@ -1555,6 +1567,104 @@ internal static class GpuWaitRegistry
 
         return broken;
     }
+
+    /// <summary>
+    /// Releases aged compute waiters whose producer has already published a
+    /// satisfying value for the current frame. Selection is by queue kind, age,
+    /// published value and frame generation only: an address window was tried
+    /// here and removed, because bounding a correctness heuristic by the
+    /// addresses one capture happened to show hides which guard is really doing
+    /// the work.
+    /// </summary>
+    public static List<WaitingDcb>? CollectCircularComputeBreaks(
+        object memory,
+        long nowTicks,
+        long minAgeTicks)
+    {
+        memory = Canonicalize(memory)!;
+        lock (_gate)
+        {
+            if (nowTicks - _lastCircularBreakTicks >= Stopwatch.Frequency)
+            {
+                _lastCircularBreakTicks = nowTicks;
+                _circularBreaksThisWindow = 0;
+            }
+
+            if (_circularBreaksThisWindow >= MaxCircularBreaksPerSecond)
+            {
+                return null;
+            }
+
+            List<WaitingDcb>? broken = null;
+            List<ulong>? emptied = null;
+            foreach (var (address, list) in _waiters)
+            {
+                for (var i = list.Count - 1;
+                     i >= 0 && _circularBreaksThisWindow < MaxCircularBreaksPerSecond;
+                     i--)
+                {
+                    var waiter = list[i];
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        waiter.IsMemSemaphore ||
+                        !IsComputeQueue(waiter.QueueName) ||
+                        nowTicks - waiter.RegisteredTicks < minAgeTicks ||
+                        !_lastProduced.TryGetValue((memory, address), out var produced) ||
+                        IsProducedValueStaleLocked(memory, address, waiter) ||
+                        !Compare(waiter, produced))
+                    {
+                        continue;
+                    }
+
+                    var waitCachePolicy = (waiter.ControlValue >> 25) & 0x3u;
+                    if (waitCachePolicy <= 2 &&
+                        TryReadVirtualLocked(
+                            memory,
+                            address,
+                            waiter.Is64Bit,
+                            out var virtualValue,
+                            out var dependency,
+                            waitCachePolicy,
+                            waiter.Mask) &&
+                        Compare(waiter, virtualValue))
+                    {
+                        waiter.Dependency = waiter.Dependency.Merge(dependency);
+                    }
+
+                    broken ??= new List<WaitingDcb>();
+                    broken.Add(waiter);
+                    list.RemoveAt(i);
+                    _circularBreaksThisWindow++;
+                }
+
+                if (list.Count == 0)
+                {
+                    emptied ??= new List<ulong>();
+                    emptied.Add(address);
+                }
+            }
+
+            if (emptied is not null)
+            {
+                foreach (var address in emptied)
+                {
+                    _waiters.Remove(address);
+                }
+            }
+
+            return broken;
+        }
+    }
+
+    private static bool IsProducedValueStaleLocked(
+        object memory,
+        ulong address,
+        in WaitingDcb waiter) =>
+        _labelFrameIds.TryGetValue((memory, address), out var producedFrameId) &&
+        producedFrameId < waiter.WaitFrameId;
+
+    private static bool IsComputeQueue(string? queueName) =>
+        queueName is not null &&
+        queueName.StartsWith("acb.compute", StringComparison.OrdinalIgnoreCase);
 
     // Under orphan force-submit, producers can run ahead of waiter
     // registration and pass an equal-compare value before it's ever seen.
@@ -1606,6 +1716,8 @@ internal static class GpuWaitRegistry
             _virtualLabels.Clear();
             _virtualLabelHistory.Clear();
             _activeSubmissionGenerations.Clear();
+            _lastCircularBreakTicks = 0;
+            _circularBreaksThisWindow = 0;
         }
     }
 }
