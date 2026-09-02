@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Stubs;
@@ -24,6 +25,12 @@ public static class GameServiceStubs
     }
 
     private static readonly object VoiceSync = new();
+    // Shared, never written: the source of the silence a read yields.
+    private static readonly byte[] VoiceSilence = new byte[4096];
+    private const uint MaxVoiceReadBytes = 1u << 20;
+    // Size the port-info structure is read and written at. Not derived from a
+    // published ABI; it is the extent this stub touches.
+    private const int VoicePortInfoBytes = 32;
     private static readonly Dictionary<uint, VoicePortState> VoicePorts = new();
     private static uint NextVoicePort = 1;
     private static bool VoiceStarted;
@@ -42,7 +49,7 @@ public static class GameServiceStubs
         if (outAddress != 0)
         {
             Span<byte> handle = stackalloc byte[sizeof(int)];
-            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(handle, 1);
+            BinaryPrimitives.WriteInt32LittleEndian(handle, 1);
             _ = ctx.Memory.TryWrite(outAddress, handle);
         }
 
@@ -138,9 +145,9 @@ public static class GameServiceStubs
             Span<byte> param = stackalloc byte[16];
             if (ctx.Memory.TryRead(paramAddress, param))
             {
-                portType = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param);
+                portType = BinaryPrimitives.ReadInt32LittleEndian(param);
                 volume = BitConverter.Int32BitsToSingle(
-                    System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param[8..]));
+                    BinaryPrimitives.ReadInt32LittleEndian(param[8..]));
                 if (volume <= 0.0f || float.IsNaN(volume))
                 {
                     volume = 1.0f;
@@ -149,7 +156,7 @@ public static class GameServiceStubs
                 if (portType == 2)
                 {
                     var requestedBitrate =
-                        System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param[12..]);
+                        BinaryPrimitives.ReadInt32LittleEndian(param[12..]);
                     if (requestedBitrate > 0)
                     {
                         bitrate = unchecked((uint)requestedBitrate);
@@ -161,11 +168,23 @@ public static class GameServiceStubs
         uint portId;
         lock (VoiceSync)
         {
-            portId = NextVoicePort++;
-            if (NextVoicePort == 0xff)
+            // Port ids are a byte on the guest side, so the counter wraps.
+            // Skip ids still held by a live port: reusing one would silently
+            // alias two ports onto the same state.
+            if (VoicePorts.Count >= 0xfe)
             {
-                NextVoicePort = 1;
+                return Ok(ctx);
             }
+
+            do
+            {
+                portId = NextVoicePort++;
+                if (NextVoicePort >= 0xff)
+                {
+                    NextVoicePort = 1;
+                }
+            }
+            while (VoicePorts.ContainsKey(portId));
 
             VoicePorts[portId] = new VoicePortState
             {
@@ -176,7 +195,7 @@ public static class GameServiceStubs
         }
 
         Span<byte> result = stackalloc byte[sizeof(uint)];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(result, portId);
+        BinaryPrimitives.WriteUInt32LittleEndian(result, portId);
         _ = ctx.Memory.TryWrite(outAddress, result);
         return Ok(ctx);
     }
@@ -288,15 +307,31 @@ public static class GameServiceStubs
         Span<byte> sizeBytes = stackalloc byte[sizeof(uint)];
         if (ctx.Memory.TryRead(sizeAddress, sizeBytes))
         {
-            var size = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(sizeBytes);
+            var size = BinaryPrimitives.ReadUInt32LittleEndian(sizeBytes);
             var dataAddress = ctx[CpuRegister.Rsi];
             if (dataAddress != 0 && size != 0)
             {
-                var silence = new byte[Math.Min(size, 1u << 20)];
-                _ = ctx.Memory.TryWrite(dataAddress, silence);
+                // No host capture backend, so the port yields silence. Written
+                // from a shared zero buffer in chunks rather than one allocation
+                // per call: this runs at audio rate.
+                var remaining = Math.Min(size, MaxVoiceReadBytes);
+                var offset = 0u;
+                while (remaining != 0)
+                {
+                    var chunk = (int)Math.Min(remaining, (uint)VoiceSilence.Length);
+                    if (!ctx.Memory.TryWrite(
+                            dataAddress + offset,
+                            VoiceSilence.AsSpan(0, chunk)))
+                    {
+                        break;
+                    }
+
+                    offset += (uint)chunk;
+                    remaining -= (uint)chunk;
+                }
             }
 
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, 0);
             _ = ctx.Memory.TryWrite(sizeAddress, sizeBytes);
         }
 
@@ -320,6 +355,7 @@ public static class GameServiceStubs
         var portId = unchecked((uint)ctx[CpuRegister.Rdi]);
         var portType = -1;
         ushort edgeCount = 0;
+        bool started;
         lock (VoiceSync)
         {
             if (VoicePorts.TryGetValue(portId, out var port))
@@ -327,21 +363,27 @@ public static class GameServiceStubs
                 portType = port.PortType;
                 edgeCount = port.EdgeCount;
             }
+
+            started = VoiceStarted;
         }
 
-        Span<byte> info = stackalloc byte[32];
-        info.Clear();
-        if (infoAddress <= ulong.MaxValue - 16 && ctx.TryReadUInt64(infoAddress + 8, out var edge))
+        // Only the fields this stub actually models are written. The rest of
+        // the structure is read back and returned unchanged rather than zeroed:
+        // its layout is not established here, and overwriting fields whose
+        // meaning is unknown is more likely to mislead a caller than leaving
+        // what it already had. A read failure also validates the pointer, which
+        // a partial guard around a single field could not do.
+        Span<byte> info = stackalloc byte[VoicePortInfoBytes];
+        if (!ctx.Memory.TryRead(infoAddress, info))
         {
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(info[8..], edge);
+            return Ok(ctx);
         }
 
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(info, portType);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
-            info[4..], VoiceStarted ? 1 : 0);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(info[16..], 0);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(info[20..], 1);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(info[24..], edgeCount);
+        BinaryPrimitives.WriteInt32LittleEndian(info, portType);
+        BinaryPrimitives.WriteInt32LittleEndian(info[4..], started ? 1 : 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[16..], 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[20..], 1);
+        BinaryPrimitives.WriteUInt16LittleEndian(info[24..], edgeCount);
         _ = ctx.Memory.TryWrite(infoAddress, info);
         return Ok(ctx);
     }
@@ -387,7 +429,7 @@ public static class GameServiceStubs
         }
 
         Span<byte> value = stackalloc byte[sizeof(uint)];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(value, bitrate);
+        BinaryPrimitives.WriteUInt32LittleEndian(value, bitrate);
         _ = ctx.Memory.TryWrite(outputAddress, value);
         return Ok(ctx);
     }
@@ -427,7 +469,7 @@ public static class GameServiceStubs
         }
 
         Span<byte> value = stackalloc byte[sizeof(float)];
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+        BinaryPrimitives.WriteInt32LittleEndian(
             value, BitConverter.SingleToInt32Bits(volume));
         _ = ctx.Memory.TryWrite(outputAddress, value);
         return Ok(ctx);
