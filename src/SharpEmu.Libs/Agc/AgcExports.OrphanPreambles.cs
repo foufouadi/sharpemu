@@ -8,7 +8,10 @@ namespace SharpEmu.Libs.Agc;
 // This partial recovers unsubmitted command-builder preambles.
 public static partial class AgcExports
 {
-    // Async-compute ring tracking is opt-in and validated against live workloads.
+    // Async-compute ring tracking, env-gated. Off by default: it makes the
+    // emulator submit command buffers the guest never submitted, so it is a
+    // workaround for one captured title's ring behaviour and invalidates any
+    // measurement of what the guest actually issued.
     private static readonly bool _forceSubmitOrphanPreamblesEnabled = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES"),
         "1",

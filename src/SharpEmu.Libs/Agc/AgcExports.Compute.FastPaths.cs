@@ -266,7 +266,14 @@ public static partial class AgcExports
             IsBufferControl(store, vectorAddress: 0, vectorData: 1, scalarResource: 4);
     }
 
-    /// <summary>CPU fast path for a recognized constant-fill kernel.</summary>
+    /// <summary>
+    /// Semantic CPU replacement for a constant-fill kernel (v4 = wgid*64 + tid;
+    /// BufferStoreFormatXyzw writes s4..s7 at record v4). The translated Vulkan
+    /// form measured ~2.2s per dispatch against microseconds for the CPU fill.
+    /// Same discipline as the masked-dword-copy replacement above: the full
+    /// instruction shape and the descriptor must match before the dispatch is
+    /// replaced, because a near-miss would silently compute something else.
+    /// </summary>
     private static bool TrySubmitConstantFillKernel(
         CpuContext ctx,
         Gen5ShaderProgram program,

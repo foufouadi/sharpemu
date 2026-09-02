@@ -163,7 +163,9 @@ public static class AudioOut2Exports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    // The host mixer owns mastering, so accepting this initialization request is sufficient.
+    // Callers reach this with flags=0 during audio startup and do not check the
+    // result before continuing into their mastering path; the actual mastering
+    // chain lives in the host mixer, so accepting the request is sufficient.
     [SysAbiExport(
         Nid = "XHl38ZNknbs",
         ExportName = "sceAudioOut2MasteringInit",
@@ -174,7 +176,9 @@ public static class AudioOut2Exports
         return SetReturn(ctx, 0);
     }
 
-    // The host mixer has no object pipeline to tune, but callers require this hint to succeed.
+    // 3D-audio object latency hint; the host mixer has no object pipeline to
+    // tune, but failure here makes a caller tear down its whole ACM context and
+    // abort audio arena bring-up.
     [SysAbiExport(
         Nid = "TViD1EZXkNI",
         ExportName = "sceAudioOut2Set3DLatency",

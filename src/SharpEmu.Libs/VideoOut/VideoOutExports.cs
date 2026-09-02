@@ -1340,7 +1340,10 @@ public static class VideoOutExports
 
         if (category > 1 || option != 0)
         {
-            // Treat unknown category/option pairs as the standard uncompressed layout.
+            // Some titles register their display buffers with a nonzero
+            // category/option pair; rejecting the registration guarantees they
+            // can never flip. Treat unknown categories as the standard
+            // uncompressed layout instead of failing the whole registration.
             TraceVideoOut(
                 $"register_buffers2 nonstandard category=0x{categoryRaw:X} " +
                 $"option=0x{option:X} handle={handle} set={setIndex} " +
