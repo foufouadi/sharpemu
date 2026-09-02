@@ -713,15 +713,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
 
-            // RDNA2 preserves signed zero / Inf / NaN through float arithmetic per
-            // IEEE-754. Without this the host driver may assume no NaN/Inf and
-            // fast-math-optimise (x*0 -> 0, x-x -> 0, reassociation), producing NaN
-            // where the guest does not. Ghost of Yotei's bloom / HDR passes surface
-            // this (bloom target all fp16 NaN -> frame black). The translator now
-            // emits the SPIR-V SignedZeroInfNanPreserve execution mode (ported from
-            // KytyPS5, which sets it on every shader); that mode is only legal when
-            // this driver property reports support. It is a property, not an
-            // enableable feature, so there is nothing to add to the device pNext.
+            // Query support before accepting shaders that request the float-controls execution mode.
             var floatControls = new PhysicalDeviceFloatControlsProperties
             {
                 SType = StructureType.PhysicalDeviceFloatControlsProperties,

@@ -2683,8 +2683,7 @@ public static partial class Gen5ShaderScalarEvaluator
 
         var bufferUnbound =
             isBufferLoad &&
-            (descriptorDiverged ||
-             !hasBufferDescriptor ||
+            (!hasBufferDescriptor ||
              bufferDescriptor.SizeBytes == 0 ||
              (scalarRegisters[scalarBase.Value] == 0 &&
               scalarRegisters[scalarBase.Value + 1] == 0 &&

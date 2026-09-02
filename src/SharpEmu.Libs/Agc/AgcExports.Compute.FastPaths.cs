@@ -266,13 +266,7 @@ public static partial class AgcExports
             IsBufferControl(store, vectorAddress: 0, vectorData: 1, scalarResource: 4);
     }
 
-    /// <summary>
-    /// Semantic CPU replacement for Yotei's constant-fill kernel (v4 =
-    /// wgid*64 + tid; BufferStoreFormatXyzw writes s4..s7 at record v4). The
-    /// translated Vulkan form measured ~2.2s per dispatch against
-    /// microseconds for the CPU fill. Same discipline as the masked-dword-copy
-    /// replacement above: full instruction shape and descriptor must match.
-    /// </summary>
+    /// <summary>CPU fast path for a recognized constant-fill kernel.</summary>
     private static bool TrySubmitConstantFillKernel(
         CpuContext ctx,
         Gen5ShaderProgram program,

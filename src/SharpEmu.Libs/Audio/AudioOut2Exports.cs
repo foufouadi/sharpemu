@@ -163,10 +163,7 @@ public static class AudioOut2Exports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    // Ghost of Yotei calls this with flags=0 during Scream startup and never
-    // checks the result before continuing into its mastering path; the actual
-    // mastering chain lives in the host mixer, so accepting the request is
-    // sufficient.
+    // The host mixer owns mastering, so accepting this initialization request is sufficient.
     [SysAbiExport(
         Nid = "XHl38ZNknbs",
         ExportName = "sceAudioOut2MasteringInit",
@@ -177,9 +174,7 @@ public static class AudioOut2Exports
         return SetReturn(ctx, 0);
     }
 
-    // 3D-audio object latency hint; the host mixer has no object pipeline to
-    // tune, but failure here makes Yotei tear down its whole ACM context and
-    // abort audio arena bring-up.
+    // The host mixer has no object pipeline to tune, but callers require this hint to succeed.
     [SysAbiExport(
         Nid = "TViD1EZXkNI",
         ExportName = "sceAudioOut2Set3DLatency",
