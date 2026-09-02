@@ -3706,7 +3706,12 @@ public static partial class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
-                if (endOut != 0 && !ctx.TryWriteUInt64(endOut, region.Address + region.Length - 1))
+                if (!TryAddU64(region.Address, region.Length, out var regionEnd))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+                }
+
+                if (endOut != 0 && !ctx.TryWriteUInt64(endOut, regionEnd))
                 {
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
@@ -3716,6 +3721,48 @@ public static partial class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+        }
+
+        // Kyty's implementation queries the complete virtual-range table, not
+        // only ranges created by sceKernelMap*.  The direct loader owns the
+        // ELF/module mappings in IVirtualMemory, so consult that table as a
+        // fallback for code/data addresses inside the loaded title.
+        var guestMemory = ctx.Memory;
+        while (guestMemory is ICpuMemoryWrapper wrapper)
+        {
+            guestMemory = wrapper.Inner;
+        }
+
+        if (guestMemory is IGuestMemoryRegionProvider regionProvider)
+        {
+            foreach (var region in regionProvider.SnapshotGuestMemoryRegions())
+            {
+                if (queryAddress < region.VirtualAddress ||
+                    !TryAddU64(region.VirtualAddress, region.MemorySize, out var regionEnd) ||
+                    queryAddress >= regionEnd)
+                {
+                    continue;
+                }
+
+                if (startOut != 0 && !ctx.TryWriteUInt64(startOut, region.VirtualAddress))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                if (endOut != 0 && !ctx.TryWriteUInt64(endOut, regionEnd))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                if (protectionOut != 0 &&
+                    !TryWriteInt32(ctx, protectionOut, (int)region.Protection))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                ctx[CpuRegister.Rax] = 0;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
         }

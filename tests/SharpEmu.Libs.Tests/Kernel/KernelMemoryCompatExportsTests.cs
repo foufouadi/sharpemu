@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Core.Loader;
+using SharpEmu.Core.Memory;
 using SharpEmu.Libs.Kernel;
 using System.Globalization;
 using System.Text;
@@ -346,6 +348,37 @@ public sealed class KernelMemoryCompatExportsTests
         Assert.True(context.TryReadUInt64(infoAddress + 8, out var regionEnd));
         Assert.Equal(memoryBase + committedLength, regionStart);
         Assert.Equal(memoryBase + reservedLength, regionEnd);
+    }
+
+    [Fact]
+    public void QueryMemoryProtection_FallsBackToLoadedVirtualMemoryRegions()
+    {
+        const ulong memoryBase = 0x40_0000_0000;
+        const ulong mappedLength = 0x4000;
+        const ulong queryAddress = memoryBase + 0x100;
+        const ulong startOut = memoryBase + 0x1000;
+        const ulong endOut = memoryBase + 0x1008;
+        const ulong protectionOut = memoryBase + 0x1010;
+        var memory = new VirtualMemory();
+        memory.Map(
+            memoryBase,
+            mappedLength,
+            fileOffset: 0,
+            ReadOnlySpan<byte>.Empty,
+            ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = queryAddress;
+        context[CpuRegister.Rsi] = startOut;
+        context[CpuRegister.Rdx] = endOut;
+        context[CpuRegister.Rcx] = protectionOut;
+
+        Assert.Equal(0, KernelMemoryCompatExports.KernelQueryMemoryProtection(context));
+        Assert.True(context.TryReadUInt64(startOut, out var regionStart));
+        Assert.True(context.TryReadUInt64(endOut, out var regionEnd));
+        Assert.True(context.TryReadUInt32(protectionOut, out var protection));
+        Assert.Equal(memoryBase, regionStart);
+        Assert.Equal(memoryBase + mappedLength, regionEnd);
+        Assert.Equal(0x03U, protection);
     }
 
     [Fact]

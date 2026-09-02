@@ -10,7 +10,7 @@ using SharpEmu.Logging;
 
 namespace SharpEmu.Core.Memory;
 
-public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IGuestAddressSpace, IDisposable
+public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IGuestAddressSpace, IGuestMemoryRegionProvider, IDisposable
 {
     private static readonly SharpEmuLogger Log = SharpEmuLog.For("VMEM");
 
@@ -1219,6 +1219,32 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     r.Size,
                     r.IsExecutable ? ProgramHeaderFlags.Execute | ProgramHeaderFlags.Read : ProgramHeaderFlags.Read);
             }
+            return snapshot;
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+    }
+
+    public IReadOnlyList<GuestMemoryRegion> SnapshotGuestMemoryRegions()
+    {
+        _gate.EnterReadLock();
+        try
+        {
+            var snapshot = new GuestMemoryRegion[_regions.Count];
+            for (var i = 0; i < _regions.Count; i++)
+            {
+                var region = _regions[i];
+                var protection = GuestMemoryProtection.Read;
+                if (region.IsExecutable)
+                {
+                    protection |= GuestMemoryProtection.Execute;
+                }
+
+                snapshot[i] = new GuestMemoryRegion(region.VirtualAddress, region.Size, protection);
+            }
+
             return snapshot;
         }
         finally

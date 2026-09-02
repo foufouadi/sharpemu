@@ -6,7 +6,7 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Memory;
 
-public sealed class VirtualMemory : IVirtualMemory
+public sealed class VirtualMemory : IVirtualMemory, IGuestMemoryRegionProvider
 {
     private readonly object _gate = new();
     private readonly List<MappedRegion> _regions = new();
@@ -64,6 +64,37 @@ public sealed class VirtualMemory : IVirtualMemory
             for (var i = 0; i < _regions.Count; i++)
             {
                 snapshot[i] = _regions[i].Region;
+            }
+
+            return snapshot;
+        }
+    }
+
+    public IReadOnlyList<GuestMemoryRegion> SnapshotGuestMemoryRegions()
+    {
+        lock (_gate)
+        {
+            var snapshot = new GuestMemoryRegion[_regions.Count];
+            for (var i = 0; i < _regions.Count; i++)
+            {
+                var region = _regions[i].Region;
+                var protection = GuestMemoryProtection.None;
+                if ((region.Protection & ProgramHeaderFlags.Read) != 0)
+                {
+                    protection |= GuestMemoryProtection.Read;
+                }
+
+                if ((region.Protection & ProgramHeaderFlags.Write) != 0)
+                {
+                    protection |= GuestMemoryProtection.Write;
+                }
+
+                if ((region.Protection & ProgramHeaderFlags.Execute) != 0)
+                {
+                    protection |= GuestMemoryProtection.Execute;
+                }
+
+                snapshot[i] = new GuestMemoryRegion(region.VirtualAddress, region.MemorySize, protection);
             }
 
             return snapshot;
