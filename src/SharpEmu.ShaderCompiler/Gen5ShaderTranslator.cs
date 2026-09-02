@@ -1506,7 +1506,6 @@ public static class Gen5ShaderTranslator
             0x345 => "VXadU32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
-            0x373 => "VMadU32U16",
             0x36D => "VAdd3U32",
             0x36F => "VLshlOrU32",
             0x371 => "VAndOrB32",
@@ -2067,16 +2066,34 @@ public static class Gen5ShaderTranslator
         // as storage images. Keep it as storage when the same guest image
         // resource is also written in this shader stage. The guest may bind
         // the same surface through format aliases (for example UNORM for the
-        // store and SRGB for the load), so comparing the descriptor words here
+        // store and SRGB for the load), so comparing the whole descriptor here
         // would split one read/write resource into a sampled image plus a
         // storage image. Kyty merges those operations by the image resource
         // source before descriptor materialization.
+        //
+        // The resource is identified by where its surface lives, not by the
+        // SGPR the descriptor happened to be loaded into: one register slot is
+        // routinely reused for several images inside a single program, so
+        // matching on the register number merges unrelated surfaces.
         return stageBindings.Any(candidate =>
             IsStorageImageOperation(candidate.Opcode) &&
-            binding.Control.ScalarResource == candidate.Control.ScalarResource &&
+            GetImageDescriptorBaseAddress(binding.ResourceDescriptor) ==
+                GetImageDescriptorBaseAddress(candidate.ResourceDescriptor) &&
             binding.Control.Dimension == candidate.Control.Dimension &&
             binding.Control.A16 == candidate.Control.A16);
     }
+
+    /// <summary>
+    /// Byte address of the surface an image descriptor points at. The address
+    /// is stored shifted right by eight across the first two dwords; the format
+    /// fields higher in the second dword are deliberately excluded so two
+    /// format aliases of one surface compare equal.
+    /// </summary>
+    public static ulong GetImageDescriptorBaseAddress(
+        IReadOnlyList<uint> resourceDescriptor) =>
+        resourceDescriptor.Count < 2
+            ? 0
+            : (resourceDescriptor[0] | ((ulong)(resourceDescriptor[1] & 0xFFu) << 32)) << 8;
 
     public static bool IsArrayedImageBinding(Gen5ImageBinding binding) =>
         binding.Control.IsArray &&
