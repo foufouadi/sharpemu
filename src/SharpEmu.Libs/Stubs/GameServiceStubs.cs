@@ -15,6 +15,19 @@ namespace SharpEmu.Libs.Stubs;
 /// </summary>
 public static class GameServiceStubs
 {
+    private sealed class VoicePortState
+    {
+        public int PortType { get; init; } = -1;
+        public uint Bitrate { get; set; } = 48_000;
+        public float Volume { get; set; } = 1.0f;
+        public ushort EdgeCount { get; set; }
+    }
+
+    private static readonly object VoiceSync = new();
+    private static readonly Dictionary<uint, VoicePortState> VoicePorts = new();
+    private static uint NextVoicePort = 1;
+    private static bool VoiceStarted;
+
     private static int Ok(CpuContext ctx)
     {
         ctx[CpuRegister.Rax] = 0;
@@ -90,7 +103,17 @@ public static class GameServiceStubs
 
     [SysAbiExport(Nid = "9TrhuGzberQ", ExportName = "sceVoiceInit",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceInit(CpuContext ctx) => Ok(ctx);
+    public static int VoiceInit(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            VoicePorts.Clear();
+            NextVoicePort = 1;
+            VoiceStarted = false;
+        }
+
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "clyKUyi3RYU", ExportName = "sceVoiceSetThreadsParams",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
@@ -98,23 +121,317 @@ public static class GameServiceStubs
 
     [SysAbiExport(Nid = "nXpje5yNpaE", ExportName = "sceVoiceCreatePort",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceCreatePort(CpuContext ctx) => OkWithHandle(ctx, CpuRegister.Rdi);
+    public static int VoiceCreatePort(CpuContext ctx)
+    {
+        var outAddress = ctx[CpuRegister.Rdi];
+        if (outAddress == 0)
+        {
+            return Ok(ctx);
+        }
+
+        var paramAddress = ctx[CpuRegister.Rsi];
+        var portType = -1;
+        var bitrate = 48_000u;
+        var volume = 1.0f;
+        if (paramAddress != 0)
+        {
+            Span<byte> param = stackalloc byte[16];
+            if (ctx.Memory.TryRead(paramAddress, param))
+            {
+                portType = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param);
+                volume = BitConverter.Int32BitsToSingle(
+                    System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param[8..]));
+                if (volume <= 0.0f || float.IsNaN(volume))
+                {
+                    volume = 1.0f;
+                }
+
+                if (portType == 2)
+                {
+                    var requestedBitrate =
+                        System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(param[12..]);
+                    if (requestedBitrate > 0)
+                    {
+                        bitrate = unchecked((uint)requestedBitrate);
+                    }
+                }
+            }
+        }
+
+        uint portId;
+        lock (VoiceSync)
+        {
+            portId = NextVoicePort++;
+            if (NextVoicePort == 0xff)
+            {
+                NextVoicePort = 1;
+            }
+
+            VoicePorts[portId] = new VoicePortState
+            {
+                PortType = portType,
+                Bitrate = bitrate,
+                Volume = volume,
+            };
+        }
+
+        Span<byte> result = stackalloc byte[sizeof(uint)];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(result, portId);
+        _ = ctx.Memory.TryWrite(outAddress, result);
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "b7kJI+nx2hg", ExportName = "sceVoiceDeletePort",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceDeletePort(CpuContext ctx) => Ok(ctx);
+    public static int VoiceDeletePort(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            VoicePorts.Remove(unchecked((uint)ctx[CpuRegister.Rdi]));
+        }
+
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "oV9GAdJ23Gw", ExportName = "sceVoiceConnectIPortToOPort",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceConnectIPortToOPort(CpuContext ctx) => Ok(ctx);
+    public static int VoiceConnectIPortToOPort(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rdi]), out var input))
+            {
+                input.EdgeCount = 1;
+            }
+
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rsi]), out var output))
+            {
+                output.EdgeCount = 1;
+            }
+        }
+
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "ajVj3QG2um4", ExportName = "sceVoiceDisconnectIPortFromOPort",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceDisconnectIPortFromOPort(CpuContext ctx) => Ok(ctx);
+    public static int VoiceDisconnectIPortFromOPort(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rdi]), out var input))
+            {
+                input.EdgeCount = 0;
+            }
+
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rsi]), out var output))
+            {
+                output.EdgeCount = 0;
+            }
+        }
+
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "Oo0S5PH7FIQ", ExportName = "sceVoiceEnd",
         Target = Generation.Gen5, LibraryName = "libSceVoice")]
-    public static int VoiceEnd(CpuContext ctx) => Ok(ctx);
+    public static int VoiceEnd(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            VoicePorts.Clear();
+            NextVoicePort = 1;
+            VoiceStarted = false;
+        }
+
+        return Ok(ctx);
+    }
+
+    // GTA V starts the voice subsystem after creating its audio ports. Kyty
+    // exposes this as a side-effect-free success path when no host voice
+    // backend is present; keeping the NID registered prevents the import
+    // resolver from falling back to an unresolved call.
+    [SysAbiExport(Nid = "54phPH2LZls", ExportName = "sceVoiceStart",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceStart(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            VoiceStarted = true;
+        }
+
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "Ao2YNSA7-Qo", ExportName = "sceVoiceStop",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceStop(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            VoiceStarted = false;
+        }
+
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "cQ6DGsQEjV4", ExportName = "sceVoiceReadFromOPort",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceReadFromOPort(CpuContext ctx)
+    {
+        var sizeAddress = ctx[CpuRegister.Rdx];
+        if (sizeAddress == 0)
+        {
+            return Ok(ctx);
+        }
+
+        Span<byte> sizeBytes = stackalloc byte[sizeof(uint)];
+        if (ctx.Memory.TryRead(sizeAddress, sizeBytes))
+        {
+            var size = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(sizeBytes);
+            var dataAddress = ctx[CpuRegister.Rsi];
+            if (dataAddress != 0 && size != 0)
+            {
+                var silence = new byte[Math.Min(size, 1u << 20)];
+                _ = ctx.Memory.TryWrite(dataAddress, silence);
+            }
+
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, 0);
+            _ = ctx.Memory.TryWrite(sizeAddress, sizeBytes);
+        }
+
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "YeJl6yDlhW0", ExportName = "sceVoiceWriteToIPort",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceWriteToIPort(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(Nid = "CrLqDwWLoXM", ExportName = "sceVoiceGetPortInfo",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceGetPortInfo(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rsi];
+        if (infoAddress == 0)
+        {
+            return Ok(ctx);
+        }
+
+        var portId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var portType = -1;
+        ushort edgeCount = 0;
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(portId, out var port))
+            {
+                portType = port.PortType;
+                edgeCount = port.EdgeCount;
+            }
+        }
+
+        Span<byte> info = stackalloc byte[32];
+        info.Clear();
+        if (infoAddress <= ulong.MaxValue - 16 && ctx.TryReadUInt64(infoAddress + 8, out var edge))
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(info[8..], edge);
+        }
+
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(info, portType);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+            info[4..], VoiceStarted ? 1 : 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(info[16..], 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(info[20..], 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(info[24..], edgeCount);
+        _ = ctx.Memory.TryWrite(infoAddress, info);
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "elcxZTEfHZM", ExportName = "sceVoiceGetPortAttr",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceGetPortAttr(CpuContext ctx)
+    {
+        var valueAddress = ctx[CpuRegister.Rdx];
+        var size = unchecked((int)ctx[CpuRegister.Rcx]);
+        if (valueAddress == 0 || size <= 0 || size > 1 << 20)
+        {
+            return Ok(ctx);
+        }
+
+        var value = new byte[size];
+        if (unchecked((int)ctx[CpuRegister.Rsi]) == 1001 && size >= sizeof(bool))
+        {
+            value[0] = 1;
+        }
+
+        _ = ctx.Memory.TryWrite(valueAddress, value);
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "cJLufzou6bc", ExportName = "sceVoiceGetBitRate",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceGetBitRate(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rsi];
+        if (outputAddress == 0)
+        {
+            return Ok(ctx);
+        }
+
+        var bitrate = 48_000u;
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rdi]), out var port))
+            {
+                bitrate = port.Bitrate;
+            }
+        }
+
+        Span<byte> value = stackalloc byte[sizeof(uint)];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(value, bitrate);
+        _ = ctx.Memory.TryWrite(outputAddress, value);
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "QBFoAIjJoXQ", ExportName = "sceVoiceSetVolume",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceSetVolume(CpuContext ctx)
+    {
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rdi]), out var port))
+            {
+                port.Volume = BitConverter.Int32BitsToSingle(unchecked((int)ctx[CpuRegister.Rsi]));
+            }
+        }
+
+        return Ok(ctx);
+    }
+
+    [SysAbiExport(Nid = "jjkCjneOYSs", ExportName = "sceVoiceGetVolume",
+        Target = Generation.Gen5, LibraryName = "libSceVoice")]
+    public static int VoiceGetVolume(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rsi];
+        if (outputAddress == 0)
+        {
+            return Ok(ctx);
+        }
+
+        var volume = 1.0f;
+        lock (VoiceSync)
+        {
+            if (VoicePorts.TryGetValue(unchecked((uint)ctx[CpuRegister.Rdi]), out var port))
+            {
+                volume = port.Volume;
+            }
+        }
+
+        Span<byte> value = stackalloc byte[sizeof(float)];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+            value, BitConverter.SingleToInt32Bits(volume));
+        _ = ctx.Memory.TryWrite(outputAddress, value);
+        return Ok(ctx);
+    }
 
     [SysAbiExport(Nid = "dPj4ZtRcIWk", ExportName = "sceContentSearchInit",
         Target = Generation.Gen5, LibraryName = "libSceContentSearch")]
