@@ -91,6 +91,9 @@ public static class Gen5ShaderTranslator
     private const uint ComputeUserDataRegister = 0x240;
     private const uint ComputePgmRsrc2Register = 0x213;
     private const int MaximumHardwareUserSgprs = 64;
+    // gfx10 operand encoding for SGPR_NULL, shared by the inline-constant
+    // table (where it reads as zero) and the FLAT/GLOBAL SADDR field.
+    private const uint NullScalarOperand = 125;
     private static readonly ConditionalWeakTable<object, ShaderDecodeCache> _decodeCaches = new();
 
     private sealed class ShaderDecodeCache
@@ -2622,9 +2625,15 @@ public static class Gen5ShaderTranslator
                 var vectorAddress = extra & 0xFF;
                 var vectorData = (extra >> 8) & 0xFF;
                 var scalarAddress = (extra >> 16) & 0x7F;
-                var usesFlatAddress = opcode.StartsWith(
-                    "Flat",
-                    StringComparison.Ordinal);
+                // gfx10 encodes SGPR_NULL as 125, and a GLOBAL_* whose SADDR is
+                // NULL has no scalar base at all: the VGPR pair carries the whole
+                // 64-bit address, exactly like a FLAT_*. Reading s[125:126] as a
+                // pointer instead lands on the last SGPR paired with EXEC_LO,
+                // which is never an address - it reads zero and takes the whole
+                // shader down with a null base.
+                var usesFlatAddress =
+                    opcode.StartsWith("Flat", StringComparison.Ordinal) ||
+                    scalarAddress == NullScalarOperand;
                 var memoryOpcode = usesFlatAddress
                     ? "Global" + opcode["Flat".Length..]
                     : opcode;
