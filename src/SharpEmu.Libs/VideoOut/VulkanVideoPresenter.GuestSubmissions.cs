@@ -886,6 +886,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     _completedTimeline = submission.Timeline;
                 }
 
+                // Publish shader-written guest buffers after their Vulkan submission completes.
+                WriteBackAllDirtyGuestBuffers(submission.Queue.Name);
+
                 _gpuLabelHostPublications.Complete(submission.LabelDependency);
 
                 foreach (var image in submission.TraceImages)
