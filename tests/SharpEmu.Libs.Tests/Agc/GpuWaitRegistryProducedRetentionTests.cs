@@ -74,27 +74,25 @@ public sealed class GpuWaitRegistryProducedRetentionTests
     }
 
     [Fact]
-    public void CircularBreakIsNotBoundedByAnAddressWindow()
+    public void CircularBreakLeavesWaitersOutsideTheHandshakeWindowAlone()
     {
-        // The selection used to be restricted to 0x400200000..0x400210000, a
-        // window taken from one capture. A satisfied, aged compute waiter is
-        // released wherever its label lives; the queue kind, age, published
-        // value and frame generation are what decide.
+        // The window was removed once and put back: unbounded, this releases
+        // waits whose producer has not run, and titles lose video while audio
+        // keeps playing. A satisfied, aged compute waiter outside the window is
+        // therefore left suspended.
         GpuWaitRegistry.Clear();
         var memory = new object();
-        var compute = NewWaiter(memory, 0x0000_0008_1234_5000UL);
-        compute.QueueName = "acb.compute[7]";
-        GpuWaitRegistry.Register(compute.WaitAddress, compute);
-        GpuWaitRegistry.RecordProduced(memory, compute.WaitAddress, 1);
+        var outside = NewWaiter(memory, 0x0000_0008_1234_5000UL);
+        outside.QueueName = "acb.compute[7]";
+        GpuWaitRegistry.Register(outside.WaitAddress, outside);
+        GpuWaitRegistry.RecordProduced(memory, outside.WaitAddress, 1);
 
         var broken = GpuWaitRegistry.CollectCircularComputeBreaks(
             memory,
             nowTicks: 1_000_000,
             minAgeTicks: 1);
 
-        var resumed = Assert.Single(
-            Assert.IsType<List<GpuWaitRegistry.WaitingDcb>>(broken));
-        Assert.Equal(compute.WaitAddress, resumed.WaitAddress);
+        Assert.Null(broken);
         GpuWaitRegistry.Clear();
     }
 

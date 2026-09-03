@@ -111,6 +111,13 @@ internal static class GpuWaitRegistry
     private static long _currentFrameId;
     private static long _lastCircularBreakTicks;
     private static int _circularBreaksThisWindow;
+    // Empirical bounds. Removing them was tried and reverted: on a machine with
+    // many suspended waits the unbounded form releases waits whose producer has
+    // not really run, and titles lose video while audio keeps playing. The
+    // window is not an architectural constant and its provenance is unproven,
+    // but it is load-bearing until the guard that should replace it is found.
+    private const ulong CircularHandshakeFirstAddress = 0x0000000400200000UL;
+    private const ulong CircularHandshakeEndAddress = 0x0000000400210000UL;
     // Releasing a wait the producer has not really satisfied is a correctness
     // risk, so the recovery is rate-limited rather than run to a fixed point:
     // a genuinely wedged frame needs a couple of releases to make progress,
@@ -1599,6 +1606,12 @@ internal static class GpuWaitRegistry
             List<ulong>? emptied = null;
             foreach (var (address, list) in _waiters)
             {
+                if (address < CircularHandshakeFirstAddress ||
+                    address >= CircularHandshakeEndAddress)
+                {
+                    continue;
+                }
+
                 for (var i = list.Count - 1;
                      i >= 0 && _circularBreaksThisWindow < MaxCircularBreaksPerSecond;
                      i--)
@@ -1634,6 +1647,12 @@ internal static class GpuWaitRegistry
                     broken.Add(waiter);
                     list.RemoveAt(i);
                     _circularBreaksThisWindow++;
+                    // Reported at warning level, not trace: this releases a
+                    // wait the guest is still holding, so a run that hits it
+                    // must say so in a default-configured log.
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] agc.circular_break label=0x{address:X16} " +
+                        $"queue={waiter.QueueName} submission={waiter.SubmissionId}");
                 }
 
                 if (list.Count == 0)
