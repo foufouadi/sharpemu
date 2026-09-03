@@ -235,7 +235,29 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int SuspendPoint(CpuContext ctx)
     {
-        TraceAgc("agc.suspend_point");
+        // A suspend point is where the title declares itself quiescent so the
+        // system may suspend it, which means the GPU has to have drained. This
+        // returned immediately and drained nothing, so a title whose own
+        // watchdog checks that a suspend point took effect keeps forcing new
+        // ones - Cult Of The Lamb prints "Forcing call to sce::Agc::
+        // suspendPoint to avoid TRC R5089 breach" every three seconds.
+        // KytyPS5's AgcSuspendPoint calls GetGpu().Done() for the same reason.
+        //
+        // Enqueuing an empty action and waiting on its sequence is how the rest
+        // of this file expresses "everything submitted before this has
+        // finished": the action takes its exact position in the guest queue.
+        var sequence = GuestGpu.Current.SubmitOrderedGuestAction(
+            static () => { },
+            "agc.suspend_point");
+        if (sequence != 0 && !GuestGpu.Current.WaitForGuestWork(sequence))
+        {
+            TraceAgc($"agc.suspend_point_wait_failed sequence={sequence}");
+        }
+        else
+        {
+            TraceAgc("agc.suspend_point");
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
