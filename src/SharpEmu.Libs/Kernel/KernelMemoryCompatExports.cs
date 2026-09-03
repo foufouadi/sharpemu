@@ -3147,15 +3147,16 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool released;
         lock (_memoryGate)
         {
-            if (!TryReleaseDirectMemoryRangeLocked(start, length))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
+            released = TryReleaseDirectMemoryRangeLocked(start, length);
         }
 
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        TraceDirectMemoryRelease("checked_release_direct", start, length, released);
+        return released
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
     }
 
     [SysAbiExport(
@@ -6612,6 +6613,45 @@ public static partial class KernelMemoryCompatExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
 
     private static bool ShouldTraceDirectMemory() => _traceDirectMemory;
+
+    /// <summary>
+    /// Reports a direct-memory release under SHARPEMU_LOG_DIRECT_MEMORY. The
+    /// allocation side is already traced; without the release side a refusal
+    /// cannot be matched against what was actually handed out. On a refusal the
+    /// current allocation table is printed, which is the only way to tell a
+    /// guest releasing memory it never allocated from a range the emulator
+    /// tracked at different bounds.
+    /// </summary>
+    private static void TraceDirectMemoryRelease(
+        string operation,
+        ulong start,
+        ulong length,
+        bool released)
+    {
+        if (!ShouldTraceDirectMemory())
+        {
+            return;
+        }
+
+        var detail = string.Empty;
+        if (!released)
+        {
+            lock (_memoryGate)
+            {
+                detail = _directAllocations.Count == 0
+                    ? " allocations=<none>"
+                    : " allocations=[" + string.Join(
+                        ',',
+                        _directAllocations.Values.Select(
+                            allocation =>
+                                $"0x{allocation.Start:X}+0x{allocation.Length:X}")) + "]";
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] {operation}: start=0x{start:X16} len=0x{length:X16} " +
+            $"released={released}{detail}");
+    }
 
     private static bool TryReleaseDirectMemoryRangeLocked(ulong start, ulong length)
     {
