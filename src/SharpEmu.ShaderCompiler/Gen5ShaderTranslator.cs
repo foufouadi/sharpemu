@@ -2071,29 +2071,26 @@ public static class Gen5ShaderTranslator
         // storage image. Kyty merges those operations by the image resource
         // source before descriptor materialization.
         //
-        // The resource is identified by where its surface lives, not by the
-        // SGPR the descriptor happened to be loaded into: one register slot is
-        // routinely reused for several images inside a single program, so
-        // matching on the register number merges unrelated surfaces.
+        // The discriminator has to be a property of the shader program, not of
+        // the descriptor contents. This decision is taken twice: once while
+        // translating, where it fixes how many storage images the SPIR-V
+        // declares, and again per dispatch, where it fixes how many the host
+        // binds. The translated module is cached across dispatches and its key
+        // does not include the descriptor's base address, so anything that
+        // varies with descriptor data makes the two disagree - a shader
+        // declaring one storage image while the host offers five, which is
+        // rejected as storage-binding-count-mismatch and drops the dispatch.
+        //
+        // Matching on the scalar resource register over-merges when one slot
+        // carries several images in a program, and that is a real defect. It is
+        // the lesser one: it must be replaced by another shader-invariant
+        // discriminator, never by descriptor contents.
         return stageBindings.Any(candidate =>
             IsStorageImageOperation(candidate.Opcode) &&
-            GetImageDescriptorBaseAddress(binding.ResourceDescriptor) ==
-                GetImageDescriptorBaseAddress(candidate.ResourceDescriptor) &&
+            binding.Control.ScalarResource == candidate.Control.ScalarResource &&
             binding.Control.Dimension == candidate.Control.Dimension &&
             binding.Control.A16 == candidate.Control.A16);
     }
-
-    /// <summary>
-    /// Byte address of the surface an image descriptor points at. The address
-    /// is stored shifted right by eight across the first two dwords; the format
-    /// fields higher in the second dword are deliberately excluded so two
-    /// format aliases of one surface compare equal.
-    /// </summary>
-    public static ulong GetImageDescriptorBaseAddress(
-        IReadOnlyList<uint> resourceDescriptor) =>
-        resourceDescriptor.Count < 2
-            ? 0
-            : (resourceDescriptor[0] | ((ulong)(resourceDescriptor[1] & 0xFFu) << 32)) << 8;
 
     public static bool IsArrayedImageBinding(Gen5ImageBinding binding) =>
         binding.Control.IsArray &&
