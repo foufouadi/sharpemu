@@ -918,13 +918,6 @@ public static class KernelPthreadCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
-            if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
-                IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
-            {
-                TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
-            }
-
             if (state.Type == MutexTypeAdaptiveNp)
             {
                 var adaptiveResult = tryOnly
@@ -932,19 +925,6 @@ public static class KernelPthreadCompatExports
                     : (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock-idempotent", mutexAddress, resolvedAddress, state, currentThreadId, adaptiveResult);
                 return adaptiveResult;
-            }
-
-            if (state.Type == MutexTypeNormal)
-            {
-                if (tryOnly)
-                {
-                    TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
-                }
-
-                state.IncrementRecursion();
-                TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
             var ownedResult = tryOnly
@@ -969,13 +949,6 @@ public static class KernelPthreadCompatExports
                     state.RecursionCount++;
                     TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-                }
-
-                if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
-                    IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
-                {
-                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
                 }
 
                 if (state.Type == MutexTypeAdaptiveNp)
@@ -1503,9 +1476,13 @@ public static class KernelPthreadCompatExports
             if (hasPointedHandle &&
                 pointedHandle != 0 &&
                 pointedHandle != mutexAddress &&
-                _mutexStates.TryGetValue(pointedHandle, out var pointedState) &&
-                !ReferenceEquals(pointedState, state))
+                _mutexStates.TryGetValue(pointedHandle, out var pointedState))
             {
+                // The handle stored in the guest slot is the canonical mutex
+                // identity, even when the slot still points at the same HLE
+                // state. All ownership decisions must use that one state and
+                // must never consult fields in the alias slot as a second
+                // source of truth.
                 _mutexStates[mutexAddress] = pointedState;
                 resolvedAddress = pointedHandle;
                 state = pointedState;
@@ -2282,10 +2259,6 @@ public static class KernelPthreadCompatExports
         TracePthreadMutex(ctx, "lock-resume-ungranted", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
     }
-
-    private static bool IsGuestTrackedSelfLock(CpuContext ctx, ulong mutexAddress, ulong currentThreadId) =>
-        KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress + 8, out var guestOwner) &&
-        guestOwner == currentThreadId;
 
     private static bool CompleteCondWaiterLocked(
         PthreadCondState state,

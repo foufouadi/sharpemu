@@ -26,7 +26,7 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
-    public void AdaptiveMutex_GuestTrackedSelfLockReturnsDeadlockAndSingleUnlockReleases()
+    public void AdaptiveMutex_GuestOwnerWordDoesNotOverrideHleOwnership()
     {
         const ulong memoryBase = 0x1_0001_0000;
         const ulong mutexAddress = memoryBase + 0x100;
@@ -40,10 +40,12 @@ public sealed class PthreadMutexSemanticsTests
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         Assert.True(context.TryWriteUInt64(mutexAddress + 8, currentThreadHandle));
         Assert.Equal(
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
+            0,
             KernelPthreadCompatExports.PthreadMutexLock(context));
 
-        Assert.True(context.TryWriteUInt64(mutexAddress + 8, 0));
+        // The HLE state is the only ownership authority. A stale or
+        // implementation-specific guest word must not turn the adaptive
+        // wrapper's duplicate acquisition into a deadlock.
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
@@ -74,6 +76,33 @@ public sealed class PthreadMutexSemanticsTests
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
         Assert.NotEqual(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
+    [Fact]
+    public void NormalMutex_SelfLockReturnsDeadlockWithoutExtraOwnership()
+    {
+        const ulong memoryBase = 0x1_0003_0000;
+        const ulong attrAddress = memoryBase + 0x100;
+        const ulong mutexAddress = memoryBase + 0x200;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        context[CpuRegister.Rdi] = attrAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrInit(context));
+        context[CpuRegister.Rsi] = 3; // Normal.
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrSettype(context));
+
+        context[CpuRegister.Rdi] = mutexAddress;
+        context[CpuRegister.Rsi] = attrAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
+            KernelPthreadCompatExports.PthreadMutexLock(context));
+
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
 
     [Fact]

@@ -10,6 +10,9 @@ public sealed class VideoOutOutputSupportTests
 {
     private const string OpenNid = "Up36PTk687E";
     private const string CloseNid = "uquVH4-Du78";
+    private const string AddOutputModeEventNid = "kmSe30JTs+E";
+    private const string CreateEqueueNid = "D0OdFMjp46I";
+    private const string DeleteEqueueNid = "jpFjmgAC5AE";
     private const string OutputSupportNid = "Nv8c-Kb+DUM";
     private const ulong MemoryBase = 0x1_0000_0000;
     private const ulong OptionsAddress = MemoryBase + 0x100;
@@ -78,6 +81,56 @@ public sealed class VideoOutOutputSupportTests
         {
             context[CpuRegister.Rdi] = handle;
             _ = manager.TryDispatch(CloseNid, context, out _);
+        }
+    }
+
+    [Fact]
+    public void Gen5AddOutputModeEventRegistersOnLiveEqueue()
+    {
+        var manager = new ModuleManager();
+        manager.RegisterExports(
+            SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
+
+        Assert.True(manager.TryGetExport(AddOutputModeEventNid, out var export));
+        Assert.Equal("sceVideoOutAddOutputModeEvent", export.Name);
+        Assert.Equal("libSceVideoOut", export.LibraryName);
+
+        var memory = new FakeCpuMemory(MemoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        var equeueOutAddress = MemoryBase + 0x180;
+
+        context[CpuRegister.Rdi] = equeueOutAddress;
+        Assert.True(manager.TryDispatch(CreateEqueueNid, context, out _));
+        Assert.True(context.TryReadUInt64(equeueOutAddress, out var equeue));
+        Assert.NotEqual(0UL, equeue);
+
+        context[CpuRegister.Rdi] = 0;
+        context[CpuRegister.Rsi] = 0;
+        context[CpuRegister.Rdx] = 0;
+        context[CpuRegister.Rcx] = 0;
+        Assert.True(manager.TryDispatch(OpenNid, context, out _));
+        var handle = unchecked((int)context[CpuRegister.Rax]);
+
+        try
+        {
+            context[CpuRegister.Rdi] = equeue;
+            context[CpuRegister.Rsi] = unchecked((ulong)handle);
+            context[CpuRegister.Rdx] = 0x8074B0F78;
+            context[CpuRegister.Rcx] = 0;
+            context[CpuRegister.R8] = 2;
+            context[CpuRegister.R9] = 0x8074B0F78;
+
+            Assert.True(manager.TryDispatch(AddOutputModeEventNid, context, out _));
+            Assert.Equal(
+                (ulong)(int)OrbisGen2Result.ORBIS_GEN2_OK,
+                context[CpuRegister.Rax]);
+        }
+        finally
+        {
+            context[CpuRegister.Rdi] = unchecked((ulong)handle);
+            _ = manager.TryDispatch(CloseNid, context, out _);
+            context[CpuRegister.Rdi] = equeue;
+            _ = manager.TryDispatch(DeleteEqueueNid, context, out _);
         }
     }
 

@@ -562,7 +562,11 @@ public static partial class KernelMemoryCompatExports
         }
 
         var submitId = unchecked((uint)Interlocked.Increment(ref _nextAioSubmitId));
-        _aioResults[submitId] = 0;
+        // The implementation performs the transfer synchronously, so the
+        // request is already complete when the ID becomes visible to the
+        // guest.  Store the real AIO state; sceKernelAioWaitRequest consumes
+        // this table using the request ID passed in RDI.
+        _aioResults[submitId] = unchecked((int)AioStateCompleted);
         if (outIdAddress != 0)
         {
             Span<byte> idBuffer = stackalloc byte[sizeof(uint)];
@@ -618,6 +622,42 @@ public static partial class KernelMemoryCompatExports
     [SysAbiExport(Nid = "o7O4z3jwKzo", ExportName = "sceKernelAioPollRequests",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioPollRequests(CpuContext ctx) => KernelAioComplete(ctx);
+
+    // Kyty/PS5 ABI: (int32_t id, int32_t* state, uint32_t* usec).
+    // This singular entry point is used by Silent Hill.  It is distinct from
+    // sceKernelAioWaitRequests, whose second/third arguments are an output
+    // state array and a request count.
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx)
+    {
+        var requestId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+
+        if (stateAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (!_aioResults.TryGetValue(requestId, out var state))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> stateBuffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            stateBuffer,
+            unchecked((uint)state));
+        if (!ctx.Memory.TryWrite(stateAddress, stateBuffer))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        // Transfers are synchronous in this HLE implementation, therefore
+        // the timeout pointer in RDX never needs to be consumed or modified.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [SysAbiExport(Nid = "lgK+oIWkJyA", ExportName = "sceKernelAioWaitRequests",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]

@@ -51,6 +51,17 @@ public sealed class SysAbiRegistryTests
     }
 
     [Fact]
+    public void RegistryResolvesAioWaitRequest()
+    {
+        var manager = new ModuleManager();
+        manager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4 | Generation.Gen5));
+
+        Assert.True(manager.TryGetExport("KOF-oJbQVvc", out var export));
+        Assert.Equal("sceKernelAioWaitRequest", export.Name);
+        Assert.Equal("libKernel", export.LibraryName);
+    }
+
+    [Fact]
     public void RegistryResolvesStorageCompatibilityExports()
     {
         var manager = new ModuleManager();

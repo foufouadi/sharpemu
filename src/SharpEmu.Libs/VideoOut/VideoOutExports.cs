@@ -69,6 +69,10 @@ public static class VideoOutExports
     // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
     // its distinctness from the flip ident matters for GetEventId/GetEventData.
     private const ulong SceVideoOutInternalEventVblank = 0x40;
+    // Output-mode changes use a distinct kernel event identity.  This is the
+    // PS5/Prospero value used by sceVideoOutAddOutputModeEvent; it must not be
+    // folded into the vblank event because titles distinguish the event id.
+    private const ulong SceVideoOutInternalEventSetMode = 0x51;
     private const short OrbisKernelEventFilterVideoOut = -13;
 
     private static readonly object _stateGate = new();
@@ -236,6 +240,7 @@ public static class VideoOutExports
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
         public List<FlipEventRegistration> VblankEvents { get; } = new();
+        public List<FlipEventRegistration> OutputModeEvents { get; } = new();
         public long OpenTimestamp;
         public long LastVblankTimestamp;
     }
@@ -372,6 +377,52 @@ public static class VideoOutExports
             Monitor.PulseAll(_stateGate);
         }
 
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "kmSe30JTs+E",
+        ExportName = "sceVideoOutAddOutputModeEvent",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAddOutputModeEvent(CpuContext ctx)
+    {
+        // The ABI starts with the same (equeue, video-out handle, user-data)
+        // tuple as AddFlipEvent/AddVblankEvent.  Newer SDKs append reserved
+        // mode/configuration arguments; they are intentionally ignored here
+        // until the host can change physical output modes.
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        var userData = ctx[CpuRegister.Rdx];
+
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
+        {
+            return OrbisVideoOutErrorInvalidEventQueue;
+        }
+
+        lock (_stateGate)
+        {
+            var existingIndex = port.OutputModeEvents.FindIndex(
+                registration => registration.Equeue == equeue);
+            var registration = new FlipEventRegistration(equeue, userData);
+            if (existingIndex >= 0)
+            {
+                port.OutputModeEvents[existingIndex] = registration;
+            }
+            else
+            {
+                port.OutputModeEvents.Add(registration);
+            }
+        }
+
+        TraceVideoOut(
+            $"videoout.add_output_mode_event eq=0x{equeue:X16} " +
+            $"handle={handle} udata=0x{userData:X16}");
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1010,6 +1061,11 @@ public static class VideoOutExports
             return 1;
         }
 
+        if (ident == SceVideoOutInternalEventSetMode)
+        {
+            return 8;
+        }
+
         return OrbisVideoOutErrorInvalidEvent;
     }
 
@@ -1035,7 +1091,9 @@ public static class VideoOutExports
         }
 
         if (filter != OrbisKernelEventFilterVideoOut ||
-            (ident != SceVideoOutInternalEventFlip && ident != SceVideoOutInternalEventVblank))
+            (ident != SceVideoOutInternalEventFlip &&
+             ident != SceVideoOutInternalEventVblank &&
+             ident != SceVideoOutInternalEventSetMode))
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
