@@ -199,6 +199,29 @@ public static partial class Gen5MslTranslator
                     instruction,
                     destination,
                     $"fmax({F16(instruction, 0)}, {F16(instruction, 1)})"),
+                "VRcpF16" => Float16Result(
+                    instruction, destination, $"(1.0f / {F16(instruction, 0)})"),
+                "VSqrtF16" => Float16Result(
+                    instruction, destination, $"sqrt({F16(instruction, 0)})"),
+                "VRsqF16" => Float16Result(
+                    instruction, destination, $"rsqrt({F16(instruction, 0)})"),
+                "VLogF16" => Float16Result(
+                    instruction, destination, $"log2({F16(instruction, 0)})"),
+                "VExpF16" => Float16Result(
+                    instruction, destination, $"exp2({F16(instruction, 0)})"),
+                "VFloorF16" => Float16Result(
+                    instruction, destination, $"floor({F16(instruction, 0)})"),
+                "VCeilF16" => Float16Result(
+                    instruction, destination, $"ceil({F16(instruction, 0)})"),
+                "VTruncF16" => Float16Result(
+                    instruction, destination, $"trunc({F16(instruction, 0)})"),
+                "VRndneF16" => Float16Result(
+                    instruction, destination, $"rint({F16(instruction, 0)})"),
+                // Revolutions, not radians, exactly like the f32 pair above.
+                "VSinF16" => Float16Result(
+                    instruction, destination, $"sin({F16(instruction, 0)} * {TauLiteral})"),
+                "VCosF16" => Float16Result(
+                    instruction, destination, $"cos({F16(instruction, 0)} * {TauLiteral})"),
                 // The decoder normalizes mk/ak literal placement, so every MAD/FMA
                 // form is fma(src0, src1, src2) exactly like the SPIR-V translator.
                 "VFmaF32" or "VMadF32" or "VMadAkF32" or "VMadMkF32" or "VFmaAkF32" or "VFmaMkF32" =>
@@ -232,6 +255,14 @@ public static partial class Gen5MslTranslator
                 "VCvtF32U32" => FloatResult(instruction, $"(float)({RawSource(instruction, 0)})"),
                 "VCvtU32F32" => $"(uint)({F(instruction, 0)})",
                 "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
+                "VCvtF16U16" => Float16Result(
+                    instruction, destination, $"(float)({I16(instruction, 0, signed: false)})"),
+                "VCvtF16I16" => Float16Result(
+                    instruction, destination, $"(float)({I16(instruction, 0, signed: true)})"),
+                "VCvtU16F16" => Integer16Result(
+                    instruction, destination, $"(uint)({F16(instruction, 0)})"),
+                "VCvtI16F16" => Integer16Result(
+                    instruction, destination, $"(uint)(int)({F16(instruction, 0)})"),
                 // RPI rounds toward positive infinity; FLR toward negative.
                 "VCvtRpiI32F32" => AsUInt($"(int)ceil({F(instruction, 0)})"),
                 "VCvtFlrI32F32" => AsUInt($"(int)floor({F(instruction, 0)})"),
@@ -1735,6 +1766,40 @@ public static partial class Gen5MslTranslator
             }
 
             return expression;
+        }
+
+        /// <summary>
+        /// Reads one half of a VGPR as a 16-bit integer, selected by the VOP3
+        /// operand-select bit, sign-extended when the operation is signed.
+        /// </summary>
+        private string I16(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool signed)
+        {
+            var raw = RawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            var shift = instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0
+                    ? 16
+                    : 0;
+            var half = $"((({raw}) >> {shift}) & 0xFFFFu)";
+            return signed ? $"(int)(short)(ushort)({half})" : $"(uint)({half})";
+        }
+
+        /// <summary>Writes a 16-bit integer, preserving the unselected half.</summary>
+        private static string Integer16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string expression)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var packed = $"(({expression}) & 0xFFFFu)";
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? $"((v[{destination}] & 0x0000FFFFu) | (({packed}) << 16))"
+                : $"((v[{destination}] & 0xFFFF0000u) | ({packed}))";
         }
 
         /// <summary>Rounds to f16 and preserves the unselected VGPR half.</summary>

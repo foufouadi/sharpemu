@@ -1219,6 +1219,26 @@ public static class Gen5ShaderTranslator
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
             0x48 => "VMovrelsd2B32",
+            // The gfx10 f16 unaries. Each reads one half of its source and
+            // writes one half of its destination, both selected by the VOP3
+            // operand-select bits; the f32 twins above at 0x05-0x36 keep the
+            // whole register. Silent Hill: The Short Message composites
+            // through 0x56.
+            0x50 => "VCvtF16U16",
+            0x51 => "VCvtF16I16",
+            0x52 => "VCvtU16F16",
+            0x53 => "VCvtI16F16",
+            0x54 => "VRcpF16",
+            0x55 => "VSqrtF16",
+            0x56 => "VRsqF16",
+            0x57 => "VLogF16",
+            0x58 => "VExpF16",
+            0x5B => "VFloorF16",
+            0x5C => "VCeilF16",
+            0x5D => "VTruncF16",
+            0x5E => "VRndneF16",
+            0x60 => "VSinF16",
+            0x61 => "VCosF16",
             _ => string.Empty,
         };
 

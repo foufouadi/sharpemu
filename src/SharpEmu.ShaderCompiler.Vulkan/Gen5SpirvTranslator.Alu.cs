@@ -377,6 +377,96 @@ public static partial class Gen5SpirvTranslator
                 case "VMaxF16":
                     result = EmitFloat16ExtBinary(instruction, destination, 40);
                     break;
+                case "VRcpF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.FDiv,
+                            _floatType,
+                            Float(1),
+                            GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSqrtF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 31);
+                    break;
+                case "VRsqF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 32);
+                    break;
+                case "VLogF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 30);
+                    break;
+                case "VExpF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 29);
+                    break;
+                case "VFloorF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 8);
+                    break;
+                case "VCeilF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 9);
+                    break;
+                case "VTruncF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 3);
+                    break;
+                case "VRndneF16":
+                    result = EmitFloat16ExtUnary(instruction, destination, 2);
+                    break;
+                // The hardware takes revolutions, not radians, exactly as the
+                // f32 forms above do.
+                case "VSinF16":
+                case "VCosF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            instruction.Opcode == "VSinF16" ? 13u : 14u,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                GetFloat16Source(instruction, 0),
+                                Float(MathF.Tau))));
+                    break;
+                case "VCvtF16U16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            GetInteger16Source(instruction, 0, signed: false)));
+                    break;
+                case "VCvtF16I16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertSToF,
+                            _floatType,
+                            Bitcast(
+                                _intType,
+                                GetInteger16Source(instruction, 0, signed: true))));
+                    break;
+                case "VCvtU16F16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertFToU,
+                            _uintType,
+                            GetFloat16Source(instruction, 0)));
+                    break;
+                case "VCvtI16F16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        Bitcast(
+                            _uintType,
+                            _module.AddInstruction(
+                                SpirvOp.ConvertFToS,
+                                _intType,
+                                GetFloat16Source(instruction, 0))));
+                    break;
                 case "VMadF32":
                 case "VFmaF32":
                 case "VMadMkF32":
@@ -3730,6 +3820,15 @@ public static partial class Gen5SpirvTranslator
                 destination,
                 _module.AddInstruction(operation, _floatType, left, right));
         }
+
+        private uint EmitFloat16ExtUnary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint operation) =>
+            EmitFloat16Result(
+                instruction,
+                destination,
+                Ext(operation, _floatType, GetFloat16Source(instruction, 0)));
 
         private uint EmitFloat16ExtBinary(
             Gen5ShaderInstruction instruction,
