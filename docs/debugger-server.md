@@ -49,11 +49,33 @@ they return "not paused" so a client never observes torn state.
 ### What is and isn't live yet
 
 - **Live:** attach/handshake, run-state tracking, register read/write, memory
-  read/write, breakpoint management, execution breakpoints at frame entry,
-  pause, frame-level step, continue, and stop/resume/terminate events.
+  read/write, breakpoint management, **execution breakpoints at any guest
+  address**, pause, frame-level step, continue, and stop/resume/terminate
+  events.
 - **Surface only (armed as the backend grows hooks):** per-instruction
   stepping and data watchpoints (`readwatch` / `writewatch` / `accesswatch`).
   The verbs and types exist so clients and tooling can be written now.
+
+### Execution breakpoints
+
+Guest code runs natively at its own virtual addresses, so a breakpoint replaces
+the first byte of the instruction with `int3` and remembers what it displaced.
+The vectored handler already installed for guest faults catches the trap,
+rewinds the instruction pointer, and calls `ICpuDebugHook.OnBreakpoint` on the
+guest thread that trapped - which is what makes register and memory reads
+describe that thread. Resuming lifts the trap, steps the restored instruction
+with the trap flag, and puts the trap back.
+
+Two consequences worth knowing:
+
+- The address must be the **first byte of an instruction**. Patching into the
+  middle of one corrupts the instruction stream.
+- While a thread steps over a breakpoint the trap is lifted, so another thread
+  can run past that address unbroken. That window is the price of patching
+  bytes rather than using the four hardware debug registers.
+
+`add-breakpoint` now reports `armed` and, when arming failed, `armError`, so a
+client is told rather than left with a breakpoint that never fires.
 
 ## Enabling the server
 

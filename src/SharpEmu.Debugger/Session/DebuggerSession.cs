@@ -45,6 +45,12 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
 
     public BreakpointStore Breakpoints { get; }
 
+    /// <summary>
+    /// Arms breakpoints in the backend once it attaches. Null until then, which
+    /// is why requests are replayed on attach rather than assumed to be live.
+    /// </summary>
+    private ICpuBreakpointController? _breakpointController;
+
     public ICpuDebugHook Hook => this;
 
     public event EventHandler<DebugStopEvent>? Stopped;
@@ -158,6 +164,105 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
                 _state = DebuggerRunState.Running;
             }
         }
+    }
+
+    void ICpuDebugHook.OnAttach(ICpuBreakpointController breakpoints)
+    {
+        lock (_sync)
+        {
+            _breakpointController = breakpoints;
+        }
+
+        // A client can add breakpoints before the target starts, so replay what
+        // is already in the store rather than only arming later additions.
+        foreach (var breakpoint in Breakpoints.Snapshot())
+        {
+            if (breakpoint.Enabled && breakpoint.Kind == BreakpointKind.Execute)
+            {
+                ArmExecutionBreakpoint(breakpoint.Address);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Asks the backend to arm an execution breakpoint. Returns the failure
+    /// reason when the address cannot be patched, so a client is told rather
+    /// than left with a breakpoint that silently never fires - which is what
+    /// the whole surface did before the backend could stop the CPU.
+    /// </summary>
+    public bool ArmExecutionBreakpoint(ulong address, out string error)
+    {
+        error = string.Empty;
+        ICpuBreakpointController? controller;
+        lock (_sync)
+        {
+            controller = _breakpointController;
+        }
+
+        if (controller is null)
+        {
+            error = "the target has not started yet";
+            return false;
+        }
+
+        if (!controller.TryArmExecutionBreakpoint(address, out error))
+        {
+            Log.Warn($"Could not arm breakpoint at 0x{address:X16}: {error}");
+            return false;
+        }
+
+        return true;
+    }
+
+    private void ArmExecutionBreakpoint(ulong address) =>
+        _ = ArmExecutionBreakpoint(address, out _);
+
+    /// <summary>Disarms a breakpoint; false when it was not armed.</summary>
+    public bool DisarmExecutionBreakpoint(ulong address)
+    {
+        ICpuBreakpointController? controller;
+        lock (_sync)
+        {
+            controller = _breakpointController;
+        }
+
+        return controller?.TryDisarmExecutionBreakpoint(address) == true;
+    }
+
+    void ICpuDebugHook.OnBreakpoint(ICpuDebugFrame frame, ulong address)
+    {
+        DebugStopEvent stop;
+        lock (_sync)
+        {
+            _currentFrame = frame;
+            _state = DebuggerRunState.Paused;
+            _lastStop = new DebugStopEvent(
+                DebugStopReason.Breakpoint,
+                DebugRegisterFile.Capture(frame),
+                frame.Kind,
+                frame.Label,
+                Breakpoints.FindExecuteHit(address));
+            stop = _lastStop;
+            _resumeGate.Reset();
+        }
+
+        Log.Debug($"Debugger stop: breakpoint at 0x{address:X16} ({stop.FrameLabel})");
+        Stopped?.Invoke(this, stop);
+
+        // Parks the guest thread that trapped, inside its exception handler, so
+        // register and memory reads describe that thread and the instruction is
+        // still pending.
+        _resumeGate.Wait();
+
+        lock (_sync)
+        {
+            if (_state != DebuggerRunState.Terminated)
+            {
+                _state = DebuggerRunState.Running;
+            }
+        }
+
+        Resumed?.Invoke(this, EventArgs.Empty);
     }
 
     void ICpuDebugHook.OnStall(ICpuDebugFrame frame, CpuStallInfo info)

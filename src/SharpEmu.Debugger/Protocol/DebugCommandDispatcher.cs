@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Linq;
 using SharpEmu.Debugger.Breakpoints;
 using SharpEmu.Debugger.Session;
 using SharpEmu.HLE;
@@ -191,10 +192,26 @@ public sealed class DebugCommandDispatcher
         }
 
         var breakpoint = _session.Breakpoints.Add(kind, address, length);
-        return DebugResponse.Success(request.Command, new Dictionary<string, object?>
+        var fields = new Dictionary<string, object?>
         {
             ["breakpoint"] = DescribeBreakpoint(breakpoint),
-        });
+        };
+
+        // Execution breakpoints have to reach the CPU to do anything. Report
+        // when they could not be armed instead of answering success for a
+        // breakpoint that will never fire.
+        if (kind == BreakpointKind.Execute &&
+            !_session.ArmExecutionBreakpoint(address, out var armError))
+        {
+            fields["armed"] = false;
+            fields["armError"] = armError;
+        }
+        else if (kind == BreakpointKind.Execute)
+        {
+            fields["armed"] = true;
+        }
+
+        return DebugResponse.Success(request.Command, fields);
     }
 
     private DebugResponse RemoveBreakpoint(DebugRequest request)
@@ -204,9 +221,18 @@ public sealed class DebugCommandDispatcher
             return DebugResponse.Failure(request.Command, "Expected an 'id'.");
         }
 
-        return _session.Breakpoints.Remove(id)
-            ? DebugResponse.Success(request.Command)
-            : DebugResponse.Failure(request.Command, $"No breakpoint with id {id}.");
+        var removed = _session.Breakpoints.Snapshot().FirstOrDefault(entry => entry.Id == id);
+        if (!_session.Breakpoints.Remove(id))
+        {
+            return DebugResponse.Failure(request.Command, $"No breakpoint with id {id}.");
+        }
+
+        if (removed is { Kind: BreakpointKind.Execute })
+        {
+            _session.DisarmExecutionBreakpoint(removed.Address);
+        }
+
+        return DebugResponse.Success(request.Command);
     }
 
     private DebugResponse EnableBreakpoint(DebugRequest request)

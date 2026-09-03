@@ -14,8 +14,19 @@ namespace SharpEmu.Debugger.Session;
 /// </summary>
 public interface IDebuggerSession : IDebugTarget
 {
-    /// <summary>The breakpoints armed for this session.</summary>
+    /// <summary>The breakpoints requested for this session.</summary>
     BreakpointStore Breakpoints { get; }
+
+    /// <summary>
+    /// Arms an execution breakpoint in the running target. Recording one in
+    /// <see cref="Breakpoints"/> only states the intent; until this succeeds
+    /// the CPU does not stop, which is why the failure reason is returned
+    /// rather than swallowed.
+    /// </summary>
+    bool ArmExecutionBreakpoint(ulong address, out string error);
+
+    /// <summary>Disarms an execution breakpoint; false when it was not armed.</summary>
+    bool DisarmExecutionBreakpoint(ulong address);
 
     /// <summary>
     /// The dispatcher-facing hook. Assign this to

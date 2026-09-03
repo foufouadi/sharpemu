@@ -1154,6 +1154,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_entryPoint = entryPoint;
 		_cpuContext = context;
 		_debugHook = executionOptions.DebugHook;
+		// Hand the debugger the means to arm breakpoints before any guest code
+		// runs, so a break requested at attach time is in place for the first
+		// instruction rather than only from the second frame onwards.
+		try
+		{
+			_debugHook?.OnAttach(this);
+		}
+		catch (Exception attachException)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] debugger attach handler failed: {attachException.Message}");
+		}
+
 		_returnFallbackTarget = context[CpuRegister.Rsi];
 		Volatile.Write(ref _globalFallbackTarget, _returnFallbackTarget);
 		Volatile.Write(ref _globalUnresolvedReturnStub, (ulong)_unresolvedReturnStub);

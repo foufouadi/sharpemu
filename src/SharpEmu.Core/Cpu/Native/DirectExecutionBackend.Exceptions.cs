@@ -9,6 +9,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu.Disasm;
+using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Cpu.Native;
@@ -183,6 +184,19 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverAmdCompatInstruction(contextRecord, rip))
+			{
+				return -1;
+			}
+			// Before the benign-debug filter: an armed breakpoint is a trap the
+			// backend planted, and its single step has to be completed on the
+			// same thread before anything else looks at the context.
+			if (exceptionCode == WindowsFaultCodes.Breakpoint &&
+				TryHandleExecutionBreakpoint(contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == WindowsFaultCodes.SingleStep &&
+				TryCompleteExecutionBreakpointStep(contextRecord))
 			{
 				return -1;
 			}

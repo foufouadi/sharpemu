@@ -46,4 +46,20 @@ public interface ICpuDebugHook
     /// break before returning to let the backend proceed.
     /// </summary>
     void OnStall(ICpuDebugFrame frame, CpuStallInfo info);
+
+    /// <summary>
+    /// Invoked once when the backend starts, handing the debugger the means to
+    /// arm execution breakpoints. Called before any frame runs.
+    /// </summary>
+    void OnAttach(ICpuBreakpointController breakpoints);
+
+    /// <summary>
+    /// Invoked on the guest thread that hit an armed execution breakpoint, with
+    /// the frame positioned at <paramref name="address"/> - the trap byte is
+    /// already removed and the instruction pointer rewound, so the frame shows
+    /// the state the guest is about to execute from. As with
+    /// <see cref="OnFrameEnter"/>, the implementation may block to present a
+    /// break; execution resumes at that address when it returns.
+    /// </summary>
+    void OnBreakpoint(ICpuDebugFrame frame, ulong address);
 }

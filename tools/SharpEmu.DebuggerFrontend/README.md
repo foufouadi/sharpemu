@@ -69,9 +69,10 @@ Useful options:
 - Raw JSON command console for new protocol operations
 - Searchable activity stream containing requests, replies, and async events
 
-The debugger currently stops and steps at guest frame boundaries. Data
-watchpoints and per-instruction stepping are exposed in the protocol but depend
-on future CPU backend hooks, as documented in `docs/debugger-server.md`.
+The debugger stops at guest frame boundaries and at execution breakpoints on
+any guest address. Data watchpoints and per-instruction stepping are exposed in
+the protocol but depend on future CPU backend hooks, as documented in
+`docs/debugger-server.md`.
 
 ## Test
 
