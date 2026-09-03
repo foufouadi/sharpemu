@@ -48,12 +48,14 @@ public static class KernelPthreadExtendedCompatExports
         CpuContext ctx,
         ulong attrAddress,
         out int priority,
-        out ulong affinityMask)
+        out ulong affinityMask,
+        out ulong stackSize)
     {
         if (attrAddress == 0)
         {
             priority = DefaultThreadPriority;
             affinityMask = DefaultThreadAffinityMask;
+            stackSize = DefaultStackSize;
             return;
         }
 
@@ -63,6 +65,7 @@ public static class KernelPthreadExtendedCompatExports
             var attributes = GetOrCreateAttrStateLocked(resolvedAddress);
             priority = attributes.SchedPriority;
             affinityMask = attributes.AffinityMask;
+            stackSize = attributes.StackSize;
         }
     }
 

@@ -209,7 +209,8 @@ public static class KernelExports
             ctx,
             attrAddress,
             out var priority,
-            out var affinityMask);
+            out var affinityMask,
+            out var requestedStackSize);
         KernelPthreadExtendedCompatExports.RegisterThreadStart(
             threadHandle,
             name,
@@ -238,7 +239,8 @@ public static class KernelExports
                 attrAddress,
                 name,
                 priority,
-                affinityMask);
+                affinityMask,
+                requestedStackSize);
             if (!scheduler.TryStartThread(ctx, request, out var error))
             {
                 Console.Error.WriteLine(

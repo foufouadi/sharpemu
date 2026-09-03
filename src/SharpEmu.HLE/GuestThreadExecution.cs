@@ -12,7 +12,10 @@ public readonly record struct GuestThreadStartRequest(
     ulong AttributeAddress,
     string Name,
     int Priority,
-    ulong AffinityMask);
+    ulong AffinityMask,
+    // Stack the guest asked for through its pthread attribute. Zero means it
+    // expressed no preference and the backend picks its default.
+    ulong StackSize = 0);
 
 public readonly record struct GuestThreadSnapshot(
     ulong ThreadHandle,

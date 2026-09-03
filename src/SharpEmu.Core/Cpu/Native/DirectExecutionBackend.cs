@@ -156,6 +156,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly ulong GuestThreadTlsBaseAddress = OperatingSystem.IsWindows() ? 0x7FFE_0000_0000UL : 0x6FFE_0000_0000UL;
 
 	private const ulong GuestThreadStackSize = 0x0020_0000UL;
+	// Headroom added on top of whatever stack the guest asked for. The emulator
+	// spends guest stack the console would not: import trampolines, the
+	// dispatcher, and exception handling all push frames onto it, so a title
+	// that sized its stack for real hardware overflows here. KytyPS5 adds the
+	// same allowance (PTHREAD_STACK_EXTRA in kernel/pthread.cpp) whenever it is
+	// the one allocating the stack.
+	private const ulong GuestThreadStackHeadroom = 0x0010_0000UL;
 
 	private const ulong GuestThreadTlsSize = 0x0001_0000UL;
 
@@ -5555,7 +5562,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = "creator context memory is not backed by IVirtualMemory";
 			return false;
 		}
-		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, GuestThreadStackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
+		// Honour the size the guest asked for. This used to map a fixed region
+		// regardless, so a thread requesting more than the default wrote past
+		// the end of its stack: Unity's graphics workers fault this way.
+		var stackSize = request.StackSize == 0
+			? GuestThreadStackSize
+			: AlignUp(request.StackSize + GuestThreadStackHeadroom, 0x1000UL);
+		if (stackSize < GuestThreadStackSize)
+		{
+			stackSize = GuestThreadStackSize;
+		}
+
+		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, stackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
 		{
 			return false;
 		}
@@ -5572,7 +5590,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			FsBase = tlsBase,
 			GsBase = tlsBase,
 		};
-		context[CpuRegister.Rsp] = stackBase + GuestThreadStackSize - sizeof(ulong);
+		context[CpuRegister.Rsp] = stackBase + stackSize - sizeof(ulong);
 		context[CpuRegister.Rdi] = request.Argument;
 		context[CpuRegister.Rsi] = 0;
 		context[CpuRegister.Rdx] = 0;
@@ -5595,7 +5613,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			AffinityMask = request.AffinityMask,
 			Context = context,
 			StackBase = stackBase,
-			StackSize = GuestThreadStackSize,
+			StackSize = stackSize,
 			State = GuestThreadRunState.Ready,
 		};
 		error = null;
