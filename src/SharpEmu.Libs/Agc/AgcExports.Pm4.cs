@@ -1382,7 +1382,7 @@ public static partial class AgcExports
         TraceAgc(
             $"agc.dcb.packet dw={dwordOffset} addr=0x{packetAddress:X16} header=0x{header:X8} len={length} op=0x{op:X2} reg=0x{register:X2}");
 
-        var payloadCount = Math.Min(length - 1, 32u);
+        var payloadCount = _traceAgcPacketPayload ? Math.Min(length - 1, 32u) : 0u;
         for (uint i = 0; i < payloadCount; i++)
         {
             if (!TryReadUInt32(ctx, packetAddress + ((ulong)(i + 1) * sizeof(uint)), out var value))

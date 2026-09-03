@@ -237,6 +237,15 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    // The per-dword payload dump is the single largest source of volume in an
+    // AGC trace -- it outnumbers every other line by roughly two to one, and
+    // the slowdown it costs can keep a run from ever reaching the state being
+    // investigated. Keep the one-line packet header under SHARPEMU_LOG_AGC and
+    // make the dwords themselves opt-in.
+    private static readonly bool _traceAgcPacketPayload = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_PAYLOAD"),
+        "1",
+        StringComparison.Ordinal);
     private static readonly bool _traceAgcShader =
         _traceAgc ||
         string.Equals(
