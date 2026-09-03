@@ -1503,6 +1503,20 @@ public static class Gen5ShaderTranslator
             0x368 => "VCvtPknormI16F32",
             0x369 => "VCvtPknormU16F32",
             0x36A => "VCvtPkU16U32",
+            // gfx10 groups the 16-bit integer VALU ops here, just below the
+            // 32-bit add/sub. Names cross-checked against Kyty's
+            // VectorAluOps table.
+            0x303 => "VAddNcU16",
+            0x304 => "VSubNcU16",
+            0x307 => "VLshrrevB16",
+            0x308 => "VAshrrevI16",
+            0x309 => "VMaxU16",
+            0x30A => "VMaxI16",
+            0x30B => "VMinU16",
+            0x30C => "VMinI16",
+            0x30D => "VAddNcI16",
+            0x30E => "VSubNcI16",
+            0x314 => "VLshlrevB16",
             0x345 => "VXadU32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",

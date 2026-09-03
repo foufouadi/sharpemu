@@ -644,6 +644,38 @@ public static partial class Gen5SpirvTranslator
                 case "VLshrB32":
                     result = EmitIntegerBinary(instruction, SpirvOp.ShiftRightLogical);
                     break;
+                case "VAddNcU16":
+                case "VAddNcI16":
+                    result = EmitInteger16Binary(instruction, destination, SpirvOp.IAdd);
+                    break;
+                case "VSubNcU16":
+                case "VSubNcI16":
+                    result = EmitInteger16Binary(instruction, destination, SpirvOp.ISub);
+                    break;
+                case "VLshlrevB16":
+                    result = EmitInteger16Shift(
+                        instruction, destination, SpirvOp.ShiftLeftLogical, signed: false);
+                    break;
+                case "VLshrrevB16":
+                    result = EmitInteger16Shift(
+                        instruction, destination, SpirvOp.ShiftRightLogical, signed: false);
+                    break;
+                case "VAshrrevI16":
+                    result = EmitInteger16Shift(
+                        instruction, destination, SpirvOp.ShiftRightArithmetic, signed: true);
+                    break;
+                case "VMinU16":
+                    result = EmitInteger16Extremum(instruction, destination, 38, signed: false);
+                    break;
+                case "VMaxU16":
+                    result = EmitInteger16Extremum(instruction, destination, 41, signed: false);
+                    break;
+                case "VMinI16":
+                    result = EmitInteger16Extremum(instruction, destination, 39, signed: true);
+                    break;
+                case "VMaxI16":
+                    result = EmitInteger16Extremum(instruction, destination, 42, signed: true);
+                    break;
                 case "VLshrrevB32":
                     result = EmitIntegerBinary(
                         instruction,
@@ -3597,6 +3629,93 @@ public static partial class Gen5SpirvTranslator
                 register + 1,
                 _module.AddInstruction(SpirvOp.UConvert, _uintType, high));
         }
+
+        // 16-bit integer VALU. Mirrors the f16 path: each source half is chosen
+        // by its op_sel bit, the result is computed in 32 bits, and only the
+        // destination half selected by op_sel[3] is written so the other half
+        // of the VGPR survives.
+        private uint GetInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool signed)
+        {
+            var raw = GetRawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            var half = instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0
+                ? ShiftRightLogical(raw, UInt(16))
+                : raw;
+            if (!signed)
+            {
+                return BitwiseAnd(half, UInt(0xFFFF));
+            }
+
+            // Sign-extend bit 15 so a 32-bit compare or shift behaves like the
+            // 16-bit one the guest asked for.
+            var shifted = ShiftLeftLogical(half, UInt(16));
+            return ShiftRightArithmetic(shifted, UInt(16));
+        }
+
+        private uint EmitInteger16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint value)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var half = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(
+                    BitwiseAnd(current, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(half, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(current, UInt(0xFFFF_0000)),
+                    half);
+        }
+
+        private uint EmitInteger16Binary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            SpirvOp operation) =>
+            EmitInteger16Result(
+                instruction,
+                destination,
+                _module.AddInstruction(
+                    operation,
+                    _uintType,
+                    GetInteger16Source(instruction, 0, signed: false),
+                    GetInteger16Source(instruction, 1, signed: false)));
+
+        // The reverse forms take the shift amount in src0, masked to 4 bits.
+        private uint EmitInteger16Shift(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            SpirvOp operation,
+            bool signed) =>
+            EmitInteger16Result(
+                instruction,
+                destination,
+                _module.AddInstruction(
+                    operation,
+                    _uintType,
+                    GetInteger16Source(instruction, 1, signed),
+                    BitwiseAnd(GetInteger16Source(instruction, 0, signed: false), UInt(15))));
+
+        private uint EmitInteger16Extremum(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint glslOperation,
+            bool signed) =>
+            EmitInteger16Result(
+                instruction,
+                destination,
+                Ext(
+                    glslOperation,
+                    _uintType,
+                    GetInteger16Source(instruction, 0, signed),
+                    GetInteger16Source(instruction, 1, signed)));
 
         private uint EmitFloat16Binary(
             Gen5ShaderInstruction instruction,
