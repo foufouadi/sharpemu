@@ -2070,6 +2070,18 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
+    /// <summary>
+    /// The POSIX-named alias of <see cref="KernelUnlink"/>. libKernel exports
+    /// one routine under both names, and middleware built against plain POSIX
+    /// headers links this one.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "unlink",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixUnlink(CpuContext ctx) => KernelUnlink(ctx);
+
     [SysAbiExport(
         Nid = "1-LFLmRFxxM",
         ExportName = "sceKernelMkdir",

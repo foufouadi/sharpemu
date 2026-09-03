@@ -644,6 +644,42 @@ public static class PadExports
         return ctx.SetReturn(0);
     }
 
+    /// <summary>
+    /// Clears the accumulated orientation of the pad's motion sensor. The host
+    /// input layer exposes no orientation to reset, so the request is accepted:
+    /// a title that calls this while centring its camera would otherwise take
+    /// an error for a working controller.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "rIZnR6eSpvk",
+        ExportName = "scePadResetOrientation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadResetOrientation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
+    /// <summary>
+    /// Whether the pad is a remote-play controller rather than a local one.
+    /// The host input layer only ever presents a local pad, so this is false.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "fCWdlnmB1Ks",
+        ExportName = "scePadIsRemoteController",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadIsRemoteController(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
     private static bool WriteNeutralPadData(CpuContext ctx, ulong dataAddress)
     {
         Span<byte> data = stackalloc byte[PadDataSize];

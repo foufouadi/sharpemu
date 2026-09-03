@@ -292,6 +292,19 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PosixPthreadYield(CpuContext ctx) => PthreadYield(ctx);
 
+    /// <summary>
+    /// The third name libKernel exports the same routine under. Titles that
+    /// spin-wait call it from the loop body, so leaving it unresolved does not
+    /// merely skip a hint: the loop never yields and burns a core. Cult of the
+    /// Lamb issued it 84,207 times in one minute of startup.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "6XG4B33N09g",
+        ExportName = "sched_yield",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SchedYield(CpuContext ctx) => PthreadYield(ctx);
+
     [SysAbiExport(
         Nid = "GBUY7ywdULE",
         ExportName = "scePthreadRename",
