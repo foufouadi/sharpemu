@@ -281,7 +281,17 @@ public static class KernelPthreadCompatExports
     public static int PthreadYield(CpuContext ctx)
     {
         _ = ctx;
-        Thread.Yield();
+        // Thread.Yield is SwitchToThread, which only considers threads ready on
+        // the current processor and returns false when there are none - leaving
+        // a guest spin-wait burning that core. Sleep(0) yields to any
+        // equal-priority thread on any processor. KytyPS5 makes exactly this
+        // distinction on Windows (SchedulerBackoffOnce in kernel/pthread.cpp)
+        // and falls through the same way.
+        if (!Thread.Yield())
+        {
+            Thread.Sleep(0);
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
