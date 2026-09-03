@@ -240,7 +240,6 @@ public static class VideoOutExports
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
         public List<FlipEventRegistration> VblankEvents { get; } = new();
-        public List<FlipEventRegistration> OutputModeEvents { get; } = new();
         public long OpenTimestamp;
         public long LastVblankTimestamp;
     }
@@ -395,7 +394,7 @@ public static class VideoOutExports
         var handle = unchecked((int)ctx[CpuRegister.Rsi]);
         var userData = ctx[CpuRegister.Rdx];
 
-        if (!TryGetPort(handle, out var port))
+        if (!TryGetPort(handle, out _))
         {
             return OrbisVideoOutErrorInvalidHandle;
         }
@@ -405,24 +404,28 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidEventQueue;
         }
 
-        lock (_stateGate)
+        // Unlike flip and vblank, this event reports a state rather than an
+        // occurrence: the output mode is already settled when the guest asks
+        // about it. The registration therefore starts out triggered, carrying
+        // the current mode, so a title that parks on its equeue waiting for
+        // the answer gets one instead of waiting for a transition that the
+        // host never makes. No export can change the mode, so neither a
+        // per-port mode nor a registry of listeners would ever be read --
+        // reintroduce both alongside sceVideoOutSetOutputMode, not before it.
+        if (!KernelEventQueueCompatExports.TriggerDisplayEvent(
+                equeue,
+                SceVideoOutInternalEventSetMode,
+                OrbisKernelEventFilterVideoOut,
+                SceVideoOutOutputModeDefault << 16,
+                userData))
         {
-            var existingIndex = port.OutputModeEvents.FindIndex(
-                registration => registration.Equeue == equeue);
-            var registration = new FlipEventRegistration(equeue, userData);
-            if (existingIndex >= 0)
-            {
-                port.OutputModeEvents[existingIndex] = registration;
-            }
-            else
-            {
-                port.OutputModeEvents.Add(registration);
-            }
+            return OrbisVideoOutErrorInvalidEventQueue;
         }
 
         TraceVideoOut(
             $"videoout.add_output_mode_event eq=0x{equeue:X16} " +
-            $"handle={handle} udata=0x{userData:X16}");
+            $"handle={handle} udata=0x{userData:X16} " +
+            $"mode={SceVideoOutOutputModeDefault}");
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1050,7 +1053,8 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidEvent;
         }
 
-        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank.
+        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank,
+        // 8 = output mode.
         if (ident == SceVideoOutInternalEventFlip)
         {
             return 0;

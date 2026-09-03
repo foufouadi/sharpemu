@@ -13,6 +13,8 @@ public sealed class VideoOutOutputSupportTests
     private const string AddOutputModeEventNid = "kmSe30JTs+E";
     private const string CreateEqueueNid = "D0OdFMjp46I";
     private const string DeleteEqueueNid = "jpFjmgAC5AE";
+    private const string WaitEqueueNid = "fzyMKs9kim0";
+    private const string GetEventIdNid = "U2JJtSqNKZI";
     private const string OutputSupportNid = "Nv8c-Kb+DUM";
     private const ulong MemoryBase = 0x1_0000_0000;
     private const ulong OptionsAddress = MemoryBase + 0x100;
@@ -85,7 +87,7 @@ public sealed class VideoOutOutputSupportTests
     }
 
     [Fact]
-    public void Gen5AddOutputModeEventRegistersOnLiveEqueue()
+    public void Gen5AddOutputModeEventDeliversCurrentModeImmediately()
     {
         var manager = new ModuleManager();
         manager.RegisterExports(
@@ -124,6 +126,38 @@ public sealed class VideoOutOutputSupportTests
             Assert.Equal(
                 (ulong)(int)OrbisGen2Result.ORBIS_GEN2_OK,
                 context[CpuRegister.Rax]);
+
+            // The mode is already settled, so the registration must arrive on
+            // the queue triggered. A guest that parks here waiting for the
+            // answer would otherwise never be woken.
+            const ulong eventAddress = MemoryBase + 0x200;
+            const ulong outCountAddress = MemoryBase + 0x240;
+            // A zero timeout makes this a poll: if the registration did not
+            // arrive triggered the call returns ETIMEDOUT instead of parking.
+            const ulong timeoutAddress = MemoryBase + 0x260;
+            Assert.True(context.TryWriteUInt32(timeoutAddress, 0));
+            context[CpuRegister.Rdi] = equeue;
+            context[CpuRegister.Rsi] = eventAddress;
+            context[CpuRegister.Rdx] = 1;
+            context[CpuRegister.Rcx] = outCountAddress;
+            context[CpuRegister.R8] = timeoutAddress;
+            Assert.True(manager.TryDispatch(WaitEqueueNid, context, out _));
+            Assert.Equal(
+                (ulong)(int)OrbisGen2Result.ORBIS_GEN2_OK,
+                context[CpuRegister.Rax]);
+            Assert.True(context.TryReadUInt32(outCountAddress, out var delivered));
+            Assert.Equal(1u, delivered);
+
+            context[CpuRegister.Rdi] = eventAddress;
+            Assert.True(manager.TryDispatch(GetEventIdNid, context, out _));
+            Assert.Equal(8UL, context[CpuRegister.Rax]);
+
+            Assert.True(context.TryReadUInt64(eventAddress + 0x18, out var udata));
+            Assert.Equal(0x8074B0F78UL, udata);
+
+            // The payload above bit 16 is the mode the guest asked about.
+            Assert.True(context.TryReadUInt64(eventAddress + 0x10, out var data));
+            Assert.Equal(1UL, data >> 16);
         }
         finally
         {
