@@ -58,6 +58,63 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
     }
 
+    [Fact]
+    public void Vop3FmaF16DecodesAndCompiles()
+    {
+        // Silent Hill: The Short Message reported "Vop3Raw34B: unsupported
+        // vector opcode" from a composite pixel shader. 0x34B is v_fma_f16,
+        // which has no VOP2 form and so only ever appears VOP3-encoded.
+        var program = Decode(
+        [
+            0xD34B0003, // v_fma_f16 v3, v1, v2, v3
+            0x040E0501,
+            SEndpgm,
+        ]);
+
+        Assert.Equal(
+            ["VFmaF16", "SEndpgm"],
+            program.Instructions.Select(instruction => instruction.Opcode));
+        Assert.True(TryCompile(program, out var shader, out var error), error);
+        Assert.Contains((ushort)SpirvOp.ExtInst, ReadOpcodes(shader!.Spirv));
+    }
+
+    [Fact]
+    public void PackedF16ReadsADwordLiteralAsTwoLanes()
+    {
+        // The same title multiplies by an f16 constant carried as a dword
+        // literal. A literal is a 32-bit source like any other here: its two
+        // halves are the two lanes, chosen by op_sel / op_sel_hi. Refusing it
+        // failed the whole shader over an operand the hardware reads plainly.
+        var program = Decode(
+        [
+            0xCC100003, // v_pk_mul_f16 v3, lit, v1
+            0x000202FF,
+            0x00002C00, // low lane 0.0625, high lane 0
+            SEndpgm,
+        ]);
+
+        Assert.Equal(
+            ["VPkMulF16", "SEndpgm"],
+            program.Instructions.Select(instruction => instruction.Opcode));
+        Assert.True(TryCompile(program, out _, out var error), error);
+    }
+
+    private static bool TryCompile(
+        Gen5ShaderProgram program,
+        out Gen5SpirvShader? shader,
+        out string error)
+    {
+        var scalarRegisters = new uint[256];
+        return Gen5SpirvTranslator.TryCompileComputeShader(
+            new Gen5ShaderState(program, [], null),
+            new Gen5ShaderEvaluation(scalarRegisters, scalarRegisters, [], []),
+            1,
+            1,
+            1,
+            out shader,
+            out error);
+    }
+
     private static Gen5ShaderProgram Decode(IReadOnlyList<uint> words)
     {
         var memory = new TestCpuMemory(ShaderAddress, words.Count * sizeof(uint));

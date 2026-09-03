@@ -377,6 +377,17 @@ public static partial class Gen5SpirvTranslator
                 case "VMaxF16":
                     result = EmitFloat16ExtBinary(instruction, destination, 40);
                     break;
+                case "VFmaF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            50,
+                            _floatType,
+                            GetFloat16Source(instruction, 0),
+                            GetFloat16Source(instruction, 1),
+                            GetFloat16Source(instruction, 2)));
+                    break;
                 case "VRcpF16":
                     result = EmitFloat16Result(
                         instruction,
@@ -1290,24 +1301,11 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var sourceCount = instruction.Opcode is "VPkFmaF16" or "VPkFmacF16" ? 3 : 2;
-            for (var index = 0; index < sourceCount; index++)
-            {
-                var source = instruction.Sources[index];
-                // Inline constants read like any other 32-bit source here: the
-                // op_sel half of their bit pattern is the f16 lane, which is how
-                // Kyty's ReadF16LaneAsF32 treats everything but a float inline
-                // constant (handled in EmitPackedF16Operand). A literal is the
-                // one encoding whose packed halves are not defined for VOP3P,
-                // so it keeps failing loudly.
-                if (source.Kind is Gen5OperandKind.LiteralConstant)
-                {
-                    error =
-                        $"unsupported vop3p operand {source} for {instruction.Opcode} (literal constant)";
-                    return false;
-                }
-            }
-
+            // Every source is read as a packed pair of f16 lanes selected by
+            // op_sel / op_sel_hi, and that includes a dword literal: the two
+            // halves of its bit pattern are the two lanes, exactly as for a
+            // register. The one exception is a float inline constant, which is
+            // a single f32 value; EmitPackedF16Operand narrows that one.
             var low = EmitPackedF16Lane(instruction, control, highLane: false);
             var high = EmitPackedF16Lane(instruction, control, highLane: true);
             result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));

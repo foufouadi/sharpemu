@@ -199,6 +199,10 @@ public static partial class Gen5MslTranslator
                     instruction,
                     destination,
                     $"fmax({F16(instruction, 0)}, {F16(instruction, 1)})"),
+                "VFmaF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fma({F16(instruction, 0)}, {F16(instruction, 1)}, {F16(instruction, 2)})"),
                 "VRcpF16" => Float16Result(
                     instruction, destination, $"(1.0f / {F16(instruction, 0)})"),
                 "VSqrtF16" => Float16Result(

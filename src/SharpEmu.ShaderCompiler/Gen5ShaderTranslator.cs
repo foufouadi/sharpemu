@@ -1540,6 +1540,9 @@ public static class Gen5ShaderTranslator
             0x345 => "VXadU32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
+            // The f16 fused multiply-add has no VOP2 form, so unlike the rest
+            // of the f16 arithmetic it only ever appears here.
+            0x34B => "VFmaF16",
             0x36D => "VAdd3U32",
             0x36F => "VLshlOrU32",
             0x371 => "VAndOrB32",
