@@ -878,11 +878,10 @@ public static partial class AgcExports
             // been reset for reuse) is released using that produced value. Only
             // fires for genuinely wedged waits, so fast-resolving ones on working
             // titles are untouched.
-            var deadlockNowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            var deadlockBroken = GpuWaitRegistry.CollectCircularComputeBreaks(
-                ctx.Memory, deadlockNowTicks, _gpuDeadlockBreakTicks) ??
-                GpuWaitRegistry.CollectDeadlockBroken(
-                    ctx.Memory, deadlockNowTicks, _gpuDeadlockBreakTicks);
+            var deadlockBroken = GpuWaitRegistry.CollectDeadlockBroken(
+                ctx.Memory,
+                System.Diagnostics.Stopwatch.GetTimestamp(),
+                _gpuDeadlockBreakTicks);
             if (deadlockBroken is not null)
             {
                 foreach (var waiter in deadlockBroken)
