@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Cpu.Debugging;
 
@@ -18,6 +19,13 @@ namespace SharpEmu.Core.Cpu.Debugging;
 public sealed class ExecutionBreakpointTable
 {
     public const byte TrapByte = 0xCC;
+
+    // Writable page protections. A guest code page is mapped executable and
+    // writable, so the trap can be planted without changing protection.
+    private const uint PageReadWrite = 0x04;
+    private const uint PageWriteCopy = 0x08;
+    private const uint PageExecuteReadWrite = 0x40;
+    private const uint PageExecuteWriteCopy = 0x80;
 
     private readonly ConcurrentDictionary<ulong, byte> _armed = new();
     private readonly object _gate = new();
@@ -42,27 +50,28 @@ public sealed class ExecutionBreakpointTable
                 return true;
             }
 
-            byte original;
-            try
+            // The page has to be checked, not tried. Writing to an unmapped
+            // guest address raises AccessViolationException, which .NET treats
+            // as a corrupted-state exception and does not deliver to an
+            // ordinary catch: the process simply dies. Arming a breakpoint at
+            // attach time, before the module carrying it is mapped, is exactly
+            // that case.
+            if (!IsWritable(address, out error))
             {
-                var slot = (byte*)address;
-                original = *slot;
-                if (original == TrapByte)
-                {
-                    // A trap that is not ours. Recording 0xCC as the byte to
-                    // restore would leave it in place forever.
-                    error = $"0x{address:X16} already holds a trap byte";
-                    return false;
-                }
-
-                *slot = TrapByte;
-            }
-            catch (Exception exception)
-            {
-                error = $"0x{address:X16} is not writable: {exception.Message}";
                 return false;
             }
 
+            var slot = (byte*)address;
+            var original = *slot;
+            if (original == TrapByte)
+            {
+                // A trap that is not ours. Recording 0xCC as the byte to
+                // restore would leave it in place forever.
+                error = $"0x{address:X16} already holds a trap byte";
+                return false;
+            }
+
+            *slot = TrapByte;
             _armed[address] = original;
             return true;
         }
@@ -77,14 +86,11 @@ public sealed class ExecutionBreakpointTable
                 return false;
             }
 
-            try
+            // The module may have been unmapped since. The record is gone
+            // either way, which is what disarming has to guarantee.
+            if (IsWritable(address, out _))
             {
                 *(byte*)address = original;
-            }
-            catch
-            {
-                // The page went away with its module. The record is gone either
-                // way, which is what disarming has to guarantee.
             }
 
             return true;
@@ -100,7 +106,8 @@ public sealed class ExecutionBreakpointTable
     {
         lock (_gate)
         {
-            if (!_armed.TryGetValue(address, out var original))
+            if (!_armed.TryGetValue(address, out var original) ||
+                !IsWritable(address, out _))
             {
                 return false;
             }
@@ -115,10 +122,35 @@ public sealed class ExecutionBreakpointTable
     {
         lock (_gate)
         {
-            if (_armed.ContainsKey(address))
+            if (_armed.ContainsKey(address) && IsWritable(address, out _))
             {
                 *(byte*)address = TrapByte;
             }
         }
+    }
+
+    private static unsafe bool IsWritable(ulong address, out string error)
+    {
+        error = string.Empty;
+        if (HostMemory.Query((void*)address, out var info) == 0)
+        {
+            error = $"0x{address:X16} is not mapped";
+            return false;
+        }
+
+        if (info.State != HostMemory.MEM_COMMIT)
+        {
+            error = $"0x{address:X16} is reserved but not committed";
+            return false;
+        }
+
+        if (info.Protect is not (PageReadWrite or PageWriteCopy or
+            PageExecuteReadWrite or PageExecuteWriteCopy))
+        {
+            error = $"0x{address:X16} is not writable (protect=0x{info.Protect:X})";
+            return false;
+        }
+
+        return true;
     }
 }

@@ -51,6 +51,13 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
     /// </summary>
     private ICpuBreakpointController? _breakpointController;
 
+    /// <summary>
+    /// Execute breakpoints requested for addresses that were not mapped yet.
+    /// A client can ask for a break in a module the loader has not reached, so
+    /// arming is retried at every frame boundary rather than failing once.
+    /// </summary>
+    private readonly HashSet<ulong> _pendingExecutionBreakpoints = [];
+
     public ICpuDebugHook Hook => this;
 
     public event EventHandler<DebugStopEvent>? Stopped;
@@ -83,6 +90,7 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
 
     void ICpuDebugHook.OnFrameEnter(ICpuDebugFrame frame)
     {
+        RetryPendingExecutionBreakpoints();
         DebugStopEvent? stop;
         lock (_sync)
         {
@@ -166,6 +174,30 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
         }
     }
 
+    /// <summary>
+    /// Re-arms breakpoints whose address was not mapped when they were
+    /// requested. Each module initializer is a frame, so this converges as the
+    /// loader brings modules in.
+    /// </summary>
+    private void RetryPendingExecutionBreakpoints()
+    {
+        ulong[] pending;
+        lock (_sync)
+        {
+            if (_pendingExecutionBreakpoints.Count == 0)
+            {
+                return;
+            }
+
+            pending = [.. _pendingExecutionBreakpoints];
+        }
+
+        foreach (var address in pending)
+        {
+            ArmExecutionBreakpoint(address);
+        }
+    }
+
     void ICpuDebugHook.OnAttach(ICpuBreakpointController breakpoints)
     {
         lock (_sync)
@@ -207,8 +239,20 @@ public sealed class DebuggerSession : IDebuggerSession, ICpuDebugHook
 
         if (!controller.TryArmExecutionBreakpoint(address, out error))
         {
-            Log.Warn($"Could not arm breakpoint at 0x{address:X16}: {error}");
+            // Most often the module carrying this address is not mapped yet.
+            // Keep it and retry as frames arrive.
+            lock (_sync)
+            {
+                _pendingExecutionBreakpoints.Add(address);
+            }
+
+            Log.Warn($"Could not arm breakpoint at 0x{address:X16} yet: {error}");
             return false;
+        }
+
+        lock (_sync)
+        {
+            _pendingExecutionBreakpoints.Remove(address);
         }
 
         return true;
