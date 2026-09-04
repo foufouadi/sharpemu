@@ -268,6 +268,7 @@ public static partial class Gen5SpirvTranslator
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
         private readonly uint[] _pixelInputCntl;
+        private readonly int _programmedPixelInputCntl;
         private readonly ulong _storageBufferOffsetAlignment;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
@@ -444,6 +445,10 @@ public static partial class Gen5SpirvTranslator
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
             _pixelInputCntl = new uint[32];
+            // Slots the guest did not program are filled with a synthetic
+            // identity mapping. Only the ones it did program carry meaningful
+            // USE_DEFAULT / DEFAULT_VAL bits, so remember how far that goes.
+            _programmedPixelInputCntl = Math.Min(pixelInputCntl?.Count ?? 0, 32);
             for (uint i = 0; i < 32u; i++)
             {
                 _pixelInputCntl[i] = pixelInputCntl is not null && i < (uint)pixelInputCntl.Count
@@ -1400,7 +1405,8 @@ public static partial class Gen5SpirvTranslator
                     var cntl = attribute < (uint)_pixelInputCntl.Length
                         ? _pixelInputCntl[attribute]
                         : attribute;
-                    if ((cntl & PixelInputUseDefault) != 0)
+                    if (attribute < (uint)_programmedPixelInputCntl &&
+                        (cntl & PixelInputUseDefault) != 0)
                     {
                         _pixelInputDefaults[attribute] =
                             (cntl >> PixelInputDefaultValueShift) & 0x3u;

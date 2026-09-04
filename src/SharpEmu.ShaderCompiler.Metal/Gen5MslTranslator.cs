@@ -260,6 +260,7 @@ public static partial class Gen5MslTranslator
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
         private readonly uint[] _pixelInputCntl;
+        private readonly int _programmedPixelInputCntl;
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
         private readonly List<(bool IsStorage, string ComponentKind)> _imageKinds = [];
@@ -312,6 +313,10 @@ public static partial class Gen5MslTranslator
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
             _pixelInputCntl = new uint[32];
+            // Slots the guest did not program are filled with a synthetic
+            // identity mapping. Only the ones it did program carry meaningful
+            // USE_DEFAULT / DEFAULT_VAL bits, so remember how far that goes.
+            _programmedPixelInputCntl = Math.Min(pixelInputCntl?.Count ?? 0, 32);
             for (uint i = 0; i < 32u; i++)
             {
                 _pixelInputCntl[i] = pixelInputCntl is not null && i < (uint)pixelInputCntl.Count
@@ -627,7 +632,8 @@ public static partial class Gen5MslTranslator
                     var cntl = attribute < (uint)_pixelInputCntl.Length
                         ? _pixelInputCntl[attribute]
                         : attribute;
-                    if ((cntl & PixelInputUseDefault) != 0)
+                    if (attribute < (uint)_programmedPixelInputCntl &&
+                        (cntl & PixelInputUseDefault) != 0)
                     {
                         _pixelInputDefaults[attribute] =
                             (cntl >> PixelInputDefaultValueShift) & 0x3u;
