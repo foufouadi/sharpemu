@@ -271,6 +271,10 @@ public static partial class Gen5SpirvTranslator
         private readonly ulong _storageBufferOffsetAlignment;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
+        // Attributes the vertex stage never exports: SPI_PS_INPUT_CNTL says to
+        // feed them a constant, so they hold a DEFAULT_VAL code instead of an
+        // input variable id.
+        private readonly Dictionary<uint, uint> _pixelInputDefaults = [];
         private readonly Dictionary<uint, SpirvPixelOutput> _pixelOutputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
         private readonly Dictionary<uint, SpirvVertexInput> _vertexInputsByPc = [];
@@ -1391,19 +1395,26 @@ public static partial class Gen5SpirvTranslator
                 for (var index = 0; index < attributes.Length; index++)
                 {
                     var attribute = attributes[index];
-                    var variable = _module.AddGlobalVariable(
-                        inputVec4Pointer,
-                        SpirvStorageClass.Input);
                     // VINTRP ATTR selects the PS input slot. SPI_PS_INPUT_CNTL
                     // maps that slot to a VS parameter export location.
                     var cntl = attribute < (uint)_pixelInputCntl.Length
                         ? _pixelInputCntl[attribute]
                         : attribute;
+                    if ((cntl & PixelInputUseDefault) != 0)
+                    {
+                        _pixelInputDefaults[attribute] =
+                            (cntl >> PixelInputDefaultValueShift) & 0x3u;
+                        continue;
+                    }
+
+                    var variable = _module.AddGlobalVariable(
+                        inputVec4Pointer,
+                        SpirvStorageClass.Input);
                     _module.AddDecoration(
                         variable,
                         SpirvDecoration.Location,
                         locations[index]);
-                    if ((cntl & 0x400u) != 0)
+                    if ((cntl & PixelInputFlatShade) != 0)
                     {
                         _module.AddDecoration(variable, SpirvDecoration.Flat);
                     }
@@ -2705,8 +2716,25 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             if (_stage != Gen5SpirvStage.Pixel ||
-                !_pixelInputs.TryGetValue(interpolation.Attribute, out var input) ||
                 !TryGetVectorDestination(instruction, out var destination))
+            {
+                error = "invalid interpolated attribute";
+                return false;
+            }
+
+            if (_pixelInputDefaults.TryGetValue(
+                    interpolation.Attribute,
+                    out var defaultValue))
+            {
+                StoreV(
+                    destination,
+                    Bitcast(
+                        _uintType,
+                        PixelInputDefault(defaultValue, interpolation.Channel)));
+                return true;
+            }
+
+            if (!_pixelInputs.TryGetValue(interpolation.Attribute, out var input))
             {
                 error = "invalid interpolated attribute";
                 return false;
@@ -6030,6 +6058,23 @@ public static partial class Gen5SpirvTranslator
         private uint UInt(uint value) => _module.Constant(_uintType, value);
 
         private uint Float(float value) => _module.ConstantFloat(_floatType, value);
+
+        // SPI_PS_INPUT_CNTL. USE_DEFAULT says the vertex stage exports no
+        // parameter for this slot; DEFAULT_VAL then picks the constant the
+        // hardware substitutes. (ATTR1's own pair of fields, bits 20 and
+        // 21-22, only applies to the packed-f16 interpolants this translator
+        // does not split apart yet.)
+        private const uint PixelInputUseDefault = 0x20u;
+        private const int PixelInputDefaultValueShift = 8;
+        private const uint PixelInputFlatShade = 0x400u;
+
+        // The four DEFAULT_VAL codes are (0,0,0,0), (0,0,0,1), (1,1,1,0) and
+        // (1,1,1,1): bit 0 drives w, bit 1 drives x, y and z.
+        private uint PixelInputDefault(uint defaultValue, uint channel)
+        {
+            var bit = channel == 3 ? defaultValue & 0x1u : (defaultValue >> 1) & 0x1u;
+            return Float(bit != 0 ? 1f : 0f);
+        }
 
         private uint Bitcast(uint type, uint value) =>
             _module.AddInstruction(SpirvOp.Bitcast, type, value);

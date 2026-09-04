@@ -870,7 +870,8 @@ public static partial class Gen5MslTranslator
         {
             error = string.Empty;
             if (_stage != Gen5MslStage.Pixel ||
-                !_pixelAttributes.Contains(interpolation.Attribute) ||
+                (!_pixelAttributes.Contains(interpolation.Attribute) &&
+                 !_pixelInputDefaults.ContainsKey(interpolation.Attribute)) ||
                 instruction.Destinations.Count == 0 ||
                 instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister)
             {
@@ -878,10 +879,36 @@ public static partial class Gen5MslTranslator
                 return false;
             }
 
+            if (_pixelInputDefaults.TryGetValue(
+                    interpolation.Attribute,
+                    out var defaultValue))
+            {
+                StoreVector(
+                    instruction.Destinations[0].Value,
+                    AsUInt(PixelInputDefault(defaultValue, interpolation.Channel)));
+                return true;
+            }
+
             StoreVector(
                 instruction.Destinations[0].Value,
                 AsUInt($"sharpemu_in.attr{interpolation.Attribute}[{interpolation.Channel}]"));
             return true;
+        }
+
+        // SPI_PS_INPUT_CNTL. USE_DEFAULT says the vertex stage exports no
+        // parameter for this slot; DEFAULT_VAL then picks the constant the
+        // hardware substitutes, one of (0,0,0,0), (0,0,0,1), (1,1,1,0) or
+        // (1,1,1,1): bit 0 drives w, bit 1 drives x, y and z. (ATTR1's own
+        // pair of fields only applies to the packed-f16 interpolants this
+        // translator does not split apart yet.)
+        private const uint PixelInputUseDefault = 0x20u;
+        private const int PixelInputDefaultValueShift = 8;
+        private const uint PixelInputFlatShade = 0x400u;
+
+        private static string PixelInputDefault(uint defaultValue, uint channel)
+        {
+            var bit = channel == 3 ? defaultValue & 0x1u : (defaultValue >> 1) & 0x1u;
+            return bit != 0 ? "1.0f" : "0.0f";
         }
 
         /// <summary>

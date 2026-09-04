@@ -269,6 +269,10 @@ public static partial class Gen5MslTranslator
         private bool[] _imageBindingReads = [];
         private bool[] _imageBindingWrites = [];
         private readonly SortedSet<uint> _pixelAttributes = [];
+        // Attributes the vertex stage never exports: SPI_PS_INPUT_CNTL says to
+        // feed them a constant, so they carry a DEFAULT_VAL code instead of a
+        // stage-in varying.
+        private readonly Dictionary<uint, uint> _pixelInputDefaults = [];
         private readonly SortedSet<uint> _vertexOutputs = [];
         private readonly Dictionary<uint, Gen5VertexInputBinding> _vertexInputsByPc = [];
         private readonly int _requiredVertexOutputCount;
@@ -623,7 +627,14 @@ public static partial class Gen5MslTranslator
                     var cntl = attribute < (uint)_pixelInputCntl.Length
                         ? _pixelInputCntl[attribute]
                         : attribute;
-                    var flat = (cntl & 0x400u) != 0 ? ", flat" : string.Empty;
+                    if ((cntl & PixelInputUseDefault) != 0)
+                    {
+                        _pixelInputDefaults[attribute] =
+                            (cntl >> PixelInputDefaultValueShift) & 0x3u;
+                        continue;
+                    }
+
+                    var flat = (cntl & PixelInputFlatShade) != 0 ? ", flat" : string.Empty;
                     source.AppendLine(
                         $"    float4 attr{attribute} [[user(locn{locations[index]}){flat}]];");
                 }
