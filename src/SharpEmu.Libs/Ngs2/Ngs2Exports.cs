@@ -316,8 +316,9 @@ public static class Ngs2Exports
         }
     }
 
-    // Waveform-blocks param: the guest pointer at +8 references a "VAGp"
-    // (PS-ADPCM) container. Decode it once and arm the voice for playback.
+    // Waveform-blocks param: the guest pointer at +8 references either a
+    // "VAGp" (PS-ADPCM) container or a RIFF/WAVE one. Decode it once and arm
+    // the voice for playback.
     private static void ApplyWaveformParam(CpuContext ctx, ulong voiceHandle, ulong paramOffset)
     {
         if (!ctx.TryReadUInt64(paramOffset + 8, out var dataAddr) || dataAddr <= 0x10000)
@@ -335,19 +336,44 @@ public static class Ngs2Exports
             }
         }
 
+        // Read only what the container itself declares: a guest pointer says
+        // nothing about how much memory is really there.
         Span<byte> header = stackalloc byte[Ngs2VagDecoder.VagHeaderSize];
-        if (!ctx.Memory.TryRead(dataAddr, header) || !Ngs2VagDecoder.IsVag(header))
+        if (!ctx.Memory.TryRead(dataAddr, header))
         {
             return;
         }
 
-        var declaredSize = (int)BinaryPrimitives.ReadUInt32BigEndian(header[0x0C..]);
-        var totalBytes = Ngs2VagDecoder.VagHeaderSize + Math.Clamp(declaredSize, 0, 8 * 1024 * 1024);
+        int totalBytes;
+        bool isRiff;
+        if (Ngs2VagDecoder.IsVag(header))
+        {
+            var declaredSize = (int)BinaryPrimitives.ReadUInt32BigEndian(header[0x0C..]);
+            totalBytes = Ngs2VagDecoder.VagHeaderSize +
+                Math.Clamp(declaredSize, 0, 8 * 1024 * 1024);
+            isRiff = false;
+        }
+        else if (Ngs2RiffDecoder.TryGetTotalSize(header, out totalBytes))
+        {
+            isRiff = true;
+        }
+        else
+        {
+            return;
+        }
+
         var raw = System.Buffers.ArrayPool<byte>.Shared.Rent(totalBytes);
         try
         {
-            if (!ctx.Memory.TryRead(dataAddr, raw.AsSpan(0, totalBytes)) ||
-                !Ngs2VagDecoder.TryDecode(raw.AsSpan(0, totalBytes), out var waveform))
+            if (!ctx.Memory.TryRead(dataAddr, raw.AsSpan(0, totalBytes)))
+            {
+                return;
+            }
+
+            var decoded = isRiff
+                ? Ngs2RiffDecoder.TryDecode(raw.AsSpan(0, totalBytes), out var waveform)
+                : Ngs2VagDecoder.TryDecode(raw.AsSpan(0, totalBytes), out waveform);
+            if (!decoded)
             {
                 return;
             }
