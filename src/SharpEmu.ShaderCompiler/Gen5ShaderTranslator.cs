@@ -1379,6 +1379,9 @@ public static class Gen5ShaderTranslator
             0x95 => "VCmpxNeI32",
             0x96 => "VCmpxGeI32",
             0x97 => "VCmpxTI32",
+            // The exec-writing twin of 0x88. The SPIR-V and MSL emitters
+            // already handle it; only the decode was missing.
+            0x98 => "VCmpxClassF32",
             0xC0 => "VCmpFU32",
             0xC1 => "VCmpLtU32",
             0xC2 => "VCmpEqU32",

@@ -32,10 +32,7 @@ internal static class AudioPcmConversion
         for (var frame = 0; frame < frames; frame++)
         {
             var sourceFrame = source.Slice(frame * sourceFrameSize, sourceFrameSize);
-            var left = ReadSample(sourceFrame, 0, bytesPerSample, isFloat);
-            var right = channels == 1
-                ? left
-                : ReadSample(sourceFrame, 1, bytesPerSample, isFloat);
+            var (left, right) = DownmixFrame(sourceFrame, channels, bytesPerSample, isFloat);
             left = ApplyVolume(left, clampedVolume);
             right = ApplyVolume(right, clampedVolume);
             BinaryPrimitives.WriteInt16LittleEndian(destination[(frame * OutputFrameSize)..], left);
@@ -83,20 +80,71 @@ internal static class AudioPcmConversion
         }
     }
 
-    private static short ReadSample(
+    // Surround gain for the channels that fold into both sides. -3 dB is the
+    // usual coefficient: it keeps the summed power of a source panned to two
+    // speakers equal to the same source on one.
+    private const float SurroundGain = 0.7071068f;
+    // LFE is deliberately dropped rather than folded in. It carries content an
+    // octave below what most stereo playback reproduces, and summing it in at
+    // unity is what makes a downmix sound like it is clipping.
+    private const float LowFrequencyGain = 0.0f;
+
+    // Guest layouts, in the interleave order AudioOut submits:
+    //   1 channel  mono
+    //   2 channels front left, front right
+    //   6 channels front left, front right, centre, LFE, back left, back right
+    //   8 channels the same, then side left, side right
+    // Anything else falls back to the first two channels, which is what a
+    // layout we cannot name would have got anyway.
+    private static (short Left, short Right) DownmixFrame(
+        ReadOnlySpan<byte> frame,
+        int channels,
+        int bytesPerSample,
+        bool isFloat)
+    {
+        var left = ReadSampleFloat(frame, 0, bytesPerSample, isFloat);
+        if (channels == 1)
+        {
+            var mono = ConvertFloatSample(left);
+            return (mono, mono);
+        }
+
+        var right = ReadSampleFloat(frame, 1, bytesPerSample, isFloat);
+        if (channels is 6 or 8)
+        {
+            var centre = ReadSampleFloat(frame, 2, bytesPerSample, isFloat);
+            var lowFrequency = ReadSampleFloat(frame, 3, bytesPerSample, isFloat);
+            var backLeft = ReadSampleFloat(frame, 4, bytesPerSample, isFloat);
+            var backRight = ReadSampleFloat(frame, 5, bytesPerSample, isFloat);
+            var shared = (SurroundGain * centre) + (LowFrequencyGain * lowFrequency);
+            left += shared + (SurroundGain * backLeft);
+            right += shared + (SurroundGain * backRight);
+            if (channels == 8)
+            {
+                left += SurroundGain * ReadSampleFloat(frame, 6, bytesPerSample, isFloat);
+                right += SurroundGain * ReadSampleFloat(frame, 7, bytesPerSample, isFloat);
+            }
+        }
+
+        return (ConvertFloatSample(left), ConvertFloatSample(right));
+    }
+
+    private static float ReadSampleFloat(
         ReadOnlySpan<byte> frame,
         int channel,
         int bytesPerSample,
         bool isFloat)
     {
         var sample = frame.Slice(channel * bytesPerSample, bytesPerSample);
-        if (!isFloat)
+        if (isFloat)
         {
-            return BinaryPrimitives.ReadInt16LittleEndian(sample);
+            var bits = BinaryPrimitives.ReadInt32LittleEndian(sample);
+            var value = BitConverter.Int32BitsToSingle(bits);
+            return float.IsNaN(value) ? 0.0f : value;
         }
 
-        var bits = BinaryPrimitives.ReadInt32LittleEndian(sample);
-        return ConvertFloatSample(BitConverter.Int32BitsToSingle(bits));
+        var pcm = BinaryPrimitives.ReadInt16LittleEndian(sample);
+        return pcm / (pcm < 0 ? 32768.0f : short.MaxValue);
     }
 
     private static short ConvertFloatSample(float value)
