@@ -350,6 +350,34 @@ public static partial class AgcExports
                 (texture.IsFallback ? ":FALLBACK" : string.Empty)));
         var positions = string.Empty;
         var positionBuffer = vertexBuffers.FirstOrDefault(buffer => buffer.Location == 0);
+        // Where the position stream came from and what actually landed in it.
+        // A draw whose sampled positions read as garbage is either pointed at
+        // the wrong memory or reading it before the guest filled it, and only
+        // the source tells those apart.
+        var positionSource = "none";
+        if (positionBuffer is not null)
+        {
+            var span = positionBuffer.Data.AsSpan(
+                0,
+                Math.Clamp(positionBuffer.Length, 0, positionBuffer.Data.Length));
+            var nonzero = 0;
+            foreach (var value in span)
+            {
+                if (value != 0)
+                {
+                    nonzero++;
+                }
+            }
+
+            positionSource =
+                $"0x{positionBuffer.BaseAddress:X}+{positionBuffer.OffsetBytes}" +
+                $":{positionBuffer.Length}b/s{positionBuffer.Stride}" +
+                $":f{positionBuffer.DataFormat}/n{positionBuffer.NumberFormat}" +
+                $"/c{positionBuffer.ComponentCount}" +
+                $" nonzero={nonzero}/{span.Length}" +
+                (positionBuffer.Pooled ? " pooled" : string.Empty);
+        }
+
         if (positionBuffer is { Length: >= 8 })
         {
             var stride = Math.Max(positionBuffer.Stride, 4u);
@@ -378,6 +406,7 @@ public static partial class AgcExports
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
             $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
+            $"vb0={positionSource} " +
             $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
             $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
     }
