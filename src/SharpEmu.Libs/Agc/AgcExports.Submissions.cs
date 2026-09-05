@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
@@ -228,6 +228,11 @@ public static partial class AgcExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // How long a suspend point waits for the GPU to drain before giving up.
+    // Matches IndirectArgsFlushTimeoutMilliseconds, the other bounded GPU wait
+    // taken from a guest thread.
+    private const int SuspendPointDrainTimeoutMilliseconds = 250;
+
     [SysAbiExport(
         Nid = "h9z6+0hEydk",
         ExportName = "sceAgcSuspendPoint",
@@ -249,8 +254,17 @@ public static partial class AgcExports
         var sequence = GuestGpu.Current.SubmitOrderedGuestAction(
             static () => { },
             "agc.suspend_point");
-        if (sequence != 0 && !GuestGpu.Current.WaitForGuestWork(sequence))
+        if (sequence != 0 &&
+            !GuestGpu.Current.WaitForGuestWork(
+                sequence,
+                SuspendPointDrainTimeoutMilliseconds))
         {
+            // Bounded on purpose. The other infinite waits in this file run on
+            // the packet parser, where stalling stalls the parser; this one runs
+            // on a guest thread, so a GPU that never drains would freeze the
+            // title instead of merely delaying its suspend point. Report the
+            // overrun and return: a suspend point the system did not honour is
+            // recoverable, a hung guest thread is not.
             TraceAgc($"agc.suspend_point_wait_failed sequence={sequence}");
         }
         else
