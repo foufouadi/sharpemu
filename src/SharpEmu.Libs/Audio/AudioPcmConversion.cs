@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
@@ -88,6 +88,14 @@ internal static class AudioPcmConversion
     // octave below what most stereo playback reproduces, and summing it in at
     // unity is what makes a downmix sound like it is clipping.
     private const float LowFrequencyGain = 0.0f;
+    // Summing the folded channels at their own gain overshoots: one side of a
+    // 7.1 frame reaches 1 + 3 x 0.7071 = 3.12, and the conversion to PCM16
+    // clamps, so loud passages came out distorted rather than merely loud.
+    // Divide by the sum of the coefficients that side uses, which is what
+    // ffmpeg's downmix does by default (its "normalize" option) and what makes
+    // a full-scale input land exactly at full scale instead of past it.
+    private const float SurroundNormalize = 1.0f / (1.0f + (2.0f * SurroundGain));
+    private const float FullSurroundNormalize = 1.0f / (1.0f + (3.0f * SurroundGain));
 
     // Guest layouts, in the interleave order AudioOut submits:
     //   1 channel  mono
@@ -119,11 +127,16 @@ internal static class AudioPcmConversion
             var shared = (SurroundGain * centre) + (LowFrequencyGain * lowFrequency);
             left += shared + (SurroundGain * backLeft);
             right += shared + (SurroundGain * backRight);
+            var normalize = SurroundNormalize;
             if (channels == 8)
             {
                 left += SurroundGain * ReadSampleFloat(frame, 6, bytesPerSample, isFloat);
                 right += SurroundGain * ReadSampleFloat(frame, 7, bytesPerSample, isFloat);
+                normalize = FullSurroundNormalize;
             }
+
+            left *= normalize;
+            right *= normalize;
         }
 
         return (ConvertFloatSample(left), ConvertFloatSample(right));

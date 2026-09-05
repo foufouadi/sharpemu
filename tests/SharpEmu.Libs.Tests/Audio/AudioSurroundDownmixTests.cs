@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
@@ -14,6 +14,14 @@ namespace SharpEmu.Libs.Tests.Audio;
 public sealed class AudioSurroundDownmixTests
 {
     private const float SurroundGain = 0.7071068f;
+    // The folded result is divided by the sum of the coefficients that side
+    // uses, so a full-scale input lands at full scale instead of three times
+    // past it. 5.1 folds centre and one back channel; 7.1 adds a side channel.
+    private const float SurroundNormalize = 1.0f / (1.0f + (2.0f * SurroundGain));
+    private const float FullSurroundNormalize = 1.0f / (1.0f + (3.0f * SurroundGain));
+
+    private static float Normalize(int channels) =>
+        channels == 8 ? FullSurroundNormalize : SurroundNormalize;
 
     [Theory]
     [InlineData(6)]
@@ -26,7 +34,7 @@ public sealed class AudioSurroundDownmixTests
 
         var (left, right) = Convert(frame);
 
-        var expected = Quantize(SurroundGain * 0.5f);
+        var expected = Quantize(SurroundGain * 0.5f * Normalize(channels));
         Assert.Equal(expected, left);
         Assert.Equal(expected, right);
     }
@@ -41,7 +49,7 @@ public sealed class AudioSurroundDownmixTests
 
         var (left, right) = Convert(frame);
 
-        Assert.Equal(Quantize(SurroundGain * 0.5f), left);
+        Assert.Equal(Quantize(SurroundGain * 0.5f * Normalize(channels)), left);
         Assert.Equal(0, right);
     }
 
@@ -53,7 +61,7 @@ public sealed class AudioSurroundDownmixTests
 
         var (left, right) = Convert(frame);
 
-        Assert.Equal(Quantize(SurroundGain * 0.5f), left);
+        Assert.Equal(Quantize(SurroundGain * 0.5f * FullSurroundNormalize), left);
         Assert.Equal(0, right);
     }
 
@@ -91,18 +99,50 @@ public sealed class AudioSurroundDownmixTests
         Assert.Equal(Quantize(0.5f), right);
     }
 
-    [Fact]
-    public void SummedChannelsClampInsteadOfWrapping()
+    [Theory]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void EveryFoldedChannelAtFullScaleLandsExactlyAtFullScale(int channels)
     {
-        var frame = new float[8];
+        // Without the normalisation this side summed to 2.41 (5.1) or 3.12
+        // (7.1) and the conversion clamped, so a loud passage came out
+        // distorted rather than loud. The whole point of dividing by the sum of
+        // the coefficients is that this case reaches the ceiling and no
+        // further.
+        var frame = new float[channels];
         frame[0] = 1.0f;
         frame[2] = 1.0f;
         frame[4] = 1.0f;
-        frame[6] = 1.0f;
+        if (channels == 8)
+        {
+            frame[6] = 1.0f;
+        }
 
         var (left, _) = Convert(frame);
 
         Assert.Equal(short.MaxValue, left);
+    }
+
+    [Theory]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void HalfScaleOnEveryFoldedChannelStaysBelowTheCeiling(int channels)
+    {
+        // The companion to the case above: clamping at full scale is only
+        // meaningful if the level below it is not clamped too. Pinned so a
+        // normalisation that is merely a hard limiter would fail here.
+        var frame = new float[channels];
+        frame[0] = 0.5f;
+        frame[2] = 0.5f;
+        frame[4] = 0.5f;
+        if (channels == 8)
+        {
+            frame[6] = 0.5f;
+        }
+
+        var (left, _) = Convert(frame);
+
+        Assert.Equal(Quantize(0.5f), left);
     }
 
     private static short Quantize(float value)
