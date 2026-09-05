@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
@@ -57,9 +57,12 @@ public static class ImeExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    // Size of OrbisImeKeyboardInfo. Not derived from a published header; it is
-    // the extent this stub clears.
-    private const int KeyboardInfoBytes = 0x88;
+    // sizeof(OrbisImeKeyboardInfo): userId, device, type, repeatDelay,
+    // repeatRate and status, then twelve reserved bytes. KytyPS5 pins the same
+    // layout with static_assert(sizeof(KeyboardInfo) == 0x24) in libs/ime.h.
+    // This has to be the real size, not an upper bound: the caller usually
+    // passes a stack structure, so clearing further would erase its frame.
+    private const int KeyboardInfoBytes = 0x24;
 
     [SysAbiExport(
         Nid = "dKadqZFgKKQ",
