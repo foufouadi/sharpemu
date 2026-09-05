@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
@@ -163,6 +163,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// same allowance (PTHREAD_STACK_EXTRA in kernel/pthread.cpp) whenever it is
 	// the one allocating the stack.
 	private const ulong GuestThreadStackHeadroom = 0x0010_0000UL;
+	// Ceiling on the size a guest may ask for. scePthreadAttrSetstacksize
+	// stores whatever the title writes without validating it, so an attribute
+	// that was never initialised - or one read back from freed memory - would
+	// otherwise become a mapping request of that size. No real thread stack
+	// approaches this, and the region stride leaves room for it.
+	private const ulong GuestThreadStackSizeLimit = 0x0400_0000UL;
 
 	private const ulong GuestThreadTlsSize = 0x0001_0000UL;
 
@@ -5578,9 +5584,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// Honour the size the guest asked for. This used to map a fixed region
 		// regardless, so a thread requesting more than the default wrote past
 		// the end of its stack: Unity's graphics workers fault this way.
-		var stackSize = request.StackSize == 0
+		var requestedStackSize = request.StackSize;
+		if (requestedStackSize > GuestThreadStackSizeLimit)
+		{
+			Console.Error.WriteLine(
+				$"[cpu] guest thread requested a {requestedStackSize:X} byte stack; " +
+				$"capping at {GuestThreadStackSizeLimit:X}");
+			requestedStackSize = GuestThreadStackSizeLimit;
+		}
+
+		var stackSize = requestedStackSize == 0
 			? GuestThreadStackSize
-			: AlignUp(request.StackSize + GuestThreadStackHeadroom, 0x1000UL);
+			: AlignUp(requestedStackSize + GuestThreadStackHeadroom, 0x1000UL);
 		if (stackSize < GuestThreadStackSize)
 		{
 			stackSize = GuestThreadStackSize;
