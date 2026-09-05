@@ -259,14 +259,10 @@ public sealed class Gen5ScalarSsa
 
         var state = (IrScalarValue[])_entryState[blockIndex].Clone();
         var range = _graphRange(blockIndex);
-        foreach (var instruction in _instructions)
+        for (var index = FirstIndexAtOrAfter(range.StartPc); index < _instructions.Count; index++)
         {
-            if (instruction.Pc < range.StartPc || instruction.Pc >= range.EndPc)
-            {
-                continue;
-            }
-
-            if (instruction.Pc >= pc)
+            var instruction = _instructions[index];
+            if (instruction.Pc >= range.EndPc || instruction.Pc >= pc)
             {
                 break;
             }
@@ -275,6 +271,31 @@ public sealed class Gen5ScalarSsa
         }
 
         return state[register];
+    }
+
+    // Both walks used to scan the whole program and skip everything outside the
+    // block, which makes one lookup cost the length of the shader and a whole
+    // evaluation cost its square. Instructions are ordered by pc -- the existing
+    // break on pc already relied on that -- so the block's first instruction can
+    // be found directly.
+    private int FirstIndexAtOrAfter(uint pc)
+    {
+        var low = 0;
+        var high = _instructions.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) / 2);
+            if (_instructions[middle].Pc < pc)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        return low;
     }
 
     public IrReachingDefinition GetReachingDefinitionAt(uint pc, uint register)
@@ -286,14 +307,10 @@ public sealed class Gen5ScalarSsa
 
         var definitions = (IrReachingDefinition[])_entryDefinitions[blockIndex].Clone();
         var range = _graphRange(blockIndex);
-        foreach (var instruction in _instructions)
+        for (var index = FirstIndexAtOrAfter(range.StartPc); index < _instructions.Count; index++)
         {
-            if (instruction.Pc < range.StartPc || instruction.Pc >= range.EndPc)
-            {
-                continue;
-            }
-
-            if (instruction.Pc >= pc)
+            var instruction = _instructions[index];
+            if (instruction.Pc >= range.EndPc || instruction.Pc >= pc)
             {
                 break;
             }
