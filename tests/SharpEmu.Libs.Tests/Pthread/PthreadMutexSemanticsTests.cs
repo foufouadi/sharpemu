@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
@@ -26,7 +26,7 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
-    public void AdaptiveMutex_GuestOwnerWordDoesNotOverrideHleOwnership()
+    public void AdaptiveMutex_GuestTrackedSelfLockReturnsDeadlockAndSingleUnlockReleases()
     {
         const ulong memoryBase = 0x1_0001_0000;
         const ulong mutexAddress = memoryBase + 0x100;
@@ -40,12 +40,10 @@ public sealed class PthreadMutexSemanticsTests
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         Assert.True(context.TryWriteUInt64(mutexAddress + 8, currentThreadHandle));
         Assert.Equal(
-            0,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
             KernelPthreadCompatExports.PthreadMutexLock(context));
 
-        // The HLE state is the only ownership authority. A stale or
-        // implementation-specific guest word must not turn the adaptive
-        // wrapper's duplicate acquisition into a deadlock.
+        Assert.True(context.TryWriteUInt64(mutexAddress + 8, 0));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
@@ -79,7 +77,7 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
-    public void NormalMutex_SelfLockReturnsDeadlockWithoutExtraOwnership()
+    public void NormalMutex_SelfLockIsAcceptedSoUnrealTitlesBoot()
     {
         const ulong memoryBase = 0x1_0003_0000;
         const ulong attrAddress = memoryBase + 0x100;
@@ -96,11 +94,20 @@ public sealed class PthreadMutexSemanticsTests
         context[CpuRegister.Rsi] = attrAddress;
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
-        Assert.Equal(
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
-            KernelPthreadCompatExports.PthreadMutexLock(context));
+        // POSIX says a NORMAL mutex relocked by its owner deadlocks. Upstream
+        // #451 accepts it instead, because that deadlock is what kept several
+        // Unreal titles from booting. Pin the shipped behaviour so it is not
+        // quietly traded back for the standard one.
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
 
+        // Accepting the relock counts it, so the pair of locks needs a pair of
+        // unlocks before the mutex is free again.
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY,
+            KernelPthreadCompatExports.PthreadMutexTrylock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
