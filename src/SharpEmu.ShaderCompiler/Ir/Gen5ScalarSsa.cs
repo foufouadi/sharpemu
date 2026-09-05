@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Generic;
@@ -257,7 +257,8 @@ public sealed class Gen5ScalarSsa
             return IrScalarValue.Unknown;
         }
 
-        var state = (IrScalarValue[])_entryState[blockIndex].Clone();
+        var state = ScalarScratch;
+        _entryState[blockIndex].AsSpan().CopyTo(state);
         var range = _graphRange(blockIndex);
         for (var index = FirstIndexAtOrAfter(range.StartPc); index < _instructions.Count; index++)
         {
@@ -272,6 +273,25 @@ public sealed class Gen5ScalarSsa
 
         return state[register];
     }
+
+    // Both walks read exactly one register out of the state they rebuild, but
+    // they have to rebuild all of it to get there, and allocating a fresh
+    // 256-entry array per lookup put that allocation on the shader
+    // translator's hottest path. The walk is a local one - Apply and
+    // ApplyDefinitions are static and cannot re-enter these methods - so a
+    // buffer per thread is reused instead. Thread-static rather than shared
+    // because translation runs on several threads at once.
+    [ThreadStatic]
+    private static IrScalarValue[]? _scalarScratch;
+
+    [ThreadStatic]
+    private static IrReachingDefinition[]? _definitionScratch;
+
+    private static IrScalarValue[] ScalarScratch =>
+        _scalarScratch ??= new IrScalarValue[ScalarRegisterCount];
+
+    private static IrReachingDefinition[] DefinitionScratch =>
+        _definitionScratch ??= new IrReachingDefinition[ScalarRegisterCount];
 
     // Both walks used to scan the whole program and skip everything outside the
     // block, which makes one lookup cost the length of the shader and a whole
@@ -305,7 +325,8 @@ public sealed class Gen5ScalarSsa
             return IrReachingDefinition.None;
         }
 
-        var definitions = (IrReachingDefinition[])_entryDefinitions[blockIndex].Clone();
+        var definitions = DefinitionScratch;
+        _entryDefinitions[blockIndex].AsSpan().CopyTo(definitions);
         var range = _graphRange(blockIndex);
         for (var index = FirstIndexAtOrAfter(range.StartPc); index < _instructions.Count; index++)
         {
