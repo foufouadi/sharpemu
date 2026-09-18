@@ -213,7 +213,7 @@ internal sealed class ShaderProgramCache
         {
             if (!ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out var materializationFailure, captureIndirectImageFailure))
             {
-                var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16}.";
+                var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
                 if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
                     throw new ShaderProgramRejectedException(message);
                 throw SubmissionScheduler.Fatal(message);

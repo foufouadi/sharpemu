@@ -82,6 +82,7 @@ public static class ResourceMaterializer
 
         if (!BuildSpecialization(plan, materialized, out var nextSnapshot, out var nextSpecialization, out failure, captureIndirectImageFailure))
         {
+            Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at BuildSpecialization failure={failure}");
             return false;
         }
 
@@ -117,6 +118,7 @@ public static class ResourceMaterializer
             evaluateTable: true, out var values, out var table, out var activeSources,
             additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount)))
         {
+            Console.Error.WriteLine("[LOADER][WARN] materialize_snapshot_probe failed at top-level EvaluateSources");
             return false;
         }
 
@@ -141,7 +143,11 @@ public static class ResourceMaterializer
                 if (indirect.DirectCandidates is { } directCandidates)
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, directCandidates.Select(candidate => candidate.Source).ToArray(),
-                        cleanInputs, [], evaluateTable: false, out var descriptors, out _)) return false;
+                        cleanInputs, [], evaluateTable: false, out var descriptors, out _))
+                    {
+                        Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at directCandidates image={imageIndex}");
+                        return false;
+                    }
                     var directTable = new IndirectImageTable { Resource = (uint)imageIndex };
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
                     {
@@ -163,12 +169,14 @@ public static class ResourceMaterializer
                 }
                 if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _))
                 {
+                    Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at material/heap source image={imageIndex}");
                     return false;
                 }
 
                 if (!MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image.R128, inputs,
                     captureSelectorDiagnostic, out var indirectTable, out failure))
                 {
+                    Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at MaterializeIndirectImage image={imageIndex} failure={failure}");
                     return false;
                 }
 
@@ -553,7 +561,10 @@ public static class ResourceMaterializer
             {
                 images[index] = image with
                 {
-                    NumericClass = baseImage.Atomic ? ImageNumericClass.Uint : ImageNumericClass.Float,
+                    // A null-bound atomic keeps its declared numeric class
+                    // (Uint or, since float image atomics were added, Float)
+                    // instead of assuming every atomic image is Uint.
+                    NumericClass = baseImage.Atomic ? baseImage.NumericClass : ImageNumericClass.Float,
                     Dimension = ImageDimension.Dim2D,
                     Cube = false,
                 };
@@ -569,7 +580,14 @@ public static class ResourceMaterializer
             }
 
             var format = GuestImageFormat.FormatOf(descriptor);
-            if (baseImage.Atomic && format != GuestImageFormat.Format32Uint)
+            // Integer image atomics (Add/Smax/And/...) only ever operate on a
+            // 32-bit uint UAV. The float image atomics (Fmin/Fmax/Fcmpswap,
+            // MIMG op 0x1D-0x1F) are lowered as a compare-and-swap loop on the
+            // raw bit pattern (Gen5SpirvTranslator) and legitimately target a
+            // 32-bit float-format UAV instead - reject only formats that are
+            // neither.
+            if (baseImage.Atomic && format != GuestImageFormat.Format32Uint &&
+                GuestImageFormat.SampledNumericClass(format) != ImageNumericClass.Float)
             {
                 return Fail($"atomic image descriptor {index} uses unsupported format {format}");
             }
