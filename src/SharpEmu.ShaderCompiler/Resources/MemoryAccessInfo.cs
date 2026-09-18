@@ -91,6 +91,14 @@ public sealed class MemoryAccessInfo
     public bool OffsetEnabled { get; init; }
     public bool PlanningOnly { get; set; }
 
+    // Set when a raw (untyped, unformatted) buffer access reads its V# from a
+    // runtime scalar-memory address instead of naming a descriptor that can be
+    // bound ahead of time (e.g. a descriptor-array entry indexed by a loop
+    // counter). The SPIR-V backend then addresses the buffer through the
+    // device-address page table using the descriptor's runtime base, exactly
+    // like a Global access, and applies the descriptor's own byte bounds.
+    public bool RuntimeBufferDescriptor { get; set; }
+
     public bool IsAddressKind =>
         Kind is MemoryResourceKind.ScalarAddress or MemoryResourceKind.Flat or
             MemoryResourceKind.Global or MemoryResourceKind.Scratch;

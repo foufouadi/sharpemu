@@ -2115,6 +2115,12 @@ public static partial class Gen5SpirvTranslator
                 return TryEmitVertexInputFetch(control, vertexInput, out error);
             }
 
+            if (_request.Memory.TryGetIndex(instruction.Pc, 0, out var runtimeMemoryIndex) &&
+                _request.Memory[runtimeMemoryIndex].RuntimeBufferDescriptor)
+            {
+                return TryEmitRuntimeBufferMemory(instruction, control, out error);
+            }
+
             int bindingIndex;
             uint stride;
             uint descriptorWord3;

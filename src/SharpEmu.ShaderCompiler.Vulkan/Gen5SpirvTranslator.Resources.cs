@@ -869,6 +869,157 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        // A raw buffer access whose V# was read from a runtime scalar address. The
+        // descriptor dwords live in the SGPRs named by the instruction, so build the
+        // guest address from the runtime base and go through the device-address page
+        // table. num_records/stride bound the access, so a null or empty descriptor
+        // binds nothing, matching the static path's range check.
+        private bool TryEmitRuntimeBufferMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5BufferMemoryControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (control.Typed || instruction.Opcode.Contains("Format", StringComparison.Ordinal))
+            {
+                error = $"runtime buffer descriptor does not support the formatted access {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
+            {
+                error = $"runtime buffer descriptor does not support the atomic access {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Sources.Count < 2 ||
+                instruction.Sources[1].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = "runtime buffer descriptor has no scalar resource base";
+                return false;
+            }
+
+            var srsrc = instruction.Sources[1].Value;
+            var scalarOffset = instruction.Sources.Count > 2
+                ? GetRawSource(instruction, 2)
+                : UInt(0);
+            var vectorIndex = control.IndexEnabled ? LoadV(control.VectorAddress) : UInt(0);
+            var vectorOffset = control.OffsetEnabled
+                ? LoadV(control.VectorAddress + (control.IndexEnabled ? 1u : 0u))
+                : UInt(0);
+
+            var descriptorWord1 = LoadS(srsrc + 1);
+            var stride = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(16)), UInt(0x3FFF));
+            var byteOffset = IAdd(UInt(unchecked((uint)control.OffsetBytes)), scalarOffset);
+            byteOffset = IAdd(byteOffset, vectorOffset);
+            byteOffset = IAdd(
+                byteOffset,
+                _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
+
+            // size = stride == 0 ? num_records : stride * num_records, in bytes.
+            var records = LoadS(srsrc + 2);
+            var size = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, stride, UInt(0)),
+                records,
+                _module.AddInstruction(SpirvOp.IMul, _uintType, stride, records));
+
+            var dwordOffset = ShiftRightLogical(byteOffset, UInt(2));
+            var dwordSize = ShiftRightLogical(size, UInt(2));
+            var baseAddress = Pair64(
+                LoadS(srsrc),
+                BitwiseAnd(descriptorWord1, UInt(0xFFFF)));
+            var address = IAdd64(baseAddress, Widen(byteOffset));
+
+            uint InRange(uint index)
+            {
+                var dword = index == 0 ? dwordOffset : IAdd(dwordOffset, UInt(index));
+                return _module.AddInstruction(SpirvOp.ULessThan, _boolType, dword, dwordSize);
+            }
+
+            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreByte", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreShort", StringComparison.Ordinal))
+            {
+                EmitExecConditional(() =>
+                {
+                    if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                    {
+                        StoreDeviceBytes(
+                            address,
+                            LoadV(control.VectorData),
+                            byteCount,
+                            sourceShift,
+                            InRange(0));
+                        return;
+                    }
+
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        StoreDeviceDword(
+                            index == 0 ? address : IAdd64(address, ULong((ulong)index * sizeof(uint))),
+                            LoadV(control.VectorData + index),
+                            InRange(index));
+                    }
+                });
+                return true;
+            }
+
+            if (TryGetSubdwordLoadInfo(
+                    instruction.Opcode,
+                    out var loadByteCount,
+                    out var signExtend,
+                    out var d16,
+                    out var d16High))
+            {
+                StoreV(
+                    control.VectorData,
+                    LoadSubdwordDeviceValue(
+                        address,
+                        LoadV(control.VectorData),
+                        loadByteCount,
+                        signExtend,
+                        d16,
+                        d16High));
+                return true;
+            }
+
+            if (!instruction.Opcode.StartsWith("BufferLoad", StringComparison.Ordinal) &&
+                !instruction.Opcode.StartsWith("TBufferLoad", StringComparison.Ordinal))
+            {
+                error = $"unsupported runtime buffer opcode {instruction.Opcode}";
+                return false;
+            }
+
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                StoreV(
+                    control.VectorData + index,
+                    LoadBoundedDeviceDword(
+                        index == 0 ? address : IAdd64(address, ULong((ulong)index * sizeof(uint))),
+                        InRange(index)));
+            }
+
+            return true;
+        }
+
+        private uint LoadBoundedDeviceDword(uint address64, uint inRange)
+        {
+            var (pointer, valid) = ResolveDeviceAddress(address64);
+            Store(_deviceWordScratch, UInt(0));
+            EmitConditional(LogicalAnd(inRange, valid), () =>
+                Store(
+                    _deviceWordScratch,
+                    _module.AddInstruction(
+                        SpirvOp.Load,
+                        _uintType,
+                        DeviceWordPointer(pointer),
+                        2u,
+                        4u)));
+            return Load(_uintType, _deviceWordScratch);
+        }
+
         // ---- images ----
 
         // An access over several descriptors takes one constant-element case per descriptor:

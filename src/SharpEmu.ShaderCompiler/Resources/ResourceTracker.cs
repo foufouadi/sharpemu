@@ -308,6 +308,39 @@ public sealed partial class ResourceTracker
         return InternSource(source);
     }
 
+    // A runtime V# is one whose four dwords are each a raw scalar-memory word read
+    // at a dynamic (non-constant) offset. Constant-offset reads are materialized
+    // through the flattened resource table instead, so a handle built purely from
+    // them resolves normally and must keep the ordinary binding path.
+    private bool IsRuntimeDescriptorHandle(ScalarValue? handle)
+    {
+        if (handle is null || handle.Kind != ScalarValueKind.BufferHandle ||
+            handle.Operands.Length != 4)
+        {
+            return false;
+        }
+
+        var validator = new RuntimeValueValidator(
+            _graph,
+            _plan.UserDataBase,
+            _plan.UserDataCount,
+            _plan.TableReads.Count);
+        foreach (var operand in handle.Operands)
+        {
+            if (!validator.IsRawRead(operand))
+            {
+                return false;
+            }
+
+            if (operand.Operands.Length >= 2 && operand.Operands[1].IsConstant)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // ---- dense tables ----
 
     private static uint ByteExtent(MemoryAccessInfo memory)
@@ -490,6 +523,18 @@ public sealed partial class ResourceTracker
 
         if (isBuffer)
         {
+            // A V# whose dwords are all read from a runtime scalar-memory address
+            // (e.g. a descriptor-array entry indexed by a loop counter) cannot be
+            // bound ahead of time. Address it through the device-address page table
+            // using the descriptor's own runtime base, like a Global access, so the
+            // raw buffer access stays correct instead of failing to compile.
+            if (IsRuntimeDescriptorHandle(access.Handle))
+            {
+                memory.RuntimeBufferDescriptor = true;
+                _info.UsesDeviceAddresses = true;
+                return;
+            }
+
             var source = GetHandleSource(access.Handle, ScalarValueKind.BufferHandle, 4, memory.Pc);
             var resource = AddBuffer(source, memory, memory.Pc);
             if (resource == DescriptorConstants.NoIndex)
