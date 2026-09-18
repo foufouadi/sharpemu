@@ -799,6 +799,30 @@ public static partial class Gen5SpirvTranslator
                     result = ShiftLeftLogical(lowMask, GetRawSource(instruction, 1));
                     break;
                 }
+                case "VMadI32I24":
+                {
+                    // D = S0 * S1 + S2 with S0 and S1 taken as signed 24-bit
+                    // values; the product wraps in 32 bits before the add.
+                    var signedLeft = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        UInt(0),
+                        UInt(24));
+                    var signedRight = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)),
+                        UInt(0),
+                        UInt(24));
+                    var product = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        Bitcast(_uintType, signedLeft),
+                        Bitcast(_uintType, signedRight));
+                    result = IAdd(product, GetRawSource(instruction, 2));
+                    break;
+                }
                 case "VMadU32U24":
                 {
                     var left = BitwiseAnd(
