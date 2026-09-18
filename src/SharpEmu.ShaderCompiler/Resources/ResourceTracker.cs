@@ -217,12 +217,20 @@ public sealed partial class ResourceTracker
         }
     }
 
-    private bool ValidateSource(DescriptorSource source, out uint badDword)
+    private bool ValidateSource(DescriptorSource source, out uint badDword) => ValidateSource(source, out badDword, out _);
+
+    private bool ValidateSource(DescriptorSource source, out uint badDword, out bool controlDependent)
     {
+        controlDependent = false;
         for (badDword = 0; badDword < source.DwordCount; badDword++)
         {
             var dword = source.Dwords[badDword];
-            if (dword.Type != ScalarValueType.U32 || !_plan.ValidateRuntimeValue(dword))
+            if (dword.Type != ScalarValueType.U32)
+            {
+                return false;
+            }
+
+            if (!_plan.ValidateRuntimeValue(dword, out controlDependent))
             {
                 return false;
             }
@@ -273,9 +281,28 @@ public sealed partial class ResourceTracker
         // already handle ScalarBufferWord dwords generically (the same mechanism buffer
         // descriptors rely on via MaterializationSources), so let ValidateSource below be the
         // single source of truth instead of a narrower, ImageHandle-specific blanket ban.
-        if (!ValidateSource(source, out var badDword))
+        if (!ValidateSource(source, out var badDword, out var controlDependent))
         {
-            throw Failure(pc, $"{expected} dword {badDword} is not a valid runtime value");
+            // A bindless image/sampler descriptor whose dwords resolve through a
+            // control-dependent phi (e.g. a hash-table/linear-probe material lookup, as seen
+            // in Ghost of Yotei) has no single compile-time source: real support needs
+            // GPU-side dynamic descriptor indexing, which this resource tracker doesn't
+            // implement. Rather than fail shader recompilation outright, degrade to a null
+            // descriptor for that one access and let it read as a null/black texture,
+            // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
+            // descriptor). Buffer/sampler-adjacent handles or any other validation failure
+            // still hard-fail, since those aren't safe to silently zero.
+            if (controlDependent && expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
+            {
+                source = new DescriptorSource
+                {
+                    Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
+                };
+            }
+            else
+            {
+                throw Failure(pc, $"{expected} dword {badDword} is not a valid runtime value");
+            }
         }
 
         return InternSource(source);
