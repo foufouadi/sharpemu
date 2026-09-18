@@ -66,8 +66,12 @@ public sealed class BufferCandidateTablePlan
 
     public bool IsStaticallyBounded => Count >= 0;
 
+    // The byte distance between two consecutive candidates: the induction step times the
+    // descriptor stride.
+    public uint CandidateSpacing => unchecked(Step * Stride);
+
     // The byte offset of candidate index, valid only for a statically bounded table.
-    public uint StaticCandidateOffset(int index) => unchecked(MinOffset + (uint)index * Stride);
+    public uint StaticCandidateOffset(int index) => unchecked(MinOffset + (uint)index * CandidateSpacing);
 
     // The candidate count for a run-time limit, clamped to the cap. Returns -1 when the
     // limit is below the initial value (an empty loop) or overflows.

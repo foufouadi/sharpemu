@@ -138,4 +138,84 @@ public sealed class BufferCandidateTablePlannerTests
         Assert.Empty(plan.BufferCandidateTables);
         Assert.True(plan.Info.UsesDeviceAddresses);
     }
+
+    private static TestWordMemory CandidateMemory()
+    {
+        var memory = new TestWordMemory { Base = 0x3000, Words = new uint[0x2000 / 4], RequireAlignment = true };
+        for (var index = 0; index < 4; index++)
+        {
+            var address = 0x3000 + (ulong)index * 16;
+            memory.At(address + 0) = 0x4000u + (uint)index * 0x100;
+            memory.At(address + 4) = 16u << 16;
+            memory.At(address + 8) = 4;
+            memory.At(address + 12) = 0;
+        }
+
+        return memory;
+    }
+
+    [Fact]
+    public void CanonicalTable_MaterializesCandidatesTransactionally()
+    {
+        var plan = Extract(CandidateProgram());
+        var memory = CandidateMemory();
+        var inputs = Inputs([], readCleanMemory: memory.Read);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+
+        var table = Assert.Single(specialization.BufferCandidateTables);
+        Assert.Equal(4u, table.CandidateCount);
+        Assert.Equal(plan.Info.Buffers.Count + 4, specialization.Buffers.Count);
+        Assert.Equal(4u, snapshot.FlattenedResourceTable[(int)table.MappingOffset]);
+
+        var applied = ResourceMaterializer.ApplyTo(plan, specialization);
+        Assert.Equal(plan.Info.Buffers.Count + 4, applied.Info.Buffers.Count);
+        var info = Assert.Single(applied.Info.BufferCandidateTables);
+        Assert.Equal(4u, info.CandidateCount);
+        Assert.Equal((uint)plan.Info.Buffers.Count, info.FirstCandidate);
+
+        // One unreadable candidate must leave the previous snapshot and specialization intact.
+        var priorSnapshot = snapshot;
+        var priorSpecialization = specialization;
+        memory.FailAddress = 0x3004;
+        Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+        Assert.Same(priorSnapshot, snapshot);
+        Assert.Same(priorSpecialization, specialization);
+    }
+
+    [Fact]
+    public void IdenticalCandidatesShareOneBindingAndProbeKey()
+    {
+        var plan = Extract(CandidateProgram());
+        var memory = CandidateMemory();
+        for (var index = 1; index < 4; index++)
+        {
+            var address = 0x3000 + (ulong)index * 16;
+            memory.At(address + 0) = memory.At(0x3000);
+        }
+
+        var inputs = Inputs([], readCleanMemory: memory.Read);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+
+        var table = Assert.Single(specialization.BufferCandidateTables);
+        Assert.Equal(1u, table.CandidateCount);
+        Assert.Equal(1u, snapshot.FlattenedResourceTable[(int)table.MappingOffset]);
+    }
+
+    [Fact]
+    public void DistinctDescriptorsSharingAProbeKey_AreRejected()
+    {
+        var plan = Extract(CandidateProgram());
+        var memory = CandidateMemory();
+        memory.At(0x3010) = memory.At(0x3000);
+        memory.At(0x3018) = 8;
+
+        var inputs = Inputs([], readCleanMemory: memory.Read);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+    }
 }
