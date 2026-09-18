@@ -193,6 +193,7 @@ public enum SpirvCapability : uint
     Float16 = 9,
     Float64 = 10,
     Int64 = 11,
+    Int64Atomics = 12,
     Int16 = 22,
     ImageGatherExtended = 25,
     StorageImageExtendedFormats = 49,

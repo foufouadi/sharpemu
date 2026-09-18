@@ -121,6 +121,12 @@ public sealed class ShaderCompileRequest
     public uint WaveSize { get; init; } = 32;
     public uint ScratchDwords { get; init; }
     public bool EnableGraphicsSubgroupOperations { get; init; } = true;
+
+    // The device supports 64-bit integer atomics on workgroup memory
+    // (VkPhysicalDeviceFeatures.shaderSharedInt64Atomics). When set, the LDS
+    // 64-bit atomics are emitted as real 64-bit atomics instead of a pair of
+    // 32-bit ones, which is not atomic as a pair.
+    public bool SupportsSharedInt64Atomics { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];

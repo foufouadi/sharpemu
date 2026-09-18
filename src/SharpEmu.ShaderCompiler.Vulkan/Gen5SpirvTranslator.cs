@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Resources;
 
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
@@ -160,6 +161,7 @@ public static partial class Gen5SpirvTranslator
         private uint _storageUintPointer;
         private uint _lds;
         private uint _ldsElementPointer;
+        private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
         private uint _positionOutput;
         private uint _vertexIndexInput;
@@ -677,6 +679,7 @@ public static partial class Gen5SpirvTranslator
             var ldsArrayType = _module.TypeArray(_uintType, dwordCount);
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
             _ldsElementPointer = _module.TypePointer(storageClass, _uintType);
+            _lds64ElementPointer = _module.TypePointer(storageClass, _ulongType);
             _lds = storageClass == SpirvStorageClass.Workgroup
                 ? _module.AddGlobalVariable(ldsPointer, storageClass)
                 : _module.AddGlobalVariable(
@@ -1554,20 +1557,42 @@ public static partial class Gen5SpirvTranslator
                         return false;
                     }
 
-                    // LDS is modelled as an array of dwords, so a 64-bit atomic
-                    // is lowered to the two dword atomics that make it up.
-                    // Neither of these opcodes returns the old value, which is
-                    // what makes the split exact: only the final memory state is
-                    // observable, and both operations reconstruct it regardless
-                    // of the order concurrent lanes land in.
                     var atomicAddress = GetRawSource(instruction, 0);
+                    var isOr = instruction.Opcode == "DsOrB64";
+                    if (_request.SupportsSharedInt64Atomics)
+                    {
+                        // A true 64-bit shared atomic, exposed by Vulkan through
+                        // the Int64Atomics capability and shaderSharedInt64Atomics.
+                        // This is the only form atomic as a pair.
+                        _module.AddCapability(SpirvCapability.Int64Atomics);
+                        var widePointer = LdsPointer64(atomicAddress, control.SingleOffsetBytes);
+                        EmitExecConditional(() =>
+                        {
+                            var wideValue = Pair64(
+                                GetRawSource(instruction, 1),
+                                GetRawSource(instruction, 2));
+                            _module.AddInstruction(
+                                isOr ? SpirvOp.AtomicOr : SpirvOp.AtomicIAdd,
+                                _ulongType,
+                                widePointer,
+                                UInt(2),
+                                UInt(0x108),
+                                wideValue);
+                        });
+
+                        return true;
+                    }
+
+                    // Fallback when the device lacks shaderSharedInt64Atomics: two
+                    // 32-bit atomics. The final arithmetic result is exact without
+                    // contention, but the pair is not atomic against a concurrent
+                    // 64-bit update. Device setup warns once when this is used.
                     var lowPointer = LdsPointer(
                         atomicAddress,
                         control.SingleOffsetBytes);
                     var highPointer = LdsPointer(
                         atomicAddress,
                         control.SingleOffsetBytes + sizeof(uint));
-                    var isOr = instruction.Opcode == "DsOrB64";
                     EmitExecConditional(() =>
                     {
                         var lowValue = GetRawSource(instruction, 1);
@@ -1924,6 +1949,12 @@ public static partial class Gen5SpirvTranslator
                 index);
         }
 
+        // A 64-bit view of the same LDS bytes, for true 64-bit shared atomics.
+        // The dword index is even by the ISA's 8-byte alignment rule, so the
+        // bitcast only changes the pointee type, not the address.
+        private uint LdsPointer64(uint address, uint offsetBytes) =>
+            Bitcast(_lds64ElementPointer, LdsPointer(address, offsetBytes));
+
         private void StoreLds(uint pointer, uint value)
         {
             var active = Load(_boolType, _exec);
@@ -2115,10 +2146,25 @@ public static partial class Gen5SpirvTranslator
                 return TryEmitVertexInputFetch(control, vertexInput, out error);
             }
 
-            if (_request.Memory.TryGetIndex(instruction.Pc, 0, out var runtimeMemoryIndex) &&
-                _request.Memory[runtimeMemoryIndex].RuntimeBufferDescriptor)
+            if (_request.Memory.TryGetIndex(instruction.Pc, 0, out var accessMemoryIndex))
             {
-                return TryEmitRuntimeBufferMemory(instruction, control, out error);
+                var accessMemory = _request.Memory[accessMemoryIndex];
+                var strategy = accessMemory.BufferDescriptor?.ChooseStrategy(
+                        control.Typed,
+                        accessMemory.Formatted,
+                        accessMemory.Access == MemoryAccess.Atomic)
+                    ?? BufferLoweringStrategy.NativeBinding;
+                if (strategy == BufferLoweringStrategy.PhysicalStorageBuffer)
+                {
+                    return TryEmitPhysicalStorageBufferMemory(instruction, control, out error);
+                }
+
+                if (strategy == BufferLoweringStrategy.BoundedCandidateTable)
+                {
+                    error =
+                        $"runtime buffer descriptor with formatted/typed/atomic access needs candidate enumeration: {instruction.Opcode}";
+                    return false;
+                }
             }
 
             int bindingIndex;

@@ -618,9 +618,8 @@ public sealed partial class ResourceTracker
         {
             // A V# whose dwords are all read from a runtime scalar-memory address
             // (e.g. a descriptor-array entry indexed by a loop counter) cannot be
-            // bound ahead of time. Address it through the device-address page table
-            // using the descriptor's own runtime base, like a Global access, so the
-            // raw buffer access stays correct instead of failing to compile.
+            // bound ahead of time. Record it as a runtime guest descriptor so the
+            // backend can choose a lowering strategy for each access.
             if (IsRuntimeDescriptorHandle(access.Handle))
             {
                 // A formatted vector access can enumerate its bounded candidates; a scalar
@@ -632,11 +631,10 @@ public sealed partial class ResourceTracker
                 {
                     memory.BufferDescriptor = new GuestBufferDescriptor
                     {
-                    Provenance = BufferDescriptorProvenance.Runtime,
-                };
-                return;
+                        Provenance = BufferDescriptorProvenance.Runtime,
+                    };
+                    return;
                 }
-
                 memory.BufferDescriptor = new GuestBufferDescriptor
                 {
                     Provenance = BufferDescriptorProvenance.Runtime,
@@ -652,6 +650,11 @@ public sealed partial class ResourceTracker
                 throw Failure(memory.Pc, "buffer resource limit exceeded");
             }
 
+            memory.BufferDescriptor = new GuestBufferDescriptor
+            {
+                Provenance = BufferDescriptorProvenance.Static,
+                StaticResource = resource,
+            };
             AddMemoryPatch(index, resource, 0, false, memory.Pc);
             return;
         }

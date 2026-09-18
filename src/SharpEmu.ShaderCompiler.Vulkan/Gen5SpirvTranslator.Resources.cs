@@ -897,12 +897,15 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // A raw buffer access whose V# was read from a runtime scalar address. The
-        // descriptor dwords live in the SGPRs named by the instruction, so build the
-        // guest address from the runtime base and go through the device-address page
-        // table. num_records/stride bound the access, so a null or empty descriptor
-        // binds nothing, matching the static path's range check.
-        private bool TryEmitRuntimeBufferMemory(
+        // BufferLoweringStrategy.PhysicalStorageBuffer: a raw buffer access whose
+        // V# was read from a runtime scalar address. The descriptor dwords live in
+        // the SGPRs named by the instruction, so build the guest address from the
+        // runtime base and go through the device-address page table.
+        // num_records/stride bound the access, so a null or empty descriptor binds
+        // nothing, matching the static path's range check. Formatted/typed/atomic
+        // accesses never reach here; the chooser escalates them to
+        // BoundedCandidateTable.
+        private bool TryEmitPhysicalStorageBufferMemory(
             Gen5ShaderInstruction instruction,
             Gen5BufferMemoryControl control,
             out string error)

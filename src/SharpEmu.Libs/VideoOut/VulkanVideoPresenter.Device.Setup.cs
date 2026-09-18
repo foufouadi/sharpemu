@@ -687,6 +687,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     "translated shaders using double precision will fail.");
             }
 
+
+
             if (!supportedFeatures.VertexPipelineStoresAndAtomics || !supportedFeatures.FragmentStoresAndAtomics)
             {
                 Console.Error.WriteLine(
@@ -765,19 +767,33 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceBufferDeviceAddressFeatures,
                 PNext = &timelineSemaphoreFeatures,
             };
+            var atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
+            {
+                SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
+                PNext = &addressFeatures,
+            };
             var featuresQuery = new PhysicalDeviceFeatures2
             {
                 SType = StructureType.PhysicalDeviceFeatures2,
-                PNext = &addressFeatures,
+                PNext = &atomicInt64Features,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
             var supportsBufferDeviceAddress = addressFeatures.BufferDeviceAddress;
+            var supportsSharedInt64Atomics = atomicInt64Features.ShaderSharedInt64Atomics;
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
+            SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
+            if (!supportsSharedInt64Atomics)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support shaderSharedInt64Atomics " +
+                    "64-bit LDS atomics fall back to a non-atomic pair of 32-bit atomics.");
+            }
+
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var deviceProperties);
             var deviceName = SilkMarshal.PtrToString((nint)deviceProperties.DeviceName) ?? "unknown";
             RequireRenderingFeature(dynamicRenderingFeatures.DynamicRendering, DynamicRenderingExtensionName, deviceName);
@@ -888,6 +904,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     PNext = &timelineSemaphoreFeatures,
                 };
                 void* renderingChain = &addressFeatures;
+                if (supportsSharedInt64Atomics)
+                {
+                    atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
+                    {
+                        SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
+                        ShaderSharedInt64Atomics = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &atomicInt64Features;
+                }
+
                 if (_supportsDepthClipEnable)
                 {
                     depthClipEnableFeatures = new PhysicalDeviceDepthClipEnableFeaturesEXT

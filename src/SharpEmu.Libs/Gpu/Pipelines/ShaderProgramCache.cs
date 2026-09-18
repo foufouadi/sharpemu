@@ -457,6 +457,7 @@ internal sealed class ShaderProgramCache
         BindingLayout layout)
     {
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
+        var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -468,6 +469,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
+                    SupportsSharedInt64Atomics = sharedInt64Atomics,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                 };
@@ -484,6 +486,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
+                    SupportsSharedInt64Atomics = sharedInt64Atomics,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
                     PixelInputAddress = options.PixelInputAddress,
@@ -499,6 +502,7 @@ internal sealed class ShaderProgramCache
                     WaveSize = info.WaveSize,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
+                    SupportsSharedInt64Atomics = sharedInt64Atomics,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
