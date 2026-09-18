@@ -2131,26 +2131,39 @@ public static partial class Gen5SpirvTranslator
 
                 if (strategy == BufferLoweringStrategy.BoundedCandidateTable)
                 {
-                    error =
-                        $"runtime buffer descriptor with formatted/typed/atomic access needs candidate enumeration: {instruction.Opcode}";
-                    return false;
+                    return TryEmitBoundedCandidateTableMemory(instruction, control, accessMemoryIndex, out error);
                 }
             }
 
-            int bindingIndex;
-            uint stride;
-            uint descriptorWord3;
+            if (!TryResolveLayoutBuffer(instruction.Pc, out var bindingIndex, out _))
             {
-                // The dense buffer, its stride and its format come from the specialization.
-                if (!TryResolveLayoutBuffer(instruction.Pc, out bindingIndex, out var specialized))
-                {
-                    error = "missing buffer-memory binding";
-                    return false;
-                }
-
-                stride = UInt(specialized.PackedStride & 0x3FFF);
-                descriptorWord3 = UInt((specialized.DescriptorFormat << 12) | (specialized.DescriptorSwizzle & 0xFFF));
+                error = "missing buffer-memory binding";
+                return false;
             }
+
+            return EmitResolvedBufferMemory(instruction, control, bindingIndex, out error);
+        }
+
+        // One buffer operation against a resolved candidate binding: the dense binding path
+        // and every arm of a bounded candidate table share it, so the operation itself
+        // stays independent of how its descriptor was selected.
+        private bool EmitResolvedBufferMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5BufferMemoryControl control,
+            int bindingIndex,
+            out string error)
+        {
+            error = string.Empty;
+            var info = _request.Resources.Info;
+            if (bindingIndex < 0 || bindingIndex >= info.Buffers.Count)
+            {
+                error = $"buffer binding {bindingIndex} is out of range";
+                return false;
+            }
+
+            var specialized = info.Buffers[bindingIndex];
+            var stride = UInt(specialized.PackedStride & 0x3FFF);
+            var descriptorWord3 = UInt((specialized.DescriptorFormat << 12) | (specialized.DescriptorSwizzle & 0xFFF));
 
             var scalarOffset = instruction.Sources.Count > 2
                 ? GetRawSource(instruction, 2)
@@ -2304,6 +2317,98 @@ public static partial class Gen5SpirvTranslator
             }
 
             return true;
+        }
+
+        // BufferLoweringStrategy.BoundedCandidateTable: a runtime V# whose descriptors cannot
+        // be reconstructed from its raw words. The runtime V# sits in the scalar resource
+        // registers; its base-address dword is the probe key into the flattened candidate
+        // mapping, and each arm binds a native candidate and runs the ordinary buffer op.
+        private bool TryEmitBoundedCandidateTableMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5BufferMemoryControl control,
+            int memoryIndex,
+            out string error)
+        {
+            error = string.Empty;
+            if (!_request.BufferCandidateTableByMemoryIndex.TryGetValue(memoryIndex, out var table))
+            {
+                error = $"runtime buffer descriptor has no candidate table for {instruction.Opcode}";
+                return false;
+            }
+
+            if (table.CandidateCount == 0)
+            {
+                error = "runtime buffer descriptor candidate table is empty";
+                return false;
+            }
+
+            if (table.CandidateCount == 1)
+            {
+                return EmitResolvedBufferMemory(instruction, control, (int)table.FirstCandidate, out error);
+            }
+
+            if (!HasFlattenedTable)
+            {
+                error = "runtime buffer descriptor candidate table without a flattened table binding";
+                return false;
+            }
+
+            if (instruction.Sources.Count < 2 || instruction.Sources[1].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = "runtime buffer descriptor has no scalar resource base";
+                return false;
+            }
+
+            var probeKey = LoadS(instruction.Sources[1].Value);
+            var selector = SelectBufferCandidate(table, probeKey);
+            var emitted = true;
+            var caseError = string.Empty;
+            for (uint index = 0; index < table.CandidateCount && emitted; index++)
+            {
+                var candidate = table.FirstCandidate + index;
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt(index)), () =>
+                {
+                    if (!EmitResolvedBufferMemory(instruction, control, (int)candidate, out caseError))
+                    {
+                        emitted = false;
+                    }
+                });
+            }
+
+            error = caseError;
+            return emitted;
+        }
+
+        // Searches the sorted base-address mapping of a candidate table for the runtime V#'s
+        // probe key; the result is the candidate-local index, candidate 0 when absent.
+        private uint SelectBufferCandidate(BufferCandidateTableUse table, uint key)
+        {
+            var mapping = UInt(table.MappingOffset);
+            var count = LoadFlattenedWord(mapping);
+            var low = UInt(0);
+            var high = count;
+            for (uint iteration = 0; iteration < table.SearchIterations; iteration++)
+            {
+                var span = _module.AddInstruction(SpirvOp.ISub, _uintType, high, low);
+                var middle = IAdd(low, ShiftRightLogical(span, UInt(1)));
+                var probeSlot = IAdd(IAdd(mapping, UInt(1)), ShiftLeftLogical(middle, UInt(1)));
+                var probeKey = LoadFlattenedWord(probeSlot);
+                var moveUp = LogicalAnd(
+                    _module.AddInstruction(SpirvOp.ULessThan, _boolType, probeKey, key),
+                    _module.AddInstruction(SpirvOp.ULessThan, _boolType, low, high));
+                low = _module.AddInstruction(SpirvOp.Select, _uintType, moveUp, IAdd(middle, UInt(1)), low);
+                high = _module.AddInstruction(SpirvOp.Select, _uintType, moveUp, high, middle);
+            }
+
+            var foundSlot = IAdd(IAdd(mapping, UInt(1)), ShiftLeftLogical(low, UInt(1)));
+            var found = LogicalAnd(
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, low, count),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, LoadFlattenedWord(foundSlot), key));
+            var mapped = LoadFlattenedWord(IAdd(foundSlot, UInt(1)));
+            var inRange = LogicalAnd(
+                found,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, mapped, UInt(table.CandidateCount)));
+            return _module.AddInstruction(SpirvOp.Select, _uintType, inRange, mapped, UInt(0));
         }
 
         private void EmitBufferFormatLoad(
