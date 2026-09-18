@@ -623,7 +623,11 @@ public sealed partial class ResourceTracker
             // raw buffer access stays correct instead of failing to compile.
             if (IsRuntimeDescriptorHandle(access.Handle))
             {
-                if (BufferCandidateTablePlanner.TryPlan(_plan, access.Handle!, index, out var table) &&
+                // A formatted vector access can enumerate its bounded candidates; a scalar
+                // buffer read only needs the descriptor's base, which its SGPRs already
+                // hold, so it is addressed through the device-address page table.
+                if (memory.Kind == MemoryResourceKind.Buffer &&
+                    BufferCandidateTablePlanner.TryPlan(_plan, access.Handle!, index, out var table) &&
                     InternBufferCandidateTable(table, memory.Pc, index))
                 {
                     memory.BufferDescriptor = new GuestBufferDescriptor

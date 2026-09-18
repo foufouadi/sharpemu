@@ -20,6 +20,7 @@ internal static class BufferCandidateTablePlanner
             return false;
         }
 
+
         // Every dword must be the same-width scalar-buffer read at a shared dynamic offset,
         // with the component immediates 0,4,8,12 that one dwordx4 read produces.
         ScalarValue? srt = null;

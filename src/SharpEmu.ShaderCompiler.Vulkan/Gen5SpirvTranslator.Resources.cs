@@ -697,16 +697,44 @@ public static partial class Gen5SpirvTranslator
                 }
                 else if (entry.Kind == MemoryResourceKind.ScalarBuffer)
                 {
-                    if (entry.Resource == MemoryAccessInfo.NoResource)
+                    if (entry.Resource != MemoryAccessInfo.NoResource)
                     {
-                        error = "scalar buffer load has no dense buffer";
-                        return false;
+                        var bindingIndex = (int)entry.Resource;
+                        var byteAddress = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
+                        byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
+                        value = LoadBufferWord(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
                     }
+                    else
+                    {
+                        // A runtime SRT V#: its SGPRs hold the descriptor, so build the
+                        // guest address from the base and go through the device-address
+                        // page table, bounded by the descriptor's stride and record count.
+                        if (instruction.Sources.Count == 0 || instruction.Sources[0].Kind != Gen5OperandKind.ScalarRegister)
+                        {
+                            error = "runtime scalar buffer load has no scalar base";
+                            return false;
+                        }
 
-                    var bindingIndex = (int)entry.Resource;
-                    var byteAddress = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
-                    byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
-                    value = LoadBufferWord(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
+                        var baseRegister = instruction.Sources[0].Value;
+                        var descriptorWord1 = LoadS(baseRegister + 1);
+                        var stride = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(16)), UInt(0x3FFF));
+                        var records = LoadS(baseRegister + 2);
+                        var size = _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            _module.AddInstruction(SpirvOp.IEqual, _boolType, stride, UInt(0)),
+                            records,
+                            _module.AddInstruction(SpirvOp.IMul, _uintType, stride, records));
+                        var baseAddress = Pair64(LoadS(baseRegister), BitwiseAnd(descriptorWord1, UInt(0xFFFF)));
+                        var byteOffset = IAdd(dynamicOffset, UInt(unchecked((uint)control.ImmediateOffsetBytes + (uint)component * sizeof(uint))));
+                        var address = And64(IAdd64(baseAddress, Widen(byteOffset)), ULong(DeviceAddressMask & ~3ul));
+                        var inRange = _module.AddInstruction(
+                            SpirvOp.ULessThan,
+                            _boolType,
+                            ShiftRightLogical(byteOffset, UInt(2)),
+                            ShiftRightLogical(size, UInt(2)));
+                        value = LoadBoundedDeviceDword(address, inRange);
+                    }
                 }
                 else
                 {
