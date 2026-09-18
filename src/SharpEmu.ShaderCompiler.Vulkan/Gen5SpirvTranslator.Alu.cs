@@ -443,6 +443,21 @@ public static partial class Gen5SpirvTranslator
                         _uintType,
                         GetRawSource(instruction, 0));
                     break;
+                case "VFfbhU32":
+                {
+                    // RDNA reports the number of leading zero bits, with
+                    // 0xFFFFFFFF for a zero source. Reversing first lets the
+                    // GLSL FindILsb extended instruction provide both the
+                    // count and the architecturally required zero sentinel.
+                    var reversed = _module.AddInstruction(
+                        SpirvOp.BitReverse,
+                        _uintType,
+                        GetRawSource(instruction, 0));
+                    result = Bitcast(
+                        _uintType,
+                        Ext(73, _intType, Bitcast(_intType, reversed)));
+                    break;
+                }
                 case "VFfblB32":
                     result = Bitcast(
                         _uintType,
