@@ -589,8 +589,11 @@ public static partial class Gen5ShaderTranslator
             0x10 => "SBcnt1I32B64",
             0x13 => "SFF1I32B32",
             0x14 => "SFF1I32B64",
+            0x15 => "SFlbitI32B32",
             0x1B => "SBitset0B32",
+            0x1C => "SBitset0B64",
             0x1D => "SBitset1B32",
+            0x1E => "SBitset1B64",
             0x1F => "SGetpcB64",
             0x20 => "SSetpcB64",
             0x21 => "SSwappcB64",
@@ -605,6 +608,7 @@ public static partial class Gen5ShaderTranslator
             0x34 => "SAbsI32",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
+            0x3B => "SBitreplicateB64B32",
             0x3C => "SAndSaveexecB32",
             0x3D => "SOrSaveexecB32",
             0x3E => "SXorSaveexecB32",
@@ -1467,6 +1471,13 @@ public static partial class Gen5ShaderTranslator
             0x1A => "ImageAtomicXor",
             0x1B => "ImageAtomicInc",
             0x1C => "ImageAtomicDec",
+            // The float image atomics close the gfx10 atomic block. No
+            // backend emits them yet, so they still fail - but naming them
+            // lets the decoder finish the program, which is what makes the
+            // shader's bindings and global-memory usage visible in the trace.
+            0x1D => "ImageAtomicFcmpswap",
+            0x1E => "ImageAtomicFmin",
+            0x1F => "ImageAtomicFmax",
             0x20 => "ImageSample",
             0x22 => "ImageSampleD",
             0x24 => "ImageSampleL",
