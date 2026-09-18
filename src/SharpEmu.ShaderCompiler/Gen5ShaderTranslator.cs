@@ -914,6 +914,7 @@ public static partial class Gen5ShaderTranslator
             0x35 => "VMulF16",
             0x39 => "VMaxF16",
             0x3A => "VMinF16",
+            0x3C => "VPkFmacF16",
             _ => string.Empty,
         };
 

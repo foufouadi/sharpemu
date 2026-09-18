@@ -1233,6 +1233,9 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     break;
+                case "VPkFmacF16":
+                    result = EmitPackedF16Fmac(instruction, destination);
+                    break;
                 case "VFmaMixF32":
                 case "VFmaMixloF16":
                 case "VFmaMixhiF16":
@@ -1522,6 +1525,37 @@ public static partial class Gen5SpirvTranslator
             }
 
             return EmitFloatToHalf(value);
+        }
+
+        // V_PK_FMAC_F16 (VOP2 0x3C): each result half is a fused f16 multiply-add
+        // whose addend is the matching half of the old destination, so the packed
+        // register is read as D = S0 * S1 + D for both lanes at once.
+        private uint EmitPackedF16Fmac(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            var accumulator = LoadV(destination);
+            var low = EmitPackedF16FmacLane(instruction, accumulator, highLane: false);
+            var high = EmitPackedF16FmacLane(instruction, accumulator, highLane: true);
+            return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+        }
+
+        private uint EmitPackedF16FmacLane(
+            Gen5ShaderInstruction instruction,
+            uint accumulator,
+            bool highLane)
+        {
+            var left = EmitPackedF16Half(GetRawSource(instruction, 0), highLane);
+            var right = EmitPackedF16Half(GetRawSource(instruction, 1), highLane);
+            var addend = EmitPackedF16Half(accumulator, highLane);
+            return EmitFloatToHalf(
+                EmitPackedF16FusedMultiplyAdd(left, right, addend));
+        }
+
+        private uint EmitPackedF16Half(uint raw, bool highLane)
+        {
+            var half = highLane ? ShiftRightLogical(raw, UInt(16)) : raw;
+            return Bitcast(_floatType, EmitHalfToFloat(half));
         }
 
         // Saturates an f32 bit pattern to [0, 1] the way the VOP3P clamp modifier
