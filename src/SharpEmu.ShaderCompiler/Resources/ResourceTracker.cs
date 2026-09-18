@@ -308,10 +308,12 @@ public sealed partial class ResourceTracker
         return InternSource(source);
     }
 
-    // A runtime V# is one whose four dwords are each a raw scalar-memory word read
-    // at a dynamic (non-constant) offset. Constant-offset reads are materialized
-    // through the flattened resource table instead, so a handle built purely from
-    // them resolves normally and must keep the ordinary binding path.
+    // A runtime V# is one whose four dwords cannot be resolved at plan time, but
+    // whose non-constant leaves are all reads from guest memory. This covers a
+    // descriptor read straight from a device address and one read from the SRT
+    // buffer at a dynamic offset, including the phi that merges an SRT read
+    // across a loop. A handle that is fully resolvable (constants and flattened
+    // table words only) is not a runtime descriptor and keeps the native binding.
     private bool IsRuntimeDescriptorHandle(ScalarValue? handle)
     {
         if (handle is null || handle.Kind != ScalarValueKind.BufferHandle ||
@@ -320,25 +322,78 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        var validator = new RuntimeValueValidator(
-            _graph,
-            _plan.UserDataBase,
-            _plan.UserDataCount,
-            _plan.TableReads.Count);
-        foreach (var operand in handle.Operands)
+        if (!handle.Operands.All(operand => IsRuntimeDerivable(operand)))
         {
-            if (!validator.IsRawRead(operand))
-            {
-                return false;
-            }
-
-            if (operand.Operands.Length >= 2 && operand.Operands[1].IsConstant)
-            {
-                return false;
-            }
+            return false;
         }
 
-        return true;
+        return handle.Operands.Any(operand => HasRuntimeRead(operand));
+    }
+
+    // True when a value is known at plan time (constant, user data, shader base,
+    // a flattened resource-table word) or is ultimately a guest-memory read.
+    // A phi, select or operation qualifies when every operand does, so a
+    // loop-carried descriptor merge stays a runtime descriptor. A cycle through
+    // a phi is accepted: its non-cyclic inputs are checked on the path that
+    // reached it, the same way the read planner treats cyclic phis.
+    private bool IsRuntimeDerivable(ScalarValue value) => IsRuntimeDerivable(value, []);
+
+    private bool IsRuntimeDerivable(ScalarValue value, HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return value.Kind == ScalarValueKind.Phi;
+        }
+
+        try
+        {
+            switch (value.Kind)
+            {
+                case ScalarValueKind.Constant:
+                case ScalarValueKind.ResourceTableWord:
+                case ScalarValueKind.UserData:
+                case ScalarValueKind.ShaderBase:
+                    return true;
+                case ScalarValueKind.ScalarAddressWord:
+                case ScalarValueKind.ScalarBufferWord:
+                    return value.MemoryIndex < _graph.Memory.Count;
+                case ScalarValueKind.Phi:
+                case ScalarValueKind.Select:
+                case ScalarValueKind.Operation:
+                case ScalarValueKind.FirstLane:
+                    return value.Operands.All(operand => IsRuntimeDerivable(operand, visiting));
+                default:
+                    return false;
+            }
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
+
+    private static bool HasRuntimeRead(ScalarValue value) => HasRuntimeRead(value, []);
+
+    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
+            {
+                return true;
+            }
+
+            return value.Operands.Any(operand => HasRuntimeRead(operand, visiting));
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
     }
 
     // ---- dense tables ----
