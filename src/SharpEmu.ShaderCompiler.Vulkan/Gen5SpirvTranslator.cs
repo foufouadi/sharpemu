@@ -22,6 +22,38 @@ public static partial class Gen5SpirvTranslator
         uint numberType) =>
         CompilationContext.DecodeStorageImageFormat(dataFormat, numberType);
 
+    // Vulkan only guarantees maxComputeWorkGroupSize >= (1024, 1024, 64) and
+    // maxComputeWorkGroupInvocations >= 1024, but a GNM NUM_THREAD layout can put its
+    // largest axis on Z (real PS5 hardware has no such asymmetry between axes). Remap
+    // logical GNM axes onto physical SPIR-V/dispatch axes so the largest logical size
+    // always lands on the physical axis with the most headroom (X), and the smallest
+    // lands on Z, which is the only axis with a tight guaranteed limit. This is a pure
+    // function of the three thread-group sizes so the host dispatch path (which permutes
+    // vkCmdDispatch's group counts the same way) can recompute it independently without
+    // any shader-compiler metadata plumbing.
+    //
+    // Returns physicalAxisOfLogical: physicalAxisOfLogical[logical 0=X/1=Y/2=Z] is the
+    // physical axis (0=X/1=Y/2=Z) that logical axis is remapped onto.
+    public static int[] ComputeWorkgroupAxisOrder(uint sizeX, uint sizeY, uint sizeZ)
+    {
+        if (sizeZ <= 64)
+        {
+            return [0, 1, 2];
+        }
+
+        var sizes = new[] { sizeX, sizeY, sizeZ };
+        var byDescendingSize = new[] { 0, 1, 2 };
+        Array.Sort(byDescendingSize, (a, b) => sizes[b].CompareTo(sizes[a]));
+
+        var physicalAxisOfLogical = new int[3];
+        for (var physical = 0; physical < 3; physical++)
+        {
+            physicalAxisOfLogical[byDescendingSize[physical]] = physical;
+        }
+
+        return physicalAxisOfLogical;
+    }
+
     private sealed partial class CompilationContext
     {
         private const int ScalarRegisterCount = 128;
@@ -79,6 +111,13 @@ public static partial class Gen5SpirvTranslator
         private readonly uint _localSizeX;
         private readonly uint _localSizeY;
         private readonly uint _localSizeZ;
+
+        // Vulkan only guarantees maxComputeWorkGroupSize >= (1024, 1024, 64), but a GNM
+        // NUM_THREAD layout can put its largest axis on Z (real hardware has no such asymmetry).
+        // physicalAxisOfLogical[logical 0=X/1=Y/2=Z] gives which physical SPIR-V axis (and which
+        // vkCmdDispatch group-count slot) that logical axis is remapped onto, so the largest size
+        // always lands on the physical axis with the most headroom.
+        private readonly int[] _physicalAxisOfLogical;
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
         private readonly uint[] _pixelInputCntl;
@@ -410,12 +449,19 @@ public static partial class Gen5SpirvTranslator
                 }
                 else if (_stage == Gen5SpirvStage.Compute)
                 {
+                    var logicalSizes = new[] { _localSizeX, _localSizeY, _localSizeZ };
+                    var physicalSizes = new uint[3];
+                    for (var logical = 0; logical < 3; logical++)
+                    {
+                        physicalSizes[_physicalAxisOfLogical[logical]] = logicalSizes[logical];
+                    }
+
                     _module.AddExecutionMode(
                         main,
                         SpirvExecutionMode.LocalSize,
-                        _localSizeX,
-                        _localSizeY,
-                        _localSizeZ);
+                        physicalSizes[0],
+                        physicalSizes[1],
+                        physicalSizes[2]);
                 }
 
                 var attributeCount = _stage == Gen5SpirvStage.Vertex
@@ -1019,18 +1065,23 @@ public static partial class Gen5SpirvTranslator
                 var invocationInBounds = _module.ConstantBool(true);
                 for (uint component = 0; component < 3; component++)
                 {
+                    // gl_LocalInvocationId/gl_WorkGroupId are indexed by the physical SPIR-V
+                    // axis, which can differ from the logical GNM axis when the workgroup was
+                    // remapped to respect the device's tighter Z-axis limit (see
+                    // ComputeWorkgroupAxisOrder).
+                    var physicalComponent = (uint)_physicalAxisOfLogical[component];
                     var localComponent = _module.AddInstruction(
                         SpirvOp.CompositeExtract,
                         _uintType,
                         localId,
-                        component);
+                        physicalComponent);
                     StoreV(component, localComponent, guardWithExec: false);
 
                     var groupComponent = _module.AddInstruction(
                         SpirvOp.CompositeExtract,
                         _uintType,
                         workGroupId,
-                        component);
+                        physicalComponent);
                     var localSize = component switch
                     {
                         0 => _localSizeX,
@@ -1065,15 +1116,15 @@ public static partial class Gen5SpirvTranslator
                     StoreComputeSystemRegister(
                         registers.WorkGroupXRegister,
                         workGroupId,
-                        0);
+                        (uint)_physicalAxisOfLogical[0]);
                     StoreComputeSystemRegister(
                         registers.WorkGroupYRegister,
                         workGroupId,
-                        1);
+                        (uint)_physicalAxisOfLogical[1]);
                     StoreComputeSystemRegister(
                         registers.WorkGroupZRegister,
                         workGroupId,
-                        2);
+                        (uint)_physicalAxisOfLogical[2]);
                     if (registers.ThreadGroupSizeRegister is { } sizeRegister)
                     {
                         StoreS(
