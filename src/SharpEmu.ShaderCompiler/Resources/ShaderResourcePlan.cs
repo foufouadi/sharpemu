@@ -38,6 +38,7 @@ public sealed class ShaderResourcePlan
     public IReadOnlyList<ScalarValue> DynamicReads { get; private set; } = [];
     public IReadOnlyList<byte> CleanFlatSlots { get; private set; } = [];
     public IReadOnlyList<IndirectImageAccess> IndirectImages { get; private set; } = [];
+    public IReadOnlyList<BufferCandidateTablePlan> BufferCandidateTables { get; private set; } = [];
     public bool RequiresSpecializationMemory { get; private set; }
     public ShaderResourceInfo Info { get; private set; } = new();
 
@@ -86,6 +87,7 @@ public sealed class ShaderResourcePlan
         plan.DescriptorSources = tracked.Sources;
         plan.Info = tracked.Info;
         plan.IndirectImages = tracked.IndirectImages;
+        plan.BufferCandidateTables = tracked.BufferCandidateTables;
         plan.DynamicReads = plan.DynamicReads.Where(read => !tracked.IndirectReads.Contains(read)).ToList();
 
         var materialization = new List<uint>();

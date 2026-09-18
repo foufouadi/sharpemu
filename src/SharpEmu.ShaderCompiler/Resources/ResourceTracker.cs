@@ -19,6 +19,7 @@ public sealed partial class ResourceTracker
     private readonly List<DescriptorSource> _sources = [];
     private readonly List<(int Index, uint Resource, uint Sampler, bool HasSampler)> _memoryPatches = [];
     private readonly List<IndirectImagePlan> _indirectImages = [];
+    private readonly List<BufferCandidateTablePlan> _bufferCandidateTables = [];
     private readonly Dictionary<ScalarValue, List<ScalarValue>> _uses;
     private readonly Dictionary<int, List<ScalarValue>> _readsByMemory = [];
 
@@ -37,7 +38,8 @@ public sealed partial class ResourceTracker
         IReadOnlyList<DescriptorSource> Sources,
         ShaderResourceInfo Info,
         IReadOnlyList<IndirectImageAccess> IndirectImages,
-        IReadOnlySet<ScalarValue> IndirectReads);
+        IReadOnlySet<ScalarValue> IndirectReads,
+        IReadOnlyList<BufferCandidateTablePlan> BufferCandidateTables);
 
     private ResourceTracker(ShaderResourcePlan plan)
     {
@@ -130,7 +132,7 @@ public sealed partial class ResourceTracker
             }
         }
 
-        return new Result(_sources, _info, indirectAccesses, indirectReads);
+        return new Result(_sources, _info, indirectAccesses, indirectReads, _bufferCandidateTables);
     }
 
     private ResourcePlanException Failure(uint pc, string reason) =>
@@ -263,6 +265,42 @@ public sealed partial class ResourceTracker
 
         _sources.Add(source);
         return (uint)(_sources.Count - 1);
+    }
+
+    // Records a proven bounded SRT candidate table, reusing an equivalent table so several
+    // accesses share one native candidate layout. Returns false when the SRT root itself is
+    // not a valid runtime source, in which case the access stays on its old lowering.
+    private bool InternBufferCandidateTable(BufferCandidateTablePlan table, uint pc, int memoryIndex)
+    {
+        table.SourceSrtResource = InternRuntimeSource(table.SrtHandle, pc);
+        if (table.SourceSrtResource == DescriptorConstants.NoIndex)
+        {
+            return false;
+        }
+
+        for (var existing = 0; existing < _bufferCandidateTables.Count; existing++)
+        {
+            var current = _bufferCandidateTables[existing];
+            if (!_graph.Equivalent(current.SrtHandle, table.SrtHandle) ||
+                !_graph.Equivalent(current.OffsetExpression, table.OffsetExpression))
+            {
+                continue;
+            }
+
+            _bufferCandidateTables[existing] = current.WithMemoryIndex(memoryIndex);
+            return true;
+        }
+
+        _bufferCandidateTables.Add(table);
+        return true;
+    }
+
+    // A fully-resolvable descriptor source for the static SRT root a candidate table reads
+    // through. Its dwords stay runtime values; this only records them for the materialiser.
+    private uint InternRuntimeSource(ScalarValue handle, uint pc)
+    {
+        var source = MakeSource(handle, 4, false, false, pc);
+        return ValidateSource(source, out _) ? InternSource(source) : DescriptorConstants.NoIndex;
     }
 
     private uint GetHandleSource(ScalarValue? handle, ScalarValueKind expected, uint width, uint pc, bool sampler = false, bool sampleAdjust = false)
@@ -585,7 +623,20 @@ public sealed partial class ResourceTracker
             // raw buffer access stays correct instead of failing to compile.
             if (IsRuntimeDescriptorHandle(access.Handle))
             {
-                memory.RuntimeBufferDescriptor = true;
+                if (BufferCandidateTablePlanner.TryPlan(_plan, access.Handle!, index, out var table) &&
+                    InternBufferCandidateTable(table, memory.Pc, index))
+                {
+                    memory.BufferDescriptor = new GuestBufferDescriptor
+                    {
+                    Provenance = BufferDescriptorProvenance.Runtime,
+                };
+                return;
+                }
+
+                memory.BufferDescriptor = new GuestBufferDescriptor
+                {
+                    Provenance = BufferDescriptorProvenance.Runtime,
+                };
                 _info.UsesDeviceAddresses = true;
                 return;
             }
