@@ -265,17 +265,14 @@ public sealed partial class ResourceTracker
         }
 
         var source = MakeSource(handle, width, sampler, sampleAdjust, pc);
-        if (expected == ScalarValueKind.ImageHandle)
-        {
-            for (uint dword = 0; dword < source.DwordCount; dword++)
-            {
-                if (source.Dwords[dword].Kind == ScalarValueKind.ScalarBufferWord)
-                {
-                    throw Failure(pc, $"{expected} dword {dword} is not a valid runtime value");
-                }
-            }
-        }
 
+        // Image descriptors loaded straight from a scalar buffer at a dynamically-uniform
+        // offset (e.g. a bindless material heap entry read via S_BUFFER_LOAD, without going
+        // through the explicit TryMakeIndirectImage/TryMakeDirectImage heap-record shapes)
+        // used to be rejected outright here. But RuntimeValueValidator/RuntimeValueEvaluator
+        // already handle ScalarBufferWord dwords generically (the same mechanism buffer
+        // descriptors rely on via MaterializationSources), so let ValidateSource below be the
+        // single source of truth instead of a narrower, ImageHandle-specific blanket ban.
         if (!ValidateSource(source, out var badDword))
         {
             throw Failure(pc, $"{expected} dword {badDword} is not a valid runtime value");
@@ -686,9 +683,21 @@ public sealed partial class ResourceTracker
     private bool TryMakeIndirectImage(ScalarValue handle, uint pc, out IndirectImagePlan plan)
     {
         plan = null!;
+        var diag = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1";
         if (handle.Kind != ScalarValueKind.ImageHandle || handle.Operands.Length != 8)
         {
+            if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: handle.Kind={handle.Kind} operands={handle.Operands.Length}");
             return false;
+        }
+
+        if (diag)
+        {
+            for (var dword = 0; dword < 8; dword++)
+            {
+                var read = handle.Operands[dword];
+                var memory = ScalarReadMemory(read, out var memoryIndex);
+                Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} dword={dword} read.Kind={read.Kind} memory={(memory is null ? "null" : $"Offset={memory.Offset} DataBits={memory.DataBits} DataDwords={memory.DataDwords} Kind={memory.Kind}")} memoryIndex={memoryIndex} belongsTo={(memory is null ? "n/a" : MemoryIndexBelongsTo(memoryIndex, read).ToString())} operand0.Kind={(read.Operands.Length > 0 ? read.Operands[0].Kind.ToString() : "n/a")} operand1.Kind={(read.Operands.Length > 1 ? read.Operands[1].Kind.ToString() : "n/a")}");
+            }
         }
 
         var heapReads = new ScalarValue[8];
@@ -702,12 +711,14 @@ public sealed partial class ResourceTracker
             var memory = ScalarReadMemory(read, out var memoryIndex);
             if (memory is null || memory.Offset != (uint)dword * sizeof(uint) || !MemoryIndexBelongsTo(memoryIndex, read))
             {
+                if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject at dword={dword}: read.Kind={read.Kind} memory={(memory is null ? "null" : $"Offset={memory.Offset}")} memoryIndex={memoryIndex}");
                 return false;
             }
 
             var currentHandle = read.Operands[0];
             if (heapHandle is not null && !ReferenceEquals(currentHandle, heapHandle))
             {
+                if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject at dword={dword}: heapHandle mismatch");
                 return false;
             }
 
@@ -718,6 +729,7 @@ public sealed partial class ResourceTracker
             }
             else if (!_graph.Equivalent(heapOffset!, read.Operands[1]))
             {
+                if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject at dword={dword}: heapOffset not equivalent across dwords");
                 return false;
             }
 
@@ -727,6 +739,7 @@ public sealed partial class ResourceTracker
         if (heapOffset!.Kind != ScalarValueKind.Operation || heapOffset.Operation != ScalarOperation.ShiftLeft32 ||
             !heapOffset.Operands[1].IsConstant || heapOffset.Operands[1].ConstantU32 != 5)
         {
+            if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: heapOffset.Kind={heapOffset.Kind} op={heapOffset.Operation} constant={(heapOffset.Kind == ScalarValueKind.Operation && heapOffset.Operands.Length > 1 ? heapOffset.Operands[1].IsConstant.ToString() : "n/a")} value={(heapOffset.Kind == ScalarValueKind.Operation && heapOffset.Operands.Length > 1 && heapOffset.Operands[1].IsConstant ? heapOffset.Operands[1].ConstantU32.ToString() : "n/a")}");
             return false;
         }
 
@@ -734,17 +747,25 @@ public sealed partial class ResourceTracker
         var materialMemory = ScalarReadMemory(materialRead, out var materialMemoryIndex);
         if (materialMemory is null || materialMemory.Offset != 0 || !MemoryIndexBelongsTo(materialMemoryIndex, materialRead))
         {
+            if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: materialRead.Kind={materialRead.Kind} materialMemory={(materialMemory is null ? "null" : $"Offset={materialMemory.Offset}")}");
             return false;
         }
 
         var materialHandle = materialRead.Operands[0];
         if (!MatchMaterialOffset(materialRead.Operands[1], out var selector, out var selectorStride, out var selectorOffset))
         {
+            if (diag)
+            {
+                var offsetValue = materialRead.Operands[1];
+                Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: MatchMaterialOffset failed on Kind={offsetValue.Kind} op={offsetValue.Operation}");
+            }
+
             return false;
         }
 
         if (!UsesOnly(materialRead, [heapOffset]) || !UsesOnly(heapOffset, heapReads))
         {
+            if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: UsesOnly failed for materialRead/heapOffset");
             return false;
         }
 
@@ -752,6 +773,7 @@ public sealed partial class ResourceTracker
         {
             if (!UsesOnly(read, [handle]))
             {
+                if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: a heap read has extra consumers");
                 return false;
             }
         }
