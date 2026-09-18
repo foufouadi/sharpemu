@@ -77,19 +77,32 @@ internal static unsafe partial class VulkanVideoPresenter
             return program;
         }
 
-        private static TextureNumericClass NumericClassOf(ImageResource image) => image.NumericClass switch
-        {
-            ImageNumericClass.Uint => TextureNumericClass.Uint,
-            ImageNumericClass.Sint => TextureNumericClass.Sint,
-            _ => TextureNumericClass.Float,
-        };
+        // Every atomic image binding (integer or float) is declared as a
+        // UINT storage image at the SPIR-V level (Gen5SpirvTranslator.
+        // Resources.cs's DeclareImageClass forces R32ui format + uint sampled
+        // type for all atomics, since the float atomics reach the real bits
+        // through a bitcast + integer compare-exchange, not a native SPIR-V
+        // float image atomic). The bound VkImageView must match that or
+        // vkCmdDispatch fails VUID-vkCmdDispatch-format-07753 - so the view
+        // request here ignores the image's logical Float numeric class for
+        // an atomic binding and requests the same Uint reinterpretation.
+        private static TextureNumericClass NumericClassOf(ImageResource image) =>
+            image.Atomic
+                ? TextureNumericClass.Uint
+                : image.NumericClass switch
+                {
+                    ImageNumericClass.Uint => TextureNumericClass.Uint,
+                    ImageNumericClass.Sint => TextureNumericClass.Sint,
+                    _ => TextureNumericClass.Float,
+                };
 
         private static ShaderImageShape ShapeOf(ImageResource image) => new(
             Volume: image.Dimension == ImageDimension.Dim3D,
             Arrayed: image.Cube || image.Dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray or ImageDimension.Dim2DMsaaArray,
             Storage: image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage,
             DynamicMip: image.MipMode == ImageMipMode.DynamicStorage,
-            NumericClass: NumericClassOf(image));
+            NumericClass: NumericClassOf(image),
+            Atomic: image.Atomic);
 
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
