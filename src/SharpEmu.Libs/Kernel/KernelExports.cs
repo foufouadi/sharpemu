@@ -30,6 +30,31 @@ public static class KernelExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // KytyPS5 libKernel.cpp KernelGetOperationMode: *mode = 2 (PS5 base console, not Pro),
+    // *submode = 0 (none). Games poll this at high frequency.
+    [SysAbiExport(
+        Nid = "NH6xARDOVv8",
+        ExportName = "sceKernelGetOperationMode",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetOperationMode(CpuContext ctx)
+    {
+        var modeAddress = ctx[CpuRegister.Rdi];
+        var submodeAddress = ctx[CpuRegister.Rsi];
+
+        if (modeAddress != 0 && !ctx.TryWriteUInt32(modeAddress, 2))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (submodeAddress != 0 && !ctx.TryWriteUInt32(submodeAddress, 0))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "8zLSfEfW5AU",
         ExportName = "sceCoredumpRegisterCoredumpHandler",
