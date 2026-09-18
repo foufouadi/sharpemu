@@ -1398,7 +1398,10 @@ public static partial class Gen5SpirvTranslator
             for (var index = 0; index < sourceCount; index++)
             {
                 var source = instruction.Sources[index];
-                if (source.Kind is not (Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister))
+                if (source.Kind is not (Gen5OperandKind.VectorRegister or
+                    Gen5OperandKind.ScalarRegister or
+                    Gen5OperandKind.EncodedConstant or
+                    Gen5OperandKind.LiteralConstant))
                 {
                     error =
                         $"unsupported vop3p operand {source} for {instruction.Opcode} (first slice: registers only)";
@@ -1673,6 +1676,22 @@ public static partial class Gen5SpirvTranslator
             int index,
             bool highLane)
         {
+            var operand = instruction.Sources[index];
+            if (operand.Kind is Gen5OperandKind.EncodedConstant or Gen5OperandKind.LiteralConstant)
+            {
+                // An inline constant or literal is a single f32 value, not a
+                // packed register: both lanes take the exactly-converted f16 of
+                // the same constant, so there is no half to select.
+                var constant = GetFloatSource(instruction, index);
+                var constantNegate = highLane ? control.NegHiMask : control.NegLoMask;
+                if (((constantNegate >> index) & 1) != 0)
+                {
+                    constant = _module.AddInstruction(SpirvOp.FNegate, _floatType, constant);
+                }
+
+                return constant;
+            }
+
             var raw = GetRawSource(instruction, index);
             var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
             var half = ((selectMask >> index) & 1) != 0
