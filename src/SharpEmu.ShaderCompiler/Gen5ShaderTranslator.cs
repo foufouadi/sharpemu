@@ -1006,6 +1006,17 @@ public static partial class Gen5ShaderTranslator
             0xDD => "VCmpxLgF16",
             0xDE => "VCmpxGeF16",
             0xDF => "VCmpxOF16",
+            // VOPC-encoded 64-bit compares (opcode bit 8 set): the same
+            // V_CMP/V_CMPX U64 forms the VOP3 table already decodes, but with
+            // the two-operand VOPC encoding the guest also emits.
+            0xE0 => "VCmpFU64",
+            0xE1 => "VCmpLtU64",
+            0xE2 => "VCmpEqU64",
+            0xE3 => "VCmpLeU64",
+            0xE4 => "VCmpGtU64",
+            0xE5 => "VCmpNeU64",
+            0xE6 => "VCmpGeU64",
+            0xE7 => "VCmpTU64",
             0xE8 => "VCmpUF16",
             0xE9 => "VCmpNgeF16",
             0xEA => "VCmpNlgF16",
@@ -1014,6 +1025,14 @@ public static partial class Gen5ShaderTranslator
             0xED => "VCmpNeqF16",
             0xEE => "VCmpNltF16",
             0xEF => "VCmpTruF16",
+            0xF0 => "VCmpxFU64",
+            0xF1 => "VCmpxLtU64",
+            0xF2 => "VCmpxEqU64",
+            0xF3 => "VCmpxLeU64",
+            0xF4 => "VCmpxGtU64",
+            0xF5 => "VCmpxNeU64",
+            0xF6 => "VCmpxGeU64",
+            0xF7 => "VCmpxTU64",
             0xF8 => "VCmpxUF16",
             0xF9 => "VCmpxNgeF16",
             0xFA => "VCmpxNlgF16",
@@ -1217,6 +1236,13 @@ public static partial class Gen5ShaderTranslator
             0x38 => "DsRead2St64B32",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
+            // gfx10 groups the 64-bit LDS atomics at 0x40..0x4C, directly ahead
+            // of DS_WRITE_B64 (0x4D). Only the no-return forms are named here:
+            // the RTN variants cannot be split into two 32-bit atomics without
+            // losing the atomicity of the returned pair, so they stay unknown
+            // and keep failing loudly.
+            0x40 => "DsAddU64",
+            0x4A => "DsOrB64",
             0x4D => "DsWriteB64",
             0x4E => "DsWrite2B64",
             0x4F => "DsWrite2St64B64",
@@ -1643,7 +1669,8 @@ public static partial class Gen5ShaderTranslator
         "DsAddRtnU32" or "DsSubRtnU32" or "DsIncRtnU32" or "DsDecRtnU32" or
         "DsMinRtnI32" or "DsMaxRtnI32" or "DsMinRtnU32" or "DsMaxRtnU32" or
         "DsAndRtnB32" or "DsOrRtnB32" or "DsXorRtnB32" or
-        "DsWrxchgRtnB32" or "DsCmpstRtnB32" => true,
+        "DsWrxchgRtnB32" or "DsCmpstRtnB32" or
+        "DsAddU64" or "DsOrB64" => true,
         _ => false,
     };
 
@@ -2114,6 +2141,12 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData1),
+                    ],
+                    // 64-bit LDS atomics take ADDR plus a DATA0 register pair.
+                    "DsAddU64" or "DsOrB64" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData0 + 1),
                     ],
                     _ when IsDataShareAtomic(opcode) => [
                         Gen5Operand.Vector(vectorAddress),
