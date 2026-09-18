@@ -1133,6 +1133,23 @@ public static partial class Gen5ShaderTranslator
             0x372 => "VOr3U32",
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
+            // VOP3-encoded 64-bit VOPC (opcode < 0x100): V_CMP_*_U64 / V_CMPX_*_U64.
+            0x0E0 => "VCmpFU64",
+            0x0E1 => "VCmpLtU64",
+            0x0E2 => "VCmpEqU64",
+            0x0E3 => "VCmpLeU64",
+            0x0E4 => "VCmpGtU64",
+            0x0E5 => "VCmpNeU64",
+            0x0E6 => "VCmpGeU64",
+            0x0E7 => "VCmpTU64",
+            0x0F0 => "VCmpxFU64",
+            0x0F1 => "VCmpxLtU64",
+            0x0F2 => "VCmpxEqU64",
+            0x0F3 => "VCmpxLeU64",
+            0x0F4 => "VCmpxGtU64",
+            0x0F5 => "VCmpxNeU64",
+            0x0F6 => "VCmpxGeU64",
+            0x0F7 => "VCmpxTU64",
             _ => $"Vop3Raw{opcode:X3}",
         };
 

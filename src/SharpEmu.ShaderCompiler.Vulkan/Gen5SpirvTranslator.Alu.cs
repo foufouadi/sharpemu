@@ -1792,6 +1792,39 @@ public static partial class Gen5SpirvTranslator
 
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
+            else if (opcode.EndsWith("U64", StringComparison.Ordinal))
+            {
+                if (opcode is "VCmpFU64" or "VCmpxFU64")
+                {
+                    condition = _module.ConstantBool(false);
+                }
+                else if (opcode is "VCmpTU64" or "VCmpxTU64")
+                {
+                    condition = _module.ConstantBool(true);
+                }
+                else
+                {
+                    var wideLeft = GetRawSource64(instruction, 0);
+                    var wideRight = GetRawSource64(instruction, 1);
+                    var operation = opcode switch
+                    {
+                        "VCmpEqU64" or "VCmpxEqU64" => SpirvOp.IEqual,
+                        "VCmpNeU64" or "VCmpxNeU64" => SpirvOp.INotEqual,
+                        "VCmpLtU64" or "VCmpxLtU64" => SpirvOp.ULessThan,
+                        "VCmpLeU64" or "VCmpxLeU64" => SpirvOp.ULessThanEqual,
+                        "VCmpGtU64" or "VCmpxGtU64" => SpirvOp.UGreaterThan,
+                        "VCmpGeU64" or "VCmpxGeU64" => SpirvOp.UGreaterThanEqual,
+                        _ => SpirvOp.Nop,
+                    };
+                    if (operation == SpirvOp.Nop)
+                    {
+                        error = $"unsupported u64 compare {opcode}";
+                        return false;
+                    }
+
+                    condition = _module.AddInstruction(operation, _boolType, wideLeft, wideRight);
+                }
+            }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
             {
                 var left = GetRawSource(instruction, 0);
