@@ -12,6 +12,13 @@ public sealed class RuntimeValueEvaluator
 {
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
 
+    // A bindless pointer the guest leaves unbound for a dispatch resolves its address-handle
+    // dwords to zero; a small immediate offset on top of that still lands under this guest
+    // null-page threshold. Treat such reads as zero instead of faulting the host, so the
+    // descriptor built from them collapses to a null resource. Ported from KytyPS5's identical
+    // fix ("shader: treat a null-based SRT constant read as zero").
+    private const ulong GuestNullPageSize = 0x10000ul;
+
     private readonly ShaderResourcePlan _plan;
     private readonly ResourceRuntimeInputs _inputs;
     private readonly IReadOnlyList<byte> _cleanFlatSlots;
@@ -256,6 +263,12 @@ public sealed class RuntimeValueEvaluator
             {
                 return false;
             }
+
+            if (address < GuestNullPageSize)
+            {
+                result = 0;
+                return true;
+            }
         }
 
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
@@ -387,6 +400,7 @@ public sealed class RuntimeValueEvaluator
                     if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
                     {
                         Console.Error.WriteLine($"[RV-EVAL-DIAG] evaluate failed tableRead FlatOffset={read.FlatOffset} Kind={read.Value.Kind} Op={read.Value.Operation}");
+                        DumpValueTree(read.Value, 0, 6);
                     }
 
                     return false;
@@ -399,6 +413,25 @@ public sealed class RuntimeValueEvaluator
         results = evaluated;
         table = flattened;
         return true;
+    }
+
+    private static void DumpValueTree(ScalarValue value, int depth, int maxDepth)
+    {
+        var indent = new string(' ', depth * 2);
+        var payload = value.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ScalarAddressWord or
+            ScalarValueKind.ScalarBufferWord or ScalarValueKind.ResourceTableWord or ScalarValueKind.Phi
+            ? $" Payload={value.Payload}"
+            : "";
+        Console.Error.WriteLine($"[RV-EVAL-DIAG] {indent}Kind={value.Kind} Op={value.Operation}{payload} Operands={value.Operands.Length}");
+        if (depth >= maxDepth)
+        {
+            return;
+        }
+
+        foreach (var operand in value.Operands)
+        {
+            DumpValueTree(operand, depth + 1, maxDepth);
+        }
     }
 
     private static bool[] EvaluateActiveSources(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, RuntimeValueEvaluator cleanEvaluator)
