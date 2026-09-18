@@ -313,12 +313,21 @@ public static partial class Gen5SpirvTranslator
             }
 
             var isStorage = resourceClass == ImageResourceClass.Storage;
-            var kind = numericClass switch
-            {
-                ImageNumericClass.Uint => ImageComponentKind.Uint,
-                ImageNumericClass.Sint => ImageComponentKind.Sint,
-                _ => ImageComponentKind.Float,
-            };
+            // Every atomic image (integer or float) is declared with the R32ui
+            // format below, so its OpTypeImage Sampled Type must be uint too -
+            // VUID-StandaloneSpirv-Image-04965 requires the two to match. The
+            // float atomics (Fmin/Fmax) still operate on the real float bits;
+            // they just get there through a bitcast + integer compare-exchange
+            // (see Gen5SpirvTranslator.cs's ImageAtomicFmax/Fmin case) instead
+            // of through the declared image/sampled type.
+            var kind = atomic
+                ? ImageComponentKind.Uint
+                : numericClass switch
+                {
+                    ImageNumericClass.Uint => ImageComponentKind.Uint,
+                    ImageNumericClass.Sint => ImageComponentKind.Sint,
+                    _ => ImageComponentKind.Float,
+                };
             var componentType = kind switch
             {
                 ImageComponentKind.Sint => _intType,
