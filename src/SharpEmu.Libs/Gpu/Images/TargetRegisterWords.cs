@@ -106,4 +106,4 @@ public readonly record struct DisplaySurfaceWords(
     bool Compressed);
 
 // The shape the shader module was compiled with; the view type must match it.
-public readonly record struct ShaderImageShape(bool Volume, bool Arrayed, bool Storage, bool DynamicMip, TextureNumericClass NumericClass);
+public readonly record struct ShaderImageShape(bool Volume, bool Arrayed, bool Storage, bool DynamicMip, TextureNumericClass NumericClass, bool Atomic = false);

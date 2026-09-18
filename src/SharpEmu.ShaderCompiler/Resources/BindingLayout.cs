@@ -44,6 +44,11 @@ public static class ImageDescriptorBinding
     private const uint StorageFloatBinding = 22;
     private const uint StorageUintBinding = 27;
     private const uint AtomicUintBinding = 32;
+    // IMAGE_ATOMIC_FMIN/FMAX (MIMG op 0x1E/0x1F) target a 32-bit float-format
+    // storage UAV, not the uint UAV every integer image atomic requires - a
+    // separate binding range so ForImage/Describe can round-trip the numeric
+    // class instead of forcing every atomic image to Uint.
+    private const uint AtomicFloatBinding = 37;
 
     public static DescriptorBindingKind? ForImage(ImageResource image)
     {
@@ -76,12 +81,16 @@ public static class ImageDescriptorBinding
         {
             if (image.Atomic)
             {
-                if (image.NumericClass != ImageNumericClass.Uint)
+                baseBinding = image.NumericClass switch
+                {
+                    ImageNumericClass.Uint => AtomicUintBinding,
+                    ImageNumericClass.Float => AtomicFloatBinding,
+                    _ => uint.MaxValue,
+                };
+                if (baseBinding == uint.MaxValue)
                 {
                     return null;
                 }
-
-                baseBinding = AtomicUintBinding;
             }
             else
             {
@@ -190,9 +199,14 @@ public static class ImageDescriptorBinding
             return (ImageResourceClass.Storage, offset / 5 == 0 ? ImageNumericClass.Float : ImageNumericClass.Uint, StorageDimensions[offset % 5], false);
         }
 
-        if (index >= AtomicUintBinding && index < (uint)DescriptorBindingKind.Samplers)
+        if (index >= AtomicUintBinding && index < AtomicFloatBinding)
         {
             return (ImageResourceClass.Storage, ImageNumericClass.Uint, StorageDimensions[index - AtomicUintBinding], true);
+        }
+
+        if (index >= AtomicFloatBinding && index < (uint)DescriptorBindingKind.Samplers)
+        {
+            return (ImageResourceClass.Storage, ImageNumericClass.Float, StorageDimensions[index - AtomicFloatBinding], true);
         }
 
         return (ImageResourceClass.None, ImageNumericClass.Unsupported, ImageDimension.Unknown, false);
@@ -205,7 +219,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 {
     public const uint FirstImageBinding = 1;
     public const uint FirstStorageImageBinding = 22;
-    public const uint ImageBindingCount = 36;
+    public const uint ImageBindingCount = 41;
     public const uint NoShaderBase = uint.MaxValue;
     public const uint ShaderBaseDwordCount = 2;
     private const int ScalarRegisterCount = 256;
