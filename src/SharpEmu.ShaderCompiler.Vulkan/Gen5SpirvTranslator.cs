@@ -3212,12 +3212,10 @@ public static partial class Gen5SpirvTranslator
             if (instruction.Opcode == "ImageGetResinfo")
             {
                 var sizeComponentCount = ImageCoordinateComponentCount(resource);
-                var queryImage = resource.IsStorage
-                    ? imageObject
-                    : _module.AddInstruction(
-                        SpirvOp.Image,
-                        resource.ImageType,
-                        imageObject);
+                // ImageGetResinfo never goes through UsesSampler(), so imageObject here is
+                // always the raw OpTypeImage value, not a sampled-image combo — no OpImage
+                // extraction needed (or valid) for either the storage or sampled case.
+                var queryImage = imageObject;
                 var size = _module.AddInstruction(
                     resource.IsStorage
                         ? SpirvOp.ImageQuerySize
