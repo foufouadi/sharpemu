@@ -231,6 +231,169 @@ public static partial class Gen5SpirvTranslator
                 case "VCvtOffF32I4":
                     result = EmitCvtOffF32I4(instruction);
                     break;
+                case "VCvtF64I32":
+                case "VCvtF64U32":
+                {
+                    var source = GetRawSource(instruction, 0);
+                    var converted = _module.AddInstruction(
+                        instruction.Opcode == "VCvtF64I32"
+                            ? SpirvOp.ConvertSToF
+                            : SpirvOp.ConvertUToF,
+                        DoubleType(),
+                        instruction.Opcode == "VCvtF64I32"
+                            ? Bitcast(_intType, source)
+                            : source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            converted,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtF32F64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.FConvert, _floatType, source));
+                    break;
+                }
+                case "VRcpF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var reciprocal = _module.AddInstruction(
+                        SpirvOp.FDiv,
+                        DoubleType(),
+                        Double(1.0),
+                        source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            reciprocal,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VRsqF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var root = Ext(31, DoubleType(), source);
+                    var reciprocal = _module.AddInstruction(
+                        SpirvOp.FDiv,
+                        DoubleType(),
+                        Double(1.0),
+                        root);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            reciprocal,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VSqrtF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            Ext(31, DoubleType(), source),
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VMulF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var left, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var right, out error))
+                    {
+                        return false;
+                    }
+
+                    var product = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        DoubleType(),
+                        left,
+                        right);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            product,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VFmaF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var first, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var second, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 2, out var third, out error))
+                    {
+                        return false;
+                    }
+
+                    var fused = Ext(50, DoubleType(), first, second, third);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            fused,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
                 case "VCvtPkU8F32":
                 {
                     var converted = _module.AddInstruction(
@@ -3565,6 +3728,117 @@ public static partial class Gen5SpirvTranslator
             StoreS(
                 register + 1,
                 _module.AddInstruction(SpirvOp.UConvert, _uintType, high));
+        }
+
+        private uint DoubleType()
+        {
+            _module.AddCapability(SpirvCapability.Float64);
+            return _module.TypeFloat(64);
+        }
+
+        private uint Double(double value) =>
+            _module.Constant64(
+                DoubleType(),
+                unchecked((ulong)BitConverter.DoubleToInt64Bits(value)));
+
+        // FP64 operands live in a register pair. The gfx10 inline-constant
+        // and literal encodings follow different expansion rules than the
+        // integer 64-bit forms, so refuse them instead of reading the wrong
+        // bits as a double.
+        private bool TryGetDoubleSource(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            out uint value,
+            out string error)
+        {
+            error = string.Empty;
+            value = 0;
+            var operand = instruction.Sources[sourceIndex];
+            if (operand.Kind != Gen5OperandKind.VectorRegister &&
+                operand.Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = $"FP64 source {sourceIndex} of {instruction.Opcode} is not a register pair";
+                return false;
+            }
+
+            value = Bitcast(DoubleType(), GetRawSource64(instruction, sourceIndex));
+
+            var absoluteMask = 0u;
+            var negateMask = 0u;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control vop3:
+                    absoluteMask = vop3.AbsoluteMask;
+                    negateMask = vop3.NegateMask;
+                    break;
+                case Gen5SdwaControl sdwa:
+                    absoluteMask = sdwa.AbsoluteMask;
+                    negateMask = sdwa.NegateMask;
+                    break;
+            }
+
+            if ((absoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = Ext(4, DoubleType(), value);
+            }
+
+            if ((negateMask & (1u << sourceIndex)) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, DoubleType(), value);
+            }
+
+            return true;
+        }
+
+        // Applies the VOP3 output modifier and clamp to a double result, then
+        // splits it across the destination register pair. The low word is
+        // returned for the caller's common destination store; the high word is
+        // stored here so both words share the same EXEC guard.
+        private bool TryStoreDoubleResult(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint doubleValue,
+            out uint low,
+            out string error)
+        {
+            error = string.Empty;
+            low = 0;
+            var outputModifier = 0u;
+            var clamp = false;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control control:
+                    outputModifier = control.OutputModifier;
+                    clamp = control.Clamp;
+                    break;
+                case null:
+                    break;
+                default:
+                    error = $"FP64 output control {instruction.Control.GetType().Name} is not implemented in {instruction.Opcode}";
+                    return false;
+            }
+
+            var type = DoubleType();
+            doubleValue = outputModifier switch
+            {
+                1 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(2.0)),
+                2 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(4.0)),
+                3 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(0.5)),
+                _ => doubleValue,
+            };
+            if (clamp)
+            {
+                doubleValue = Ext(43, type, doubleValue, Double(0.0), Double(1.0));
+            }
+
+            var bits = Bitcast(_ulongType, doubleValue);
+            var high = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(bits, _module.Constant64(_ulongType, 32)));
+            StoreV(destination + 1, high);
+            low = _module.AddInstruction(SpirvOp.UConvert, _uintType, bits);
+            return true;
         }
 
         private uint EmitFloat16Binary(

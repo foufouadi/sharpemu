@@ -649,6 +649,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 VertexPipelineStoresAndAtomics = supportedFeatures.VertexPipelineStoresAndAtomics,
                 FragmentStoresAndAtomics = supportedFeatures.FragmentStoresAndAtomics,
                 ShaderInt64 = supportedFeatures.ShaderInt64,
+                ShaderFloat64 = supportedFeatures.ShaderFloat64,
                 ShaderImageGatherExtended = supportedFeatures.ShaderImageGatherExtended,
                 ShaderStorageImageExtendedFormats = supportedFeatures.ShaderStorageImageExtendedFormats,
                 ShaderStorageImageReadWithoutFormat = supportedFeatures.ShaderStorageImageReadWithoutFormat,
@@ -677,6 +678,13 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 throw SubmissionScheduler.Fatal(
                     "The device lacks the shaderInt64 feature, which the device-address programs need.");
+            }
+
+            if (!supportedFeatures.ShaderFloat64)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support shaderFloat64 " +
+                    "translated shaders using double precision will fail.");
             }
 
             if (!supportedFeatures.VertexPipelineStoresAndAtomics || !supportedFeatures.FragmentStoresAndAtomics)
