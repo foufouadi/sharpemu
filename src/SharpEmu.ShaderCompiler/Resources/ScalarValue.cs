@@ -32,6 +32,8 @@ public enum ScalarValueKind : byte
     ScalarAddressWord,
     ScalarBufferWord,
     ResourceTableWord,
+    // A hardware-initialised compute SGPR (workgroup id X/Y/Z, thread-group size); payload 0/1/2 = workgroup id X/Y/Z, 3 = thread-group size.
+    SystemRegister,
 }
 
 // Operations a value node can apply to its operands. The validator accepts only the
@@ -160,6 +162,9 @@ public sealed class ScalarValue
     public static ScalarValue UserData(uint register) =>
         new(ScalarValueKind.UserData, ScalarValueType.U32, ScalarOperation.None, []) { Payload = register };
 
+    public static ScalarValue SystemRegister(uint kind) =>
+        new(ScalarValueKind.SystemRegister, ScalarValueType.U32, ScalarOperation.None, []) { Payload = kind };
+
     public static ScalarValue ShaderBase() =>
         new(ScalarValueKind.ShaderBase, ScalarValueType.U64, ScalarOperation.None, []);
 
@@ -197,6 +202,7 @@ public sealed class ScalarValue
     {
         ScalarValueKind.Constant => Type == ScalarValueType.U64 ? $"0x{Payload:X}ul" : Type == ScalarValueType.Bool ? (Payload != 0 ? "true" : "false") : $"0x{(uint)Payload:X}",
         ScalarValueKind.UserData => $"UserData(s{Payload})",
+        ScalarValueKind.SystemRegister => $"SystemRegister({Payload})",
         ScalarValueKind.Operation => $"{Operation}({string.Join(", ", Operands.Select(operand => operand.ToString()))})",
         ScalarValueKind.Phi => $"Phi#{Id}(block {PhiBlock})",
         _ => $"{Kind}#{Id}",
@@ -232,7 +238,7 @@ public static class ScalarValueEquivalence
             return false;
         }
 
-        if (left.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ResourceTableWord)
+        if (left.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ResourceTableWord or ScalarValueKind.SystemRegister)
         {
             return left.Payload == right.Payload;
         }

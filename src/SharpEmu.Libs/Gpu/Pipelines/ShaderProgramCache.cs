@@ -319,7 +319,8 @@ internal sealed class ShaderProgramCache
                 fetch?.Loads.Select(load => load.Pc).ToHashSet(),
                 beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
                 // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
-                waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u);
+                waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u,
+                computeSystemRegisters: source.Stage == ShaderStage.Compute ? options.ComputeSystemRegisters : null);
         }
         catch (ResourcePlanException exception)
         {

@@ -142,6 +142,25 @@ public sealed partial class ScalarValueGraph
                 }
             }
 
+            // Compute SGPRs the hardware loads after the user data: workgroup ids and the
+            // thread-group size. They differ per workgroup, so they are real values, not Undefined,
+            // but never a per-dispatch uniform (the validator rejects them).
+            if (_graph.ComputeSystemRegisters is { } system)
+            {
+                Seed(system.WorkGroupXRegister, 0);
+                Seed(system.WorkGroupYRegister, 1);
+                Seed(system.WorkGroupZRegister, 2);
+                Seed(system.ThreadGroupSizeRegister, 3);
+            }
+
+            void Seed(uint? register, uint kind)
+            {
+                if (register is { } index && index < ScalarRegisterCount)
+                {
+                    state.Scalars[index] = _graph.SystemRegister(kind);
+                }
+            }
+
             state.Scalars[VccLow] = _graph.Constant(0u);
             state.Scalars[VccHigh] = _graph.Constant(0u);
             state.Scalars[ExecLow] = _graph.Constant(FullWaveMask);

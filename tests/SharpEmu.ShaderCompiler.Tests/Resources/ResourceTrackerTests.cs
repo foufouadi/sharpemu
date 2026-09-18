@@ -617,6 +617,27 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void ComputeWorkgroupIdSgprIsASystemValueNotUndefined()
+    {
+        var program = Program(
+            MoveScalar(0, 4, 0),
+            MoveScalar(4, 5, 0),
+            MoveScalar(8, 6, 64),
+            MoveScalar(12, 7, 0),
+            ScalarBufferLoad(16, 4, destination: 8, dynamicOffsetRegister: 2),
+            EndProgram(20));
+
+        var withSystem = ScalarValueGraph.Build(program, 0, 2, new Gen5ComputeSystemRegisters(2, null, null, null));
+        var offset = Assert.Single(withSystem.Accesses, access => access?.Read is not null)!.Read!.Operands[1];
+        Assert.Equal(ScalarValueKind.SystemRegister, offset.Kind);
+        Assert.Equal(0ul, offset.Payload);
+        Assert.False(new RuntimeValueValidator(withSystem, 0, 2, 0).Validate(offset));
+
+        var without = ScalarValueGraph.Build(program, 0, 2);
+        Assert.True(Assert.Single(without.Accesses, access => access?.Read is not null)!.Read!.Operands[1].IsUndefined);
+    }
+
+    [Fact]
     public void InvariantLoopPhi()
     {
         var program = Program(

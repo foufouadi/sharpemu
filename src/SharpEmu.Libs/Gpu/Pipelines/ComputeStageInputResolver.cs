@@ -9,6 +9,7 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // The compute stage's static inputs from the compute registers and the dispatch mode.
 public static class ComputeStageInputResolver
 {
+    private static readonly bool Diag = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1";
     private const uint LocalDataShareGranuleDwords = 128;
     private const uint UseThreadDimensionsBit = 1u << 5;
     private const uint Wave32Bit = 1u << 15;
@@ -23,6 +24,13 @@ public static class ComputeStageInputResolver
         uint dispatchZ)
     {
         var threadDimensions = (dispatchInitiator & UseThreadDimensionsBit) != 0;
+        if (Diag)
+        {
+            Console.Error.WriteLine(
+                $"[CS-DIAG] shader=0x{compute.Address:X16} userSgpr={compute.UserScalarCount} tgidX={compute.ThreadGroupIdXEnable} tgidY={compute.ThreadGroupIdYEnable} " +
+                $"tgidZ={compute.ThreadGroupIdZEnable} tgSize={compute.ThreadGroupSizeEnable} tidComps={compute.ThreadIdComponentCount + 1}");
+        }
+
         return new ComputeInputInfo
         {
             ThreadsX = compute.ThreadsX & 0xFFFFu,

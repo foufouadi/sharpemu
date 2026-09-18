@@ -35,6 +35,7 @@ public sealed partial class ScalarValueGraph
     public uint UserDataCount { get; }
     // A wave32 lane mask fills one SGPR; wave64 fills an aligned pair.
     public uint WaveSize { get; }
+    public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; private init; }
 
     // Index-aligned with Memory.Entries; null when the access has no descriptor value.
     public MemoryAccessBinding?[] Accesses { get; private set; } = [];
@@ -48,11 +49,15 @@ public sealed partial class ScalarValueGraph
     public ScalarValue? ResolveInvariantPhi(ScalarValue value) => ScalarValueEquivalence.ResolveInvariantPhi(Memory, value);
 
     public static ScalarValueGraph Build(Gen5ShaderProgram program, uint userDataBase, uint userDataCount,
+        Gen5ComputeSystemRegisters? computeSystemRegisters = null,
         IReadOnlySet<uint>? fixedFunctionVertexLoads = null, uint waveSize = 64)
     {
         var controlFlow = IrControlFlowGraph.Build(program.Instructions, Gen5IrBranchResolver.Instance);
         var graph = new ScalarValueGraph(program, controlFlow, MemoryAccessTable.Build(program, fixedFunctionVertexLoads), userDataBase, userDataCount,
-            waveSize);
+            waveSize)
+        {
+            ComputeSystemRegisters = computeSystemRegisters,
+        };
         new Builder(graph).Run();
         return graph;
     }
@@ -103,6 +108,8 @@ public sealed partial class ScalarValueGraph
     }
 
     internal ScalarValue UserData(uint register) => Intern($"ud:{register}", () => ScalarValue.UserData(register));
+
+    internal ScalarValue SystemRegister(uint kind) => Intern($"sys:{kind}", () => ScalarValue.SystemRegister(kind));
 
     internal ScalarValue ShaderBase() => Intern("base", ScalarValue.ShaderBase);
 
