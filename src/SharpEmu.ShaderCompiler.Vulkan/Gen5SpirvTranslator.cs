@@ -1588,6 +1588,52 @@ public static partial class Gen5SpirvTranslator
 
                     return true;
                 }
+                case "DsSwizzleB32":
+                {
+                    if (instruction.Destinations.Count < 1 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS swizzle operand";
+                        return false;
+                    }
+
+                    // ds_swizzle_b32 is a pure lane exchange (no LDS traffic). The
+                    // 16-bit DS offset is the swizzle control, scoped to groups of 32.
+                    var swizzleData = GetRawSource(instruction, 0);
+                    var swizzlePattern = control.Offset0 | (control.Offset1 << 8);
+                    var swizzleLocalLane = BitwiseAnd(GuestWaveLane(), UInt(31));
+                    uint swizzleSourceLane;
+                    if ((swizzlePattern & 0x8000u) != 0)
+                    {
+                        // Bit mode: src = ((lane & and) | or) ^ xor, 5-bit masks.
+                        swizzleSourceLane = BitwiseXor(
+                            BitwiseOr(
+                                BitwiseAnd(swizzleLocalLane, UInt(swizzlePattern & 0x1Fu)),
+                                UInt((swizzlePattern >> 5) & 0x1Fu)),
+                            UInt((swizzlePattern >> 10) & 0x1Fu));
+                    }
+                    else
+                    {
+                        // Quad mode: lane (quadBase + pattern[2*(lane&3) +: 2]).
+                        var swizzleQuadBase = BitwiseAnd(swizzleLocalLane, UInt(0xFFFF_FFFCu));
+                        var swizzleLaneInQuad = BitwiseAnd(swizzleLocalLane, UInt(3));
+                        var swizzleSel = BitwiseAnd(
+                            ShiftRightLogical(
+                                UInt(swizzlePattern & 0xFFu),
+                                ShiftLeftLogical(swizzleLaneInQuad, UInt(1))),
+                            UInt(3));
+                        swizzleSourceLane = IAdd(swizzleQuadBase, swizzleSel);
+                    }
+
+                    var swizzleShuffled = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        swizzleData,
+                        BitwiseAnd(swizzleSourceLane, UInt(31)));
+                    StoreV(instruction.Destinations[0].Value, swizzleShuffled);
+                    return true;
+                }
                 case "DsRead2B64":
                     return TryEmitDataShareReadPair64(instruction, control, out error);
                 case "DsRead2B32":
@@ -3013,8 +3059,10 @@ public static partial class Gen5SpirvTranslator
         }
 
         // Compare-exchange loop: the merge runs on the observed word until the
-        // exchange succeeds.
-        private void EmitAtomicWordUpdate(uint pointer, Func<uint, uint> merge)
+        // exchange succeeds. Returns the observed (pre-exchange) word at the
+        // point the loop exits, which is a valid use here because it is
+        // defined by the OpPhi in `header`, and `header` dominates `mergeLabel`.
+        private uint EmitAtomicWordUpdate(uint pointer, Func<uint, uint> merge)
         {
             var preheader = _module.AllocateId();
             var header = _module.AllocateId();
@@ -3051,6 +3099,7 @@ public static partial class Gen5SpirvTranslator
             _module.AddLabel(continueLabel);
             _module.AddStatement(SpirvOp.Branch, header);
             _module.AddLabel(mergeLabel);
+            return observed;
         }
 
         private static bool TryGetSubdwordLoadInfo(
@@ -3322,6 +3371,55 @@ public static partial class Gen5SpirvTranslator
                 {
                     error = "image atomic is not bound as storage";
                     return false;
+                }
+
+                // IMAGE_ATOMIC_FMIN/FMAX target float-format storage images and
+                // have no native SPIR-V storage-image atomic without pulling in
+                // SPV_EXT_shader_atomic_float_min_max. Lower them as a
+                // compare-and-swap loop on the underlying bit pattern instead
+                // (same technique used by other float-atomic emulations that
+                // avoid that extension dependency).
+                if (instruction.Opcode is "ImageAtomicFmax" or "ImageAtomicFmin")
+                {
+                    var isMax = instruction.Opcode == "ImageAtomicFmax";
+                    var floatCoordinateCount = ImageCoordinateComponentCount(resource);
+                    var floatAtomicImageSize = _module.AddInstruction(
+                        SpirvOp.ImageQuerySize,
+                        _module.TypeVector(_intType, floatCoordinateCount),
+                        imageObject);
+                    var floatCoordinates = BuildClampedIntegerCoordinates(
+                        image,
+                        0,
+                        floatAtomicImageSize,
+                        floatCoordinateCount);
+                    EmitExecConditional(() =>
+                    {
+                        var pointer = _module.AddInstruction(
+                            SpirvOp.ImageTexelPointer,
+                            _module.TypePointer(SpirvStorageClass.Image, _uintType),
+                            resource.Variable,
+                            floatCoordinates,
+                            UInt(0));
+                        var srcBits = Bitcast(_uintType, LoadV(image.VectorData));
+                        var old = EmitAtomicWordUpdate(pointer, observed =>
+                        {
+                            var oldFloat = Bitcast(_floatType, observed);
+                            var srcFloat = Bitcast(_floatType, srcBits);
+                            var pickSrc = _module.AddInstruction(
+                                isMax ? SpirvOp.FOrdLessThan : SpirvOp.FOrdGreaterThan,
+                                _boolType,
+                                oldFloat,
+                                srcFloat);
+                            var chosen = _module.AddInstruction(
+                                SpirvOp.Select, _floatType, pickSrc, srcFloat, oldFloat);
+                            return Bitcast(_uintType, chosen);
+                        });
+                        if (image.Glc)
+                        {
+                            StoreV(image.VectorData, old);
+                        }
+                    });
+                    return true;
                 }
 
                 if (resource.ComponentKind == ImageComponentKind.Float ||

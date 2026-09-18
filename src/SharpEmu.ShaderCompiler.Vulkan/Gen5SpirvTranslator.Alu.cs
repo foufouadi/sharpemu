@@ -2082,8 +2082,26 @@ public static partial class Gen5SpirvTranslator
                     result = Ext(73, _uintType, left);
                     StoreS(destination, result);
                     return true;
+                case "SFlbitI32B32":
+                {
+                    // Count leading zero bits, 0xFFFFFFFF when the source is zero.
+                    var msb = Ext(74, _uintType, left);
+                    var clz = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), msb);
+                    result = _module.AddInstruction(
+                        SpirvOp.Select, _uintType, IsNotZero(left), clz, UInt(0xFFFFFFFFu));
+                    StoreS(destination, result);
+                    return true;
+                }
+                case "SAbsI32":
+                    result = Ext(5, _uintType, left);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
                 case "SBitset0B32":
                 case "SBitset1B32":
+                    // S_BITSET*_B32 is a read-modify-write of the destination:
+                    // it sets the single bit selected by SSRC0[4:0]. Neither
+                    // form writes SCC.
                     result = _module.AddInstruction(
                         SpirvOp.BitFieldInsert,
                         _uintType,
