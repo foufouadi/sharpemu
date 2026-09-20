@@ -2140,6 +2140,13 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode is "BufferWbinvl1" or "BufferWbinvl1Vol")
+            {
+                // The host storage path is already coherent; the guest instruction
+                // invalidates a cache level and does not access the buffer itself.
+                return true;
+            }
+
             if (control.Typed && instruction.Opcode.Contains("D16", StringComparison.Ordinal))
             {
                 error = $"unsupported buffer opcode {instruction.Opcode}";

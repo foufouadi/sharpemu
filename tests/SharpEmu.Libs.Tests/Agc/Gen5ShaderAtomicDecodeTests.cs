@@ -122,6 +122,17 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(0x0808u, control.SingleOffsetBytes);
     }
 
+    [Fact]
+    public void DsMskorB32KeepsBothDataSources()
+    {
+        var instruction = DecodeSingle(0xD8480000, 0x02010000);
+
+        Assert.Equal("DsMskorB32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            instruction.Sources);
+    }
+
     [Theory]
     [InlineData(0xD8FA3412u, "DsAppend")]
     [InlineData(0xD8F63412u, "DsConsume")]
