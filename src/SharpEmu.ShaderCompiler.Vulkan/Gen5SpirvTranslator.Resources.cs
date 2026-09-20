@@ -335,19 +335,16 @@ public static partial class Gen5SpirvTranslator
                 ImageComponentKind.Uint => _uintType,
                 _ => _floatType,
             };
+            // Guest 1D textures use the same 2D backing/view path as the image
+            // request builder. Keep the shader declaration compatible with that
+            // Vulkan view instead of emitting a 1D image type.
             var spirvDimension = dimension switch
             {
-                ImageDimension.Dim1D or ImageDimension.Dim1DArray => SpirvImageDim.Dim1D,
                 ImageDimension.Dim3D => SpirvImageDim.Dim3D,
                 _ => SpirvImageDim.Dim2D,
             };
             var arrayed = dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray or ImageDimension.Dim2DMsaaArray;
             var multisampled = dimension is ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray;
-            if (spirvDimension == SpirvImageDim.Dim1D)
-            {
-                _module.AddCapability(isStorage ? SpirvCapability.Image1D : SpirvCapability.Sampled1D);
-            }
-
             var format = atomic ? SpirvImageFormat.R32ui : SpirvImageFormat.Unknown;
             if (isStorage && !atomic)
             {
