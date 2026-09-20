@@ -215,21 +215,13 @@ public static partial class ImageRequestBuilders
         }
 
         var pixelFormat = surfaceFormat.HostFormat;
-        // Every atomic image binding (integer or float) is declared as a UINT
-        // storage image at the SPIR-V level (Gen5SpirvTranslator.Resources.cs's
-        // DeclareImageClass forces R32ui + uint sampled type for all atomics -
-        // the float atomics reach the real bits through a bitcast + integer
-        // compare-exchange, not a native SPIR-V float image atomic). The bound
-        // view must match that reinterpretation or vkCmdDispatch fails
-        // VUID-vkCmdDispatch-format-07753, same reasoning as the existing
-        // Bits32SInt storage override just below.
-        var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
         // Comparison sampling needs a depth image, even when no depth target created it.
         if (shape.DepthCompare && DepthFormatRule.FindByGuestFormat(format) is { } depthFormat)
         {
             pixelFormat = depthFormat.DepthAttachmentFormat;
         }
-        var storageViewFormat = storage && format == GuestPixelFormat.Bits32SInt ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
+        // Atomic storage images are declared as UINT in SPIR-V, including float atomics.
+        var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
         var viewFormat = storage && storageViewFormat != Format.Undefined ? storageViewFormat : pixelFormat;
         var blockBytes = GuestPixelFormats.BlockCompressedBytes(format);
         var description = ImageDescription.Create();

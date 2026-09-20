@@ -202,7 +202,11 @@ public static partial class Gen5SpirvTranslator
             ImageComponentKind ComponentKind,
             bool IsStorage,
             bool Arrayed,
-            SpirvImageDim Dimension);
+            bool Cube = false,
+            bool Multisampled = false,
+            SpirvImageDim Dimension = SpirvImageDim.Dim2D,
+            uint ConversionFormat = 0,
+            uint ShaderSwizzle = 0);
 
         private readonly record struct SpirvVertexInput(
             uint Variable,

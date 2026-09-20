@@ -50,6 +50,8 @@ public static class ImageDescriptorBinding
     // class instead of forcing every atomic image to Uint.
     private const uint AtomicFloatBinding = 37;
 
+    public static bool IsCube(DescriptorBindingKind kind) => false;
+
     public static DescriptorBindingKind? ForImage(ImageResource image)
     {
         uint baseBinding;

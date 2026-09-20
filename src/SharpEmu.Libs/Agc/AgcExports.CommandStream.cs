@@ -352,7 +352,7 @@ public static partial class AgcExports
         }
 
 
-        public void Dispatch(ulong submitId, uint endX, uint endY, uint endZ, uint dispatchInitiator)
+        public void Dispatch(ulong submitId, uint endX, uint endY, uint endZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
             var state = RequireCurrent();
             if (_executor is { } executor)
@@ -362,7 +362,7 @@ public static partial class AgcExports
                 var executorStarted = DcbParseProfile.Begin();
                 try
                 {
-                    executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator);
+                    executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress);
                 }
                 finally
                 {
@@ -491,8 +491,8 @@ public static partial class AgcExports
         public override void DrawAuto(ulong submitId, in DrawAutoArguments arguments) =>
             Translation.DrawAuto(submitId, in arguments);
 
-        public override void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator) =>
-            Translation.Dispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator);
+        public override void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0) =>
+            Translation.Dispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
 
         public override void OnQueueReset(int queueId) => Translation.QueueReset(queueId);
 
@@ -515,7 +515,7 @@ public static partial class AgcExports
             public override void DrawAuto(ulong submitId, in DrawAutoArguments arguments) =>
                 Translation.RecordAutoDrawState(in arguments);
 
-            public override void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
+            public override void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
             {
                 Dispatches.Add((submitId, groupsX, groupsY, groupsZ, dispatchInitiator));
             }
