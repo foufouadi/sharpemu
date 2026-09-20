@@ -1253,9 +1253,12 @@ public static partial class Gen5ShaderTranslator
             0x0A => "DsOrB32",
             0x0B => "DsXorB32",
             0x0D => "DsWriteB32",
+            // RDNA encodes the same LDS dword store at 0x13.
+            0x13 => "DsWriteB32",
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
             0x10 => "DsCmpstB32",
+            0x12 => "DsMskorB32",
             0x20 => "DsAddRtnU32",
             0x21 => "DsSubRtnU32",
             0x23 => "DsIncRtnU32",

@@ -1513,6 +1513,8 @@ public static partial class Gen5SpirvTranslator
                 case "DsAppend":
                 case "DsConsume":
                     return TryEmitDataShareWaveCounter(instruction, control, out error);
+                case "DsMskorB32":
+                    return TryEmitDataShareAtomic(instruction, control, out error);
                 case "DsWriteB32":
                 case "DsWriteAddtidB32":
                 {
@@ -1938,6 +1940,40 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode == "DsMskorB32")
+            {
+                if (instruction.Sources.Count < 3)
+                {
+                    error = "missing LDS masked-OR source";
+                    return false;
+                }
+
+                var maskedPointer = LdsPointer(
+                    GetRawSource(instruction, 0),
+                    control.SingleOffsetBytes);
+                EmitExecConditional(() =>
+                {
+                    var original = Load(_uintType, maskedPointer);
+                    var updated = BitwiseOr(
+                        BitwiseAnd(
+                            original,
+                            _module.AddInstruction(
+                                SpirvOp.Not,
+                                _uintType,
+                                GetRawSource(instruction, 1))),
+                        GetRawSource(instruction, 2));
+                    EmitAtomic(
+                        SpirvOp.AtomicCompareExchange,
+                        _uintType,
+                        maskedPointer,
+                        scope: 2,
+                        semantics: 0x108,
+                        value: () => updated,
+                        comparator: () => original);
+                });
+                return true;
+            }
+
             var atomicOp = instruction.Opcode switch
             {
                 "DsAddU32" or "DsAddRtnU32" => SpirvOp.AtomicIAdd,
