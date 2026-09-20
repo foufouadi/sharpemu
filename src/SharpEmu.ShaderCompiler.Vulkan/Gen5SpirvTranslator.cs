@@ -1588,52 +1588,6 @@ public static partial class Gen5SpirvTranslator
 
                     return true;
                 }
-                case "DsSwizzleB32":
-                {
-                    if (instruction.Destinations.Count < 1 ||
-                        instruction.Sources.Count < 1)
-                    {
-                        error = "missing LDS swizzle operand";
-                        return false;
-                    }
-
-                    // ds_swizzle_b32 is a pure lane exchange (no LDS traffic). The
-                    // 16-bit DS offset is the swizzle control, scoped to groups of 32.
-                    var swizzleData = GetRawSource(instruction, 0);
-                    var swizzlePattern = control.Offset0 | (control.Offset1 << 8);
-                    var swizzleLocalLane = BitwiseAnd(GuestWaveLane(), UInt(31));
-                    uint swizzleSourceLane;
-                    if ((swizzlePattern & 0x8000u) != 0)
-                    {
-                        // Bit mode: src = ((lane & and) | or) ^ xor, 5-bit masks.
-                        swizzleSourceLane = BitwiseXor(
-                            BitwiseOr(
-                                BitwiseAnd(swizzleLocalLane, UInt(swizzlePattern & 0x1Fu)),
-                                UInt((swizzlePattern >> 5) & 0x1Fu)),
-                            UInt((swizzlePattern >> 10) & 0x1Fu));
-                    }
-                    else
-                    {
-                        // Quad mode: lane (quadBase + pattern[2*(lane&3) +: 2]).
-                        var swizzleQuadBase = BitwiseAnd(swizzleLocalLane, UInt(0xFFFF_FFFCu));
-                        var swizzleLaneInQuad = BitwiseAnd(swizzleLocalLane, UInt(3));
-                        var swizzleSel = BitwiseAnd(
-                            ShiftRightLogical(
-                                UInt(swizzlePattern & 0xFFu),
-                                ShiftLeftLogical(swizzleLaneInQuad, UInt(1))),
-                            UInt(3));
-                        swizzleSourceLane = IAdd(swizzleQuadBase, swizzleSel);
-                    }
-
-                    var swizzleShuffled = _module.AddInstruction(
-                        SpirvOp.GroupNonUniformShuffle,
-                        _uintType,
-                        UInt(3),
-                        swizzleData,
-                        BitwiseAnd(swizzleSourceLane, UInt(31)));
-                    StoreV(instruction.Destinations[0].Value, swizzleShuffled);
-                    return true;
-                }
                 case "DsRead2B64":
                     return TryEmitDataShareReadPair64(instruction, control, out error);
                 case "DsRead2B32":
