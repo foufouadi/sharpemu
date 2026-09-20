@@ -1113,6 +1113,21 @@ public static partial class Gen5SpirvTranslator
                 case "VCubemaF32":
                     result = EmitCubeCoordinate(instruction, CubeCoordinate.Ma);
                     break;
+                case "VAlignbitB32":
+                {
+                    var first = GetRawSource(instruction, 0);
+                    var second = GetRawSource(instruction, 1);
+                    var shift = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    var reverseShift = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(32),
+                        shift);
+                    var low = ShiftRightLogical(second, shift);
+                    var high = ShiftLeftLogical(first, reverseShift);
+                    result = BitwiseOr(low, high);
+                    break;
+                }
                 case "VAddCoU32":
                 {
                     var left = GetRawSource(instruction, 0);

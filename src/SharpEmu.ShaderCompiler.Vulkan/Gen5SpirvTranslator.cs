@@ -2227,6 +2227,44 @@ public static partial class Gen5SpirvTranslator
             byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
 
+            if (instruction.Opcode is "BufferAtomicSwapX2" or "BufferAtomicOrX2")
+            {
+                EmitExecConditional(() =>
+                {
+                    var firstInRange = IsBufferWordInRange(bindingIndex, dwordAddress);
+                    var secondAddress = IAdd(dwordAddress, UInt(1));
+                    var secondInRange = IsBufferWordInRange(bindingIndex, secondAddress);
+                    EmitConditional(LogicalAnd(firstInRange, secondInRange), () =>
+                    {
+                        var atomicOp = instruction.Opcode == "BufferAtomicSwapX2"
+                            ? SpirvOp.AtomicExchange
+                            : SpirvOp.AtomicOr;
+                        var first = EmitAtomic(
+                            atomicOp,
+                            _uintType,
+                            BufferWordPointer(bindingIndex, dwordAddress),
+                            scope: 1,
+                            semantics: 0x48,
+                            value: () => LoadV(control.VectorData),
+                            comparator: () => UInt(0));
+                        var second = EmitAtomic(
+                            atomicOp,
+                            _uintType,
+                            BufferWordPointer(bindingIndex, secondAddress),
+                            scope: 1,
+                            semantics: 0x48,
+                            value: () => LoadV(control.VectorData + 1),
+                            comparator: () => UInt(0));
+                        if (control.Glc)
+                        {
+                            StoreV(control.VectorData, first);
+                            StoreV(control.VectorData + 1, second);
+                        }
+                    });
+                });
+                return true;
+            }
+
             if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
             {
                 if (!TryGetAtomicOp(instruction.Opcode["BufferAtomic".Length..], out var atomicOp))
