@@ -30,6 +30,7 @@ public sealed partial class ResourceTracker
         public ScalarValue Key = null!;
         public uint HeapSource;
         public bool KeyIsAddressOffset;
+        public bool SuppressMemoryReads = true;
         public int[] Memory = new int[8];
         public ScalarValue[] Reads = new ScalarValue[8];
     }
@@ -110,14 +111,17 @@ public sealed partial class ResourceTracker
         var indirectAccesses = new List<IndirectImageAccess>();
         foreach (var plan in _indirectImages)
         {
-            foreach (var index in plan.Memory)
+            if (plan.SuppressMemoryReads)
             {
-                _plan.Memory[index].PlanningOnly = true;
-            }
+                foreach (var index in plan.Memory)
+                {
+                    _plan.Memory[index].PlanningOnly = true;
+                }
 
-            foreach (var read in plan.Reads)
-            {
-                indirectReads.Add(read);
+                foreach (var read in plan.Reads)
+                {
+                    indirectReads.Add(read);
+                }
             }
 
             for (var index = 0; index < _plan.Accesses.Length; index++)
@@ -760,7 +764,7 @@ public sealed partial class ResourceTracker
     // ---- indirect images ----
 
     private bool IsIndirectPlanningMemory(int index) =>
-        _indirectImages.Any(plan => plan.Memory.Contains(index));
+        _indirectImages.Any(plan => plan.SuppressMemoryReads && plan.Memory.Contains(index));
 
     private void PlanIndirectImages()
     {
@@ -773,7 +777,9 @@ public sealed partial class ResourceTracker
                 continue;
             }
 
-            if (TryMakeIndirectImage(handle, memory.Pc, out var plan) || TryMakeDirectImage(handle, out plan))
+            if (TryMakeIndirectImage(handle, memory.Pc, out var plan) ||
+                TryMakeDenseIndirectImage(handle, memory.Pc, out plan) ||
+                TryMakeDirectImage(handle, out plan))
             {
                 _indirectImages.Add(plan);
             }
@@ -809,6 +815,25 @@ public sealed partial class ResourceTracker
         }
 
         source = MakeSource(handle, 4, false, false, pc);
+        if (!ValidateSource(source, out _))
+        {
+            return false;
+        }
+
+        sourceIndex = InternSource(source);
+        return true;
+    }
+
+    private bool MakeRuntimeAddressSource(ScalarValue handle, uint pc, out uint sourceIndex, out DescriptorSource source)
+    {
+        sourceIndex = 0;
+        source = null!;
+        if (handle.Kind != ScalarValueKind.AddressHandle)
+        {
+            return false;
+        }
+
+        source = MakeSource(handle, 2, false, false, pc);
         if (!ValidateSource(source, out _))
         {
             return false;
