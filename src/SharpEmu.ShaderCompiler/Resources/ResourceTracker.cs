@@ -789,7 +789,8 @@ public sealed partial class ResourceTracker
         }
 
         var memory = _plan.Memory[index];
-        return memory.Kind == MemoryResourceKind.ScalarBuffer && memory.DataBits == 32 && memory.DataDwords == 1 ? memory : null;
+        return memory.Kind is MemoryResourceKind.ScalarBuffer or MemoryResourceKind.Buffer &&
+            memory.DataBits == 32 && memory.DataDwords == 1 ? memory : null;
     }
 
     private bool MemoryIndexBelongsTo(int index, ScalarValue owner) =>

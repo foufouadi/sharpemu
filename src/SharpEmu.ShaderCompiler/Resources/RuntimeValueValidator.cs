@@ -201,6 +201,6 @@ public sealed class RuntimeValueValidator
 
         var kind = _graph.Memory[value.MemoryIndex].Kind;
         return (value.Kind == ScalarValueKind.ScalarAddressWord && kind == MemoryResourceKind.ScalarAddress) ||
-            (value.Kind == ScalarValueKind.ScalarBufferWord && kind == MemoryResourceKind.ScalarBuffer);
+            (value.Kind == ScalarValueKind.ScalarBufferWord && kind is MemoryResourceKind.ScalarBuffer or MemoryResourceKind.Buffer);
     }
 }
