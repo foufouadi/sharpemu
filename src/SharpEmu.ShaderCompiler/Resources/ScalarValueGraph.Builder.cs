@@ -297,6 +297,8 @@ public sealed partial class ScalarValueGraph
 
         private void Apply(Gen5ShaderInstruction instruction, RegisterState state)
         {
+            // Lets ScalarValueGraph.Undefined record which instruction gave up.
+            _graph.BuilderInstruction = (instruction.Pc, instruction.Opcode);
             switch (instruction.Encoding)
             {
                 case Gen5ShaderEncoding.Sop1:
@@ -1006,7 +1008,8 @@ public sealed partial class ScalarValueGraph
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control or Gen5Vop3pControl;
             var value = hasModifiers ? _graph.Undefined(ScalarValueType.U32) : VectorResult(instruction, state);
             if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } carryDestination } && !hasModifiers &&
-                opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or "VMadU64U32")
+                opcode is "VAddCoU32" or "VSubCoU32" or "VSubrevCoU32" or "VAddCoCiU32" or
+                    "VSubCoCiU32" or "VSubrevCoCiU32" or "VMadU64U32")
             {
                 var carry = value.IsUndefined ? _graph.Undefined(ScalarValueType.Bool) : state.CarryOut;
                 WriteMaskPair(state, carryDestination, _graph.Select(carry, _graph.Constant(1u), _graph.Constant(0u)), _graph.Constant(0u), carry);
@@ -1081,6 +1084,26 @@ public sealed partial class ScalarValueGraph
                     var second = Binary64(ScalarOperation.AddCarry32, Extract(first, 0), carryIn);
                     state.CarryOut = Bool(ScalarOperation.LogicalAnd, state.Exec, NotZero(Binary(ScalarOperation.Or32, Extract(first, 1), Extract(second, 1))));
                     return Extract(second, 0);
+                }
+                case "VSubCoCiU32":
+                case "VSubrevCoCiU32":
+                {
+                    var left = opcode == "VSubCoCiU32" ? Source(0) : Source(1);
+                    var right = opcode == "VSubCoCiU32" ? Source(1) : Source(0);
+                    var borrowIn = _graph.Select(
+                        instruction.Sources.Count > 2 ? MaskOf(sources[2], state) : state.Vcc,
+                        _graph.Constant(1u),
+                        _graph.Constant(0u));
+                    var partial = Binary(ScalarOperation.ISub32, left, right);
+                    var result = Binary(ScalarOperation.ISub32, partial, borrowIn);
+                    state.CarryOut = Bool(
+                        ScalarOperation.LogicalAnd,
+                        state.Exec,
+                        Bool(
+                            ScalarOperation.LogicalOr,
+                            Bool(ScalarOperation.UGreaterThan32, right, left),
+                            Bool(ScalarOperation.UGreaterThan32, borrowIn, partial)));
+                    return result;
                 }
                 case "VMulLoU32":
                 case "VMulLoI32":

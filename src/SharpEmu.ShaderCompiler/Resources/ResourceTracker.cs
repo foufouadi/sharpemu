@@ -142,6 +142,52 @@ public sealed partial class ResourceTracker
     private ResourcePlanException Failure(uint pc, string reason) =>
         new($"shader resource tracking: hash=0x{_plan.Hash:X16} stage={_plan.Stage} pc=0x{pc:X8} {reason}");
 
+    /// <summary>
+    /// Names the instructions that produced the undefined leaves <paramref name="value"/>
+    /// rests on, so a rejected descriptor dword points at an opcode.
+    /// </summary>
+    /// <remarks>
+    /// Undefined nodes are interned per type, which erases where each one came
+    /// from, and the builder has about twenty places that produce one. Under
+    /// SHARPEMU_RESOURCE_TRACKER_DIAG the graph interns them per instruction and
+    /// records the origin, which is what makes this list meaningful; without it
+    /// there is nothing to report.
+    /// </remarks>
+    private string DescribeUndefinedLeaves(ScalarValue value)
+    {
+        var origins = new List<string>();
+        var seen = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        pending.Push(value);
+        while (pending.Count != 0 && origins.Count < 8)
+        {
+            var current = pending.Pop();
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.Undefined &&
+                _graph.TryGetUndefinedOrigin(current, out var origin))
+            {
+                var described = $"{origin.Opcode}@0x{origin.Pc:X}";
+                if (!origins.Contains(described))
+                {
+                    origins.Add(described);
+                }
+
+                continue;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return origins.Count == 0 ? string.Empty : $" (undefined from: {string.Join(", ", origins)})";
+    }
+
     // ---- descriptor sources ----
 
     // Copies a handle's dwords into a source. A sampler that no clamp axis sets to
@@ -343,7 +389,10 @@ public sealed partial class ResourceTracker
             }
             else
             {
-                throw Failure(pc, $"{expected} dword {badDword} is not a valid runtime value");
+                throw Failure(
+                    pc,
+                    $"{expected} dword {badDword} is not a valid runtime value" +
+                        DescribeUndefinedLeaves(source.Dwords[badDword]));
             }
         }
 
@@ -956,7 +1005,7 @@ public sealed partial class ResourceTracker
 
         var materialRead = heapOffset.Operands[0];
         var materialMemory = ScalarReadMemory(materialRead, out var materialMemoryIndex);
-        if (materialMemory is null || materialMemory.Offset != 0 || !MemoryIndexBelongsTo(materialMemoryIndex, materialRead))
+        if (materialMemory is null || !MemoryIndexBelongsTo(materialMemoryIndex, materialRead))
         {
             if (diag) Console.Error.WriteLine($"[RT-DIAG] pc=0x{pc:X} reject: materialRead.Kind={materialRead.Kind} materialMemory={(materialMemory is null ? "null" : $"Offset={materialMemory.Offset}")}");
             return false;
@@ -973,6 +1022,10 @@ public sealed partial class ResourceTracker
 
             return false;
         }
+
+        // The selector table may start after a small header in the scalar buffer.
+        // The read's immediate offset is part of the effective selector offset.
+        selectorOffset = unchecked(selectorOffset + materialMemory.Offset);
 
         if (!UsesOnly(materialRead, [heapOffset]) || !UsesOnly(heapOffset, heapReads))
         {

@@ -60,8 +60,48 @@ public sealed partial class ScalarValueGraph
 
     internal ScalarValue Constant(bool value) => Intern($"c1:{value}", () => ScalarValue.ConstantOf(value));
 
-    // One undefined node per type keeps every value built over it stable across visits.
-    internal ScalarValue Undefined(ScalarValueType type) => Intern($"undef:{type}", () => ScalarValue.Undefined(type));
+    /// <summary>
+    /// The instruction the builder is translating, for diagnostics only.
+    /// </summary>
+    /// <remarks>
+    /// Undefined nodes are interned per type, so a single node stands for every
+    /// instruction the builder could not model and carries no origin of its own.
+    /// A resource plan that fails on an undefined dword therefore names no
+    /// culprit, and the builder has about twenty places that produce one. This
+    /// records which instructions actually gave up, so the failure points at an
+    /// opcode instead of a list of candidates.
+    /// </remarks>
+    internal (uint Pc, string Opcode) BuilderInstruction { get; set; }
+
+    private static readonly bool TrackUndefinedOrigins =
+        Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1";
+
+    private readonly Dictionary<ScalarValue, (uint Pc, string Opcode)> _undefinedOrigins = [];
+
+    /// <summary>
+    /// The instruction an undefined value came from, when origins are tracked.
+    /// </summary>
+    internal bool TryGetUndefinedOrigin(ScalarValue value, out (uint Pc, string Opcode) origin) =>
+        _undefinedOrigins.TryGetValue(value, out origin);
+
+    // One undefined node per type keeps every value built over it stable across
+    // visits. Under the tracker diagnostic the node is interned per instruction
+    // instead: revisiting a block reaches the same instruction, so values stay
+    // just as stable, and a descriptor dword that resolves to an undefined value
+    // can then name the instruction that produced it rather than the twenty
+    // places that might have.
+    internal ScalarValue Undefined(ScalarValueType type)
+    {
+        if (!TrackUndefinedOrigins || BuilderInstruction.Opcode is null)
+        {
+            return Intern($"undef:{type}", () => ScalarValue.Undefined(type));
+        }
+
+        var instruction = BuilderInstruction;
+        var value = Intern($"undef:{type}:{instruction.Pc:X}", () => ScalarValue.Undefined(type));
+        _undefinedOrigins.TryAdd(value, instruction);
+        return value;
+    }
 
     internal ScalarValue UserData(uint register) => Intern($"ud:{register}", () => ScalarValue.UserData(register));
 
