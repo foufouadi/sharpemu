@@ -111,6 +111,17 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(0x0808u, control.SingleOffsetBytes);
     }
 
+    [Fact]
+    public void DsWriteB32_RdnaOpcodeDecodesAsTheSameStore()
+    {
+        // RDNA DS_STORE_B32 uses opcode 0x13 instead of the legacy 0x0D encoding.
+        var instruction = DecodeSingle(0xD9B40808, 0x00000100);
+
+        Assert.Equal("DsWriteB32", instruction.Opcode);
+        var control = Assert.IsType<Gen5DataShareControl>(instruction.Control);
+        Assert.Equal(0x0808u, control.SingleOffsetBytes);
+    }
+
     [Theory]
     [InlineData(0xD8FA3412u, "DsAppend")]
     [InlineData(0xD8F63412u, "DsConsume")]
