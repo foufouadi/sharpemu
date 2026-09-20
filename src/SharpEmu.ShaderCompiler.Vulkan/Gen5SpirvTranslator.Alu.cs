@@ -540,6 +540,18 @@ public static partial class Gen5SpirvTranslator
                 case "VMaxF16":
                     result = EmitFloat16ExtBinary(instruction, destination, 40);
                     break;
+                case "VFmaF16":
+                {
+                    var fusedBits = EmitPackedF16FusedMultiplyAdd(
+                        GetFloat16Source(instruction, 0),
+                        GetFloat16Source(instruction, 1),
+                        GetFloat16Source(instruction, 2));
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Bitcast(_floatType, fusedBits));
+                    break;
+                }
                 case "VMadF32":
                 case "VFmaF32":
                 case "VMadMkF32":
@@ -786,6 +798,23 @@ public static partial class Gen5SpirvTranslator
                             SpirvOp.BitCount,
                             _uintType,
                             BitwiseAnd(GetRawSource(instruction, 0), lowBitsMask)));
+                    break;
+                }
+                case "VLshlrevB64":
+                case "VLshrrevB64":
+                {
+                    // D.u64 = S1.u64 {<< | >>} (S0.u32 & 0x3F).
+                    var shiftAmount = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                    var value = GetRawSource64(instruction, 1);
+                    var shifted = instruction.Opcode == "VLshlrevB64"
+                        ? ShiftLeftLogical64(value, shiftAmount)
+                        : ShiftRightLogical64(value, shiftAmount);
+                    result = Narrow(shifted);
+                    StoreV(destination + 1, Narrow(ShiftRightLogical64(
+                        shifted, _module.Constant64(_ulongType, 32))));
                     break;
                 }
                 case "VBfmB32":
@@ -2866,6 +2895,32 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+
+            // S_BITSET0/1_B64 use a 32-bit bit index and update the 64-bit
+            // value already held at the destination; they do not have a
+            // scalar 64-bit source operand.
+            if (instruction.Opcode is "SBitset0B64" or "SBitset1B64")
+            {
+                var bitIndex = Widen(BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var selected = ShiftLeftLogical64(
+                    _module.Constant64(_ulongType, 1),
+                    bitIndex);
+                var current = LoadS64(destination);
+                var updated = instruction.Opcode == "SBitset1B64"
+                    ? _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        current,
+                        selected)
+                    : _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        current,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, selected));
+                StoreS64(destination, updated);
+                return true;
+            }
+
             var left = GetRawSource64(instruction, 0);
             if (instruction.Opcode.EndsWith("SaveexecB64", StringComparison.Ordinal))
             {

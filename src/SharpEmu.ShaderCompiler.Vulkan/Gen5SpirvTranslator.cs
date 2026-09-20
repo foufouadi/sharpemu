@@ -1559,34 +1559,10 @@ public static partial class Gen5SpirvTranslator
 
                     var atomicAddress = GetRawSource(instruction, 0);
                     var isOr = instruction.Opcode == "DsOrB64";
-                    if (_request.SupportsSharedInt64Atomics)
-                    {
-                        // A true 64-bit shared atomic, exposed by Vulkan through
-                        // the Int64Atomics capability and shaderSharedInt64Atomics.
-                        // This is the only form atomic as a pair.
-                        _module.AddCapability(SpirvCapability.Int64Atomics);
-                        var widePointer = LdsPointer64(atomicAddress, control.SingleOffsetBytes);
-                        EmitExecConditional(() =>
-                        {
-                            var wideValue = Pair64(
-                                GetRawSource(instruction, 1),
-                                GetRawSource(instruction, 2));
-                            _module.AddInstruction(
-                                isOr ? SpirvOp.AtomicOr : SpirvOp.AtomicIAdd,
-                                _ulongType,
-                                widePointer,
-                                UInt(2),
-                                UInt(0x108),
-                                wideValue);
-                        });
-
-                        return true;
-                    }
-
-                    // Fallback when the device lacks shaderSharedInt64Atomics: two
-                    // 32-bit atomics. The final arithmetic result is exact without
-                    // contention, but the pair is not atomic against a concurrent
-                    // 64-bit update. Device setup warns once when this is used.
+                    // The LDS allocation is a uint array. Reinterpreting its
+                    // pointer as ulong with OpBitcast is invalid SPIR-V, so use
+                    // the dword fallback even when native 64-bit atomics exist.
+                    // The pair is not atomic against concurrent 64-bit use.
                     var lowPointer = LdsPointer(
                         atomicAddress,
                         control.SingleOffsetBytes);
@@ -1948,12 +1924,6 @@ public static partial class Gen5SpirvTranslator
                 _lds,
                 index);
         }
-
-        // A 64-bit view of the same LDS bytes, for true 64-bit shared atomics.
-        // The dword index is even by the ISA's 8-byte alignment rule, so the
-        // bitcast only changes the pointee type, not the address.
-        private uint LdsPointer64(uint address, uint offsetBytes) =>
-            Bitcast(_lds64ElementPointer, LdsPointer(address, offsetBytes));
 
         private void StoreLds(uint pointer, uint value)
         {
