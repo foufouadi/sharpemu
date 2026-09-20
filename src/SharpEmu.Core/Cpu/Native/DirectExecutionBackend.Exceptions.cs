@@ -114,7 +114,10 @@ public sealed partial class DirectExecutionBackend
 
 			ulong rip = ReadCtxU64(contextRecord, 248);
 			ulong rsp = ReadCtxU64(contextRecord, 152);
-			if (TryRecoverGuestInt41(exceptionCode, contextRecord, rip))
+			var faultAddress = ReadFaultAddress(exceptionRecord);
+			if (RecordGuestFault(
+					TryRecoverGuestInt41(exceptionCode, contextRecord, rip),
+					GuestFaultHandler.GuestInt41, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
@@ -122,36 +125,52 @@ public sealed partial class DirectExecutionBackend
 				exceptionCode == 3221225477u &&
 				exceptionRecord->NumberParameters >= 2 &&
 				exceptionRecord->ExceptionInformation[0] == 1uL &&
-				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
-					exceptionRecord->ExceptionInformation[1]))
+				RecordGuestFault(
+					SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
+						exceptionRecord->ExceptionInformation[1]),
+					GuestFaultHandler.ImageWriteTracker, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
-			if (TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip))
+			if (RecordGuestFault(
+					TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip),
+					GuestFaultHandler.AuxiliaryThreadExecute, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
 
-			if (exceptionCode == 3221225477u && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
+			if (exceptionCode == 3221225477u &&
+				RecordGuestFault(
+					TryHandleLazyCommittedPage(exceptionRecord, rip, rsp),
+					GuestFaultHandler.LazyCommit, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
 			if (exceptionCode == 3221225477u &&
-				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+				RecordGuestFault(
+					TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip),
+					GuestFaultHandler.AllocatorHole, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u && TryResolveGpuFault(exceptionRecord))
+			if (exceptionCode == 3221225477u &&
+				RecordGuestFault(
+					TryResolveGpuFault(exceptionRecord),
+					GuestFaultHandler.GpuFault, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
 			if (exceptionCode == StatusIllegalInstruction &&
-				TryRecoverIllegalInstruction(contextRecord, rip))
+				RecordGuestFault(
+					TryRecoverIllegalInstruction(contextRecord, rip),
+					GuestFaultHandler.IllegalInstruction, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
 			if (exceptionCode == StatusIllegalInstruction &&
-				TryRecoverAmdCompatInstruction(contextRecord, rip))
+				RecordGuestFault(
+					TryRecoverAmdCompatInstruction(contextRecord, rip),
+					GuestFaultHandler.AmdCompat, rip, rsp, faultAddress))
 			{
 				return -1;
 			}
@@ -358,7 +377,13 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine("[LOADER][ERROR]     - Guest code accessed unmapped memory");
 					Console.Error.WriteLine("[LOADER][ERROR]     - Need to implement HLE for this NID");
 					byte[] code = new byte[16];
-					if (TryReadHostBytes(rip, code))
+					DumpHostRegion("RIP", rip);
+					// Guest code can be mapped execute-only, which makes every
+					// host-side read of it fail. The guest memory view still
+					// resolves those pages, so prefer it here: otherwise the
+					// whole call-site report below is silently skipped on
+					// exactly the faults that need it.
+					if (TryReadGuestOrHostBytes(rip, code))
 					{
 						Console.Error.WriteLine("[LOADER][INFO]   Code at RIP: " + BitConverter.ToString(code).Replace("-", " "));
 						if (code[0] == 100)
@@ -376,12 +401,12 @@ public sealed partial class DirectExecutionBackend
 							Console.Error.WriteLine($"[LOADER][INFO]   RSP: 0x{rsp:X16} (mod 16 = {rsp % 16})");
 						}
 						byte[] before = new byte[16];
-						if (rip > 16 && TryReadHostBytes(rip - 16, before))
+						if (rip > 16 && TryReadGuestOrHostBytes(rip - 16, before))
 						{
 							Console.Error.WriteLine("[LOADER][INFO]   Code before RIP: " + BitConverter.ToString(before).Replace("-", " "));
 						}
 						byte[] window = new byte[64];
-						if (rip > 32 && TryReadHostBytes(rip - 32, window))
+						if (rip > 32 && TryReadGuestOrHostBytes(rip - 32, window))
 						{
 							Console.Error.WriteLine("[LOADER][INFO]   Code window [RIP-0x20..]: " + BitConverter.ToString(window).Replace("-", " "));
 						}
@@ -398,7 +423,7 @@ public sealed partial class DirectExecutionBackend
 								continue;
 							}
 							byte[] callSiteWindow = new byte[48];
-							if (TryReadHostBytes(candidate - 24, callSiteWindow))
+							if (TryReadGuestOrHostBytes(candidate - 24, callSiteWindow))
 							{
 								Console.Error.WriteLine(
 									$"[LOADER][INFO]   Stack guest-code candidate [rsp+0x{stackIndex * 8:X2}]=0x{candidate:X16}, bytes [-0x18..]: " +
@@ -410,6 +435,11 @@ public sealed partial class DirectExecutionBackend
 					{
 						Console.Error.WriteLine("[LOADER][ERROR]   Could not read code at RIP");
 					}
+					// The faulting instruction is the first thing an access
+					// violation report has to answer, so decode it through guest
+					// memory as well: that path still works when the host code
+					// page refuses a plain read.
+					DumpGuestInstructionStream("fault", rip, 4);
 					DumpRecentImportTrace();
 					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
 					DumpGuestRegisterWindowDiagnostics(
@@ -417,6 +447,7 @@ public sealed partial class DirectExecutionBackend
 						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
+					DumpGuestFaultCensus("access violation");
 					break;
 				case 2147483651u:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
@@ -1454,6 +1485,44 @@ public sealed partial class DirectExecutionBackend
 		// become invalid while an exception is being reported.
 		new ReadOnlySpan<byte>((void*)address, buffer.Length).CopyTo(buffer);
 		return true;
+	}
+
+	/// <summary>
+	/// Reads guest bytes for a crash report, preferring the guest memory view
+	/// over a raw host read. Guest code pages are commonly committed
+	/// PAGE_EXECUTE, which no host read can satisfy.
+	/// </summary>
+	private bool TryReadGuestOrHostBytes(ulong address, byte[] buffer)
+	{
+		if (_cpuContext is { } context)
+		{
+			try
+			{
+				if (context.Memory.TryRead(address, buffer))
+				{
+					return true;
+				}
+			}
+			catch
+			{
+				// Fall through to the host reader.
+			}
+		}
+
+		return TryReadHostBytes(address, buffer);
+	}
+
+	private unsafe static void DumpHostRegion(string name, ulong address)
+	{
+		if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+		{
+			Console.Error.WriteLine($"[LOADER][INFO]   {name} region: <VirtualQuery failed> address=0x{address:X16}");
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO]   {name} region: base=0x{mbi.BaseAddress:X16} size=0x{mbi.RegionSize:X16} " +
+			$"state=0x{mbi.State:X08} protect=0x{mbi.Protect:X08} type=0x{mbi.Type:X08}");
 	}
 
 	private unsafe static bool IsReadableHostRange(ulong address, int byteCount, bool allowExecuteOnly = false)
