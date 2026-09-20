@@ -99,9 +99,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private static ShaderImageShape ShapeOf(ImageResource image) => new(
             Volume: image.Dimension == ImageDimension.Dim3D,
             Arrayed: image.Cube || image.Dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray or ImageDimension.Dim2DMsaaArray,
+            Cube: image.Cube,
             Storage: image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage,
             DynamicMip: image.MipMode == ImageMipMode.DynamicStorage,
             NumericClass: NumericClassOf(image),
+            OneDimensional: image.Dimension is ImageDimension.Dim1D or ImageDimension.Dim1DArray,
+            R128: image.R128,
+            Multisampled: image.Dimension is ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray,
+            DepthCompare: image.DepthCompare,
             Atomic: image.Atomic);
 
         // Render-state discovery for one shader image; the view is acquired later with the draw.

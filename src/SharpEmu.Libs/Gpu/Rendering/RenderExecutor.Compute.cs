@@ -22,7 +22,7 @@ public sealed partial class RenderExecutor
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
-    public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
+    public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
         if (!_host.IsRecording)
         {
@@ -77,13 +77,13 @@ public sealed partial class RenderExecutor
                 $"buffers={program.Buffers.Length} images={program.Images.Length} samplers={program.SamplerCount}");
         }
 
-        if (TryConsumeMetadataClear(input))
+        if (indirectArgumentsAddress == 0 && TryConsumeMetadataClear(input))
         {
             _host.ResetBindings();
             return;
         }
 
-        if (TryConsumeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator))
+        if (indirectArgumentsAddress == 0 && TryConsumeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
             _host.ResetBindings();
             return;
@@ -91,6 +91,9 @@ public sealed partial class RenderExecutor
 
         if (useThreadDimensions)
         {
+            // The indirect buffer carries thread counts in this mode, while Vulkan indirect
+            // dispatch consumes workgroup counts. Use the CPU-resolved counts after conversion.
+            indirectArgumentsAddress = 0;
             var threadsX = groupsX;
             var threadsY = groupsY;
             var threadsZ = groupsZ;
@@ -105,7 +108,7 @@ public sealed partial class RenderExecutor
             }
         }
 
-        if (groupsX == 0 || groupsY == 0 || groupsZ == 0)
+        if (indirectArgumentsAddress == 0 && (groupsX == 0 || groupsY == 0 || groupsZ == 0))
         {
             if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
             {
@@ -141,7 +144,6 @@ public sealed partial class RenderExecutor
             }
 
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
-
             // The shader's local workgroup axes may have been remapped at compile time
             // (see Gen5SpirvTranslator.ComputeWorkgroupAxisOrder) so the largest NUM_THREAD
             // axis lands on a physical axis Vulkan actually allows it on. The dispatch group
@@ -158,7 +160,10 @@ public sealed partial class RenderExecutor
                 physicalGroups[axisOrder[logical]] = logicalGroups[logical];
             }
 
-            _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
+            if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
+            {
+                _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
+            }
             _host.ShaderAccessBarrier();
         }
 

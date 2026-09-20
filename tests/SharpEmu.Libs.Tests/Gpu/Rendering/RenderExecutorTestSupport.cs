@@ -324,6 +324,8 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public void Dispatch(uint groupsX, uint groupsY, uint groupsZ) => Calls.Add($"dispatch {groupsX} {groupsY} {groupsZ}");
 
+    public bool TryDispatchIndirect(ulong argumentsAddress) => false;
+
     public void ShaderWriteBarrier(PipelineStageFlags sourceStages) => Calls.Add($"write_barrier {sourceStages}");
 
     public void ShaderWriteHazardBarrier() => Calls.Add("write_hazard_barrier");
@@ -354,6 +356,9 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer) =>
         Calls.Add($"resolve {source.Index}:{sourceMip}:{sourceLayer} -> {destination.Index}:{destinationMip}:{destinationLayer}");
+
+    public void CopyDepthStencilImage(ResourceSlotIdentifier source, ResourceSlotIdentifier destination, in SubresourceRange range, in Extent3D extent, ImageAspectFlags aspects) =>
+        Calls.Add($"copy_depth_stencil {source.Index} -> {destination.Index} {aspects}");
 
     public bool IsMetadata(ulong address)
     {
