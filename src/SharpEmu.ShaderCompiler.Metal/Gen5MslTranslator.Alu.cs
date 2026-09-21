@@ -415,8 +415,10 @@ public static partial class Gen5MslTranslator
                     }
                     case "VSubbU32":
                     case "VSubbrevU32":
+                    case "VSubCoCiU32":
+                    case "VSubrevCoCiU32":
                     {
-                        var reverse = instruction.Opcode == "VSubbrevU32";
+                        var reverse = instruction.Opcode is "VSubbrevU32" or "VSubrevCoCiU32";
                         var left = Temp("uint", RawSource(instruction, reverse ? 1 : 0));
                         var right = Temp("uint", RawSource(instruction, reverse ? 0 : 1));
                         var borrowIn = instruction.Sources.Count > 2

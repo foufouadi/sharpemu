@@ -388,10 +388,11 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
-    public void WrappedScalarImmediate_DoesNotEnterTheIndirectImageProof()
+    public void MaterialHeaderImmediate_ContributesToTheIndirectImageOffset()
     {
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(IndirectImageProgram(false, materialImmediate: 4)));
-        Assert.Contains("not a valid runtime value", error.Message);
+        var plan = Extract(IndirectImageProgram(false, materialImmediate: 4));
+        var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.Equal(4u, selector.SelectorOffset);
     }
 
     [Fact]

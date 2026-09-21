@@ -251,7 +251,9 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                return false;
+                // Robust buffer reads from an empty/out-of-range V# return zero.
+                result = 0;
+                return true;
             }
 
             address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;

@@ -658,9 +658,11 @@ public static partial class Gen5SpirvTranslator
                     result = EmitIntegerBinary(instruction, SpirvOp.ISub, reverse: true);
                     break;
                 case "VSubbU32":
+                case "VSubCoCiU32":
                     result = EmitSubtractWithBorrow(instruction, reverse: false);
                     break;
                 case "VSubbrevU32":
+                case "VSubrevCoCiU32":
                     result = EmitSubtractWithBorrow(instruction, reverse: true);
                     break;
                 case "VMulI32I24":
@@ -1313,6 +1315,67 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     break;
+                case "VAddNcU16":
+                case "VAddNcI16":
+                case "VSubNcU16":
+                case "VSubNcI16":
+                case "VLshrrevB16":
+                case "VLshlrevB16":
+                case "VAshrrevI16":
+                case "VMaxU16":
+                case "VMinU16":
+                case "VMaxI16":
+                case "VMinI16":
+                {
+                    if (instruction.Control is Gen5Vop3Control { Clamp: true })
+                    {
+                        error = $"{instruction.Opcode}: clamped 16-bit integer results are not supported";
+                        return false;
+                    }
+
+                    var signed = instruction.Opcode.EndsWith("I16", StringComparison.Ordinal);
+                    var left = GetInt16Source(instruction, 0, signed);
+                    var right = GetInt16Source(instruction, 1, signed);
+                    uint value;
+                    switch (instruction.Opcode)
+                    {
+                        case "VAddNcU16":
+                        case "VAddNcI16":
+                            value = _module.AddInstruction(SpirvOp.IAdd, _uintType, left, right);
+                            break;
+                        case "VSubNcU16":
+                        case "VSubNcI16":
+                            value = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                            break;
+                        case "VLshrrevB16":
+                            value = ShiftRightLogical(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VLshlrevB16":
+                            value = ShiftLeftLogical(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VAshrrevI16":
+                            value = ShiftRightArithmetic(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VMaxU16":
+                            value = Ext(41, _uintType, left, right);
+                            break;
+                        case "VMinU16":
+                            value = Ext(38, _uintType, left, right);
+                            break;
+                        default:
+                            value = Bitcast(
+                                _uintType,
+                                Ext(
+                                    instruction.Opcode == "VMaxI16" ? 42u : 39u,
+                                    _intType,
+                                    Bitcast(_intType, left),
+                                    Bitcast(_intType, right)));
+                            break;
+                    }
+
+                    result = EmitInt16Result(instruction, destination, value);
+                    break;
+                }
                 default:
                     error = $"unsupported vector opcode {instruction.Opcode}";
                     return false;
@@ -3008,6 +3071,13 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+                if (!_emulateWave64 && _waveLaneCount != 64)
+                {
+                    newExec = BitwiseAnd(
+                        newExec,
+                        _module.Constant64(_ulongType, 0xFFFF_FFFFUL));
+                }
+
                 StoreS64(destination, oldExec);
                 StoreS64(126, newExec);
                 Store(_scc, IsNotZero64(newExec));
@@ -4534,6 +4604,30 @@ public static partial class Gen5SpirvTranslator
                 sourceActive,
                 shuffled,
                 UInt(0));
+        }
+
+        private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)
+        {
+            var raw = GetRawSource(instruction, sourceIndex, applySdwaIntegerModifiers: false);
+            if (instruction.Control is Gen5Vop3Control control && (control.OperandSelect & (1u << sourceIndex)) != 0)
+            {
+                raw = ShiftRightLogical(raw, UInt(16));
+            }
+
+            var half = BitwiseAnd(raw, UInt(0xFFFF));
+            return signed
+                ? ShiftRightArithmetic(ShiftLeftLogical(half, UInt(16)), UInt(16))
+                : half;
+        }
+
+        private uint EmitInt16Result(Gen5ShaderInstruction instruction, uint destination, uint value)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var half = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(BitwiseAnd(current, UInt(0x0000_FFFF)), ShiftLeftLogical(half, UInt(16)))
+                : BitwiseOr(BitwiseAnd(current, UInt(0xFFFF_0000)), half);
         }
 
         private uint EmitFloat16Result(

@@ -1073,6 +1073,8 @@ public static partial class Gen5ShaderTranslator
             ? opcode switch
             {
                 0x128 => "VAddCoCiU32",
+                0x129 => "VSubCoCiU32",
+                0x12A => "VSubrevCoCiU32",
                 0x30F => "VAddCoU32",
                 0x310 => "VSubCoU32",
                 0x319 => "VSubrevCoU32",
@@ -1157,6 +1159,18 @@ public static partial class Gen5ShaderTranslator
             0x372 => "VOr3U32",
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
+            // GFX10 16-bit integer ALU, VOP3-only.
+            0x303 => "VAddNcU16",
+            0x304 => "VSubNcU16",
+            0x307 => "VLshrrevB16",
+            0x308 => "VAshrrevI16",
+            0x309 => "VMaxU16",
+            0x30A => "VMaxI16",
+            0x30B => "VMinU16",
+            0x30C => "VMinI16",
+            0x30D => "VAddNcI16",
+            0x30E => "VSubNcI16",
+            0x314 => "VLshlrevB16",
             // VOP3-encoded 64-bit VOPC (opcode < 0x100): V_CMP_*_U64 / V_CMPX_*_U64.
             0x0E0 => "VCmpFU64",
             0x0E1 => "VCmpLtU64",
@@ -1181,7 +1195,8 @@ public static partial class Gen5ShaderTranslator
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>
-        opcode is 0x128 or 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
+        opcode is 0x128 or 0x129 or 0x12A or 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310
+            or 0x319;
 
     private static bool DecodeRaw2(
         uint word,
@@ -1536,7 +1551,7 @@ public static partial class Gen5ShaderTranslator
 
     private static bool DecodeMimg(uint word, out string name, out uint sizeDwords, out string error)
     {
-        var opcode = (word >> 18) & 0x7F;
+        var opcode = ((word >> 18) & 0x7Fu) | ((word & 1u) << 7);
         sizeDwords = 2 + ((word >> 1) & 0x3);
         error = string.Empty;
         name = opcode switch
@@ -1581,6 +1596,8 @@ public static partial class Gen5ShaderTranslator
             0x4E => "ImageGather4CBCl",
             0x57 => "ImageGather4LzO",
             0x5F => "ImageGather4CLzO",
+            0xE6 => "ImageBvhIntersectRay",
+            0xE7 => "ImageBvh64IntersectRay",
             _ => string.Empty,
         };
 
@@ -2156,7 +2173,7 @@ public static partial class Gen5ShaderTranslator
                 control = new Gen5DataShareControl(
                     word & 0xFF,
                     (word >> 8) & 0xFF,
-                    ((word >> 16) & 1) != 0);
+                    ((word >> 17) & 1) != 0);
                 sources = opcode switch
                 {
                     "DsAppend" or "DsConsume" or "DsReadAddtidB32" => [Gen5Operand.Scalar(124)],
