@@ -11,6 +11,8 @@ public static class KernelExports
     private static readonly object _cxaGate = new();
     private static readonly List<CxaDestructorEntry> _cxaDestructors = new();
     private static readonly object _coredumpGate = new();
+    private const string RepeatedGuestAssertion = "Assertion failed: 0";
+    private static int _repeatedGuestAssertionCount;
     private static ulong _coredumpHandler;
     private static ulong _coredumpHandlerContext;
 
@@ -415,17 +417,40 @@ public static class KernelExports
         ulong fmtPtr = ctx[CpuRegister.Rdi];
         string fmt = ReadCString(ctx, fmtPtr, 4096);
         string outStr = KernelMemoryCompatExports.FormatStringFromVarArgs(ctx, fmt, firstGpArgIndex: 1);
-        if (outStr.EndsWith('\n') || outStr.EndsWith('\r'))
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(outStr);
+        if (ShouldWriteGuestPrintf(outStr))
         {
-            Console.Write($"[DEBUG][PRINF] {outStr}");
-        }
-        else
-        {
-            Console.WriteLine($"[DEBUG][PRINF] {outStr}");
+            if (outStr.EndsWith('\n') || outStr.EndsWith('\r'))
+            {
+                Console.Write($"[DEBUG][PRINF] {outStr}");
+            }
+            else
+            {
+                Console.WriteLine($"[DEBUG][PRINF] {outStr}");
+            }
         }
 
-        ctx[CpuRegister.Rax] = (ulong)System.Text.Encoding.UTF8.GetByteCount(outStr);
+        ctx[CpuRegister.Rax] = (ulong)byteCount;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Demon\'s Souls can print this same guest-side diagnostic thousands of times during
+    // bootstrap. Printing it does not convey new state and serializes the emulation threads,
+    // but printf must still report its original byte count to the guest.
+    private static bool ShouldWriteGuestPrintf(string text)
+    {
+        if (!string.Equals(text.TrimEnd('\r', '\n'), RepeatedGuestAssertion, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var count = Interlocked.Increment(ref _repeatedGuestAssertionCount);
+        if (count == 2)
+        {
+            Console.WriteLine("[DEBUG][PRINF] Further repeated 'Assertion failed: 0' messages are suppressed.");
+        }
+
+        return count == 1;
     }
 
     [SysAbiExport(

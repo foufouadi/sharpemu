@@ -872,11 +872,16 @@ public static partial class Gen5SpirvTranslator
                 var locations = Gen5PixelInputMapping.ResolveLocations(
                     _pixelInputCntl,
                     attributes);
+                DeclareInterpolationParameters();
                 for (var index = 0; index < attributes.Length; index++)
                 {
                     var attribute = attributes[index];
+                    // V_INTERP_MOV reads one vertex of the primitive, so its attribute is a
+                    // per-vertex array rather than an interpolated value.
                     var variable = _module.AddGlobalVariable(
-                        inputVec4Pointer,
+                        _perVertexAttributes.Contains(attribute)
+                            ? _module.TypePointer(SpirvStorageClass.Input, _module.TypeArray(_vec4Type, 3))
+                            : inputVec4Pointer,
                         SpirvStorageClass.Input);
                     // VINTRP ATTR selects the PS input slot. SPI_PS_INPUT_CNTL
                     // maps that slot to a VS parameter export location.
@@ -887,7 +892,11 @@ public static partial class Gen5SpirvTranslator
                         variable,
                         SpirvDecoration.Location,
                         locations[index]);
-                    if ((cntl & 0x400u) != 0)
+                    if (_perVertexAttributes.Contains(attribute))
+                    {
+                        _module.AddDecoration(variable, SpirvDecoration.PerVertexKhr);
+                    }
+                    else if ((cntl & 0x400u) != 0)
                     {
                         _module.AddDecoration(variable, SpirvDecoration.Flat);
                     }
@@ -1177,6 +1186,19 @@ public static partial class Gen5SpirvTranslator
         {
             if ((_pixelInputAddress & (1u << bit)) != 0)
             {
+                // Shaders that interpolate by hand (P1/P2 on per-vertex attributes) read
+                // the I/J barycentrics from these registers.
+                if (_barycentricInputs.TryGetValue(bit, out var barycentricInput))
+                {
+                    var coordinates = LoadBarycentricCoordinates(bit, barycentricInput);
+                    for (uint component = 0; component < 2; component++)
+                    {
+                        var coordinate = _module.AddInstruction(
+                            SpirvOp.CompositeExtract, _floatType, coordinates, component + 1);
+                        StoreV(vgpr + component, Bitcast(_uintType, coordinate), guardWithExec: false);
+                    }
+                }
+
                 vgpr += dwordCount;
             }
         }
@@ -1416,8 +1438,7 @@ public static partial class Gen5SpirvTranslator
                 // NGG shaders bracket their exports with s_sendmsg
                 // (GS_ALLOC_REQ/DEALLOC) to reserve hardware export space;
                 // exports are translated directly, so the message is moot.
-                "SSendmsg" or
-                "VInterpMovF32")
+                "SSendmsg")
             {
                 return true;
             }
@@ -2106,6 +2127,11 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (_perVertexAttributes.Contains(interpolation.Attribute))
+            {
+                return TryEmitInterpolationParameter(instruction, interpolation, input, destination, out error);
+            }
+
             var vector = Load(_vec4Type, input);
             var component = _module.AddInstruction(
                 SpirvOp.CompositeExtract,
@@ -2306,10 +2332,28 @@ public static partial class Gen5SpirvTranslator
                 instruction.Opcode.StartsWith("BufferStoreByte", StringComparison.Ordinal) ||
                 instruction.Opcode.StartsWith("BufferStoreShort", StringComparison.Ordinal))
             {
+                var untypedFormatStore = !control.Typed && instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal);
+                var descriptorFormat = info.Buffers[bindingIndex].DescriptorFormat;
+                if (untypedFormatStore && descriptorFormat != DescriptorConstants.InvalidFormat &&
+                    !Gfx10UnifiedFormat.TryDecode(descriptorFormat, out _, out _))
+                {
+                    error = $"unsupported buffer store format {descriptorFormat}";
+                    return false;
+                }
+
                 EmitExecConditional(() =>
                 {
-                    if (control.Typed && TryEmitTypedBufferFormatStore(bindingIndex, byteAddress, control, descriptorWord3))
+                    if (control.Typed && TryEmitBufferFormatStore(bindingIndex, byteAddress, control, control.TypedFormat, descriptorWord3))
                     {
+                        return;
+                    }
+
+                    // An untyped format store converts with the descriptor's format, as the
+                    // matching load does; a descriptor without a format discards it.
+                    if (untypedFormatStore)
+                    {
+                        if (descriptorFormat != DescriptorConstants.InvalidFormat)
+                            TryEmitBufferFormatStore(bindingIndex, byteAddress, control, descriptorFormat, descriptorWord3);
                         return;
                     }
 
@@ -2616,15 +2660,17 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // A typed store converts each register with the format's number format and places
+        // A format store converts each register with the format's number format and places
         // the bits at the component's offset; all transferred components are stored or dropped.
-        private bool TryEmitTypedBufferFormatStore(
+        // The unified format comes from the instruction (typed) or the descriptor (untyped).
+        private bool TryEmitBufferFormatStore(
             int bindingIndex,
             uint byteAddress,
             Gen5BufferMemoryControl control,
+            uint unifiedFormat,
             uint descriptorWord3)
         {
-            if (!Gfx10UnifiedFormat.TryDecode(control.TypedFormat, out var dataFormat, out var numberFormat))
+            if (!Gfx10UnifiedFormat.TryDecode(unifiedFormat, out var dataFormat, out var numberFormat))
             {
                 return false;
             }

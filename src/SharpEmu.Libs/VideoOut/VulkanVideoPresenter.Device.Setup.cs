@@ -50,6 +50,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private string? _pipelineCachePath;
         private bool _pipelineCacheDirty;
         private long _lastPipelineCacheSaveTick;
+        // Reading a mature driver cache can itself take several seconds. Keep the
+        // render thread focused on pipeline warm-up; teardown still saves eagerly.
+        private const long PipelineCacheCheckpointIntervalMs = 300_000;
         private Queue _queue;
         private uint _queueFamilyIndex;
 
@@ -1183,7 +1186,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // frame, so saving after every slow creation compounds a warm-up
             // hitch into a multi-minute stall. Coalesce all creations into one
             // periodic snapshot; shutdown still forces a final save.
-            if (Environment.TickCount64 - _lastPipelineCacheSaveTick >= 30_000)
+            if (Environment.TickCount64 - _lastPipelineCacheSaveTick >= PipelineCacheCheckpointIntervalMs)
             {
                 SavePipelineCache(force: false);
             }

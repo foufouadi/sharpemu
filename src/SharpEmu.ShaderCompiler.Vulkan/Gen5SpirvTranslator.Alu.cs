@@ -119,12 +119,8 @@ public static partial class Gen5SpirvTranslator
                     // Per-lane: if current lane == src1, write src0, else keep old value.
                     var oldValue = LoadV(destination);
                     var src0 = GetRawSource(instruction, 0);
-                    var laneSelect = GetRawSource(instruction, 1);
-                    var currentLane = _subgroupInvocationIdInput != 0
-                        ? BitwiseAnd(
-                            Load(_uintType, _subgroupInvocationIdInput),
-                            UInt(RdnaWaveLaneCount - 1))
-                        : UInt(0);
+                    var laneSelect = GuestLaneSelect(GetRawSource(instruction, 1));
+                    var currentLane = GuestWaveLane();
                     var isTargetLane = _module.AddInstruction(
                         SpirvOp.IEqual,
                         _boolType,
@@ -4407,6 +4403,24 @@ public static partial class Gen5SpirvTranslator
             return result;
         }
 
+        // A lane selector reduced to the guest wave: bits [5:0] for wave64, [4:0] for wave32.
+        private uint GuestLaneSelect(uint selector) =>
+            BitwiseAnd(selector, UInt(_waveLaneCount == 64 ? 63u : RdnaWaveLaneCount - 1));
+
+        // An emulated wave64 spans two host subgroups, so a subgroup broadcast cannot reach
+        // the other half. The selected guest lane publishes through workgroup scratch, like
+        // BroadcastFirstWave64Active; the trailing barrier keeps the next use from racing.
+        private uint BroadcastWave64Lane(uint value, uint lane)
+        {
+            EmitConditional(
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, GuestWaveLane(), lane),
+                () => Store(WaveBroadcastScratchPointer(), value));
+            EmitWave64Barrier();
+            var result = Load(_uintType, WaveBroadcastScratchPointer());
+            EmitWave64Barrier();
+            return result;
+        }
+
         private uint BroadcastFirstWave64Active(uint value)
         {
             var lane = GuestWaveLane();
@@ -4502,15 +4516,17 @@ public static partial class Gen5SpirvTranslator
 
             if (_subgroupInvocationIdInput != 0)
             {
-                // sdst = vsrc0[lane(src1)] — broadcast from the specified lane.
-                var laneSelect = GetRawSource(instruction, 1);
-                var broadcast = _module.AddInstruction(
-                    SpirvOp.GroupNonUniformBroadcast,
-                    _uintType,
-                    UInt(3),  // Subgroup scope
-                    src0,
-                    laneSelect);
-                StoreS(destination, broadcast);
+                // sdst = vsrc0[lane(src1)], ignoring EXEC. The selector is taken
+                // modulo the guest wave, as the hardware only decodes its low bits.
+                var laneSelect = GuestLaneSelect(GetRawSource(instruction, 1));
+                StoreS(destination, _emulateWave64
+                    ? BroadcastWave64Lane(src0, laneSelect)
+                    : _module.AddInstruction(
+                        SpirvOp.GroupNonUniformBroadcast,
+                        _uintType,
+                        UInt(3),  // Subgroup scope
+                        src0,
+                        laneSelect));
             }
             else
             {

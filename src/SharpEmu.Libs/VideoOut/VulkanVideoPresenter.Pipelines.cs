@@ -115,6 +115,19 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // The same ownership rules as the two word readers, checked once for a whole range.
+        public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
+        {
+            var size = (ulong)destination.Length;
+            if (_bufferCache.HasGpuDirtyPages(address, size) ||
+                (clean && (_bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+            {
+                return false;
+            }
+
+            return _guestMemory.TryRead(address, destination);
+        }
+
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);

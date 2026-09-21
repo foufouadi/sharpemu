@@ -203,9 +203,16 @@ public sealed record IndirectImageSelector(
     public uint TableOffset { get; init; }
     public uint DynamicOffsetBase { get; init; }
     public uint KeyBound { get; init; }
+    public WaveIndexedImageSelector? WaveIndexed { get; init; }
 }
 
 public sealed record DirectImageCandidate(uint Offset, uint Source);
+
+// A wave-uniform descriptor selector. The guest derives each descriptor key from
+// a set bit in one scalar mask, through a compact global index table. Keeping this
+// shape explicit lets the host materialize only those keys, rather than treating a
+// lane value as an unknowable descriptor address.
+public sealed record WaveIndexedImageSelector(uint MaskOffset, uint IndexTableOffset, uint IndexStride);
 
 // The graph values one descriptor is assembled from, up to eight dwords.
 public sealed class DescriptorSource

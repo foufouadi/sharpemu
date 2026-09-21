@@ -323,6 +323,22 @@ public sealed class ScalarValueGraphTests
         Assert.Contains("not a valid runtime value", error.Message);
     }
 
+    [Fact]
+    public void DirectExecutionMaskWriteKeepsBranchConditionDefined()
+    {
+        var program = Program(
+            MoveScalar(0, 126, 0),
+            Branch(4, "SCbranchExecz", 0),
+            EndProgram(8));
+
+        var graph = ScalarValueGraph.Build(program, 0, 0);
+
+        Assert.True(graph.BranchConditions.TryGetValue(4, out var condition));
+        Assert.False(condition.IsUndefined);
+        Assert.True(condition.IsConstant);
+        Assert.Equal(1u, condition.ConstantU32);
+    }
+
     // ---- Requirement A: lane provenance and uniform vector values ----
 
     [Fact]

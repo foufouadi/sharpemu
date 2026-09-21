@@ -179,6 +179,21 @@ public static class ResourceMaterializer
                     if (directTable.Descriptors.Count > 1) snapshot.IndirectImages.Add(directTable);
                     continue;
                 }
+                if (indirect.WaveIndexed is { } waveIndexed)
+                {
+                    if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
+                        out var waveSources, out _))
+                        return false;
+                    if (!MaterializeWaveIndexedImage(indirect, waveIndexed, waveSources[0], image, image.R128, inputs, out var waveTable, out failure))
+                        return false;
+                    snapshot.Images[imageIndex] = waveTable.Descriptors[(int)waveTable.Candidates[0]].Dwords;
+                    if (waveTable.Descriptors.Count > 1)
+                    {
+                        waveTable.Resource = (uint)imageIndex;
+                        snapshot.IndirectImages.Add(waveTable);
+                    }
+                    continue;
+                }
                 if (indirect.Dense)
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
@@ -569,6 +584,73 @@ public static class ResourceMaterializer
                 .Select(index => unchecked(indirect.DynamicOffsetBase + ((uint)index << 5))),
             out result,
             out failure);
+    }
+
+    private static bool MaterializeWaveIndexedImage(
+        IndirectImageSelector indirect,
+        WaveIndexedImageSelector wave,
+        DescriptorWords heap,
+        ImageResource image,
+        bool r128,
+        ResourceRuntimeInputs inputs,
+        out IndirectImageTable result,
+        out ResourceMaterializationFailure failure)
+    {
+        failure = ResourceMaterializationFailure.Other;
+        result = new IndirectImageTable();
+        if (heap.DwordCount != 2 || inputs.ReadCleanMemory is null || wave.IndexStride == 0)
+            return false;
+
+        var baseAddress = (((ulong)heap.Dwords[1] << 32) | heap.Dwords[0]) & AddressMask;
+        if (!TryReadCleanWord(baseAddress, wave.MaskOffset, inputs, out var activeMask))
+            return false;
+
+        var keys = new SortedSet<uint>();
+        for (uint bit = 0; bit < 32; bit++)
+        {
+            if ((activeMask & (1u << (int)bit)) == 0)
+                continue;
+            var indexOffset = (ulong)wave.IndexTableOffset + (ulong)bit * wave.IndexStride;
+            if (!TryReadCleanWord(baseAddress, indexOffset, inputs, out var key))
+                return false;
+            // VCmpxLeI32 0, key suppresses signed-negative indices before ReadFirstLane.
+            if ((key & 0x8000_0000u) == 0)
+                keys.Add(key);
+        }
+
+        var probed = new List<uint[]>(Math.Max(1, keys.Count));
+        var offsets = new List<uint>(Math.Max(1, keys.Count));
+        foreach (var key in keys)
+        {
+            var candidate = new uint[8];
+            var descriptorOffset = (ulong)indirect.TableOffset + ((ulong)key << 5);
+            for (uint dword = 0; dword < candidate.Length; dword++)
+            {
+                if (!TryReadCleanWord(baseAddress, descriptorOffset + dword * sizeof(uint), inputs, out candidate[dword]))
+                    return false;
+            }
+
+            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) || !ReservedImageBitsClear(candidate))
+                Array.Clear(candidate);
+            probed.Add(candidate);
+            offsets.Add(unchecked(indirect.DynamicOffsetBase + (key << 5)));
+        }
+
+        if (probed.Count == 0)
+        {
+            probed.Add(new uint[8]);
+            offsets.Add(0);
+        }
+
+        IndirectImageTrace.WriteWaveTable(baseAddress, activeMask, keys, probed);
+        return FinishIndirectImage(probed, offsets, out result, out failure);
+    }
+
+    private static bool TryReadCleanWord(ulong baseAddress, ulong offset, ResourceRuntimeInputs inputs, out uint word)
+    {
+        word = 0;
+        return offset <= AddressMask && baseAddress <= AddressMask - offset &&
+            inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(baseAddress + offset, out word);
     }
 
     private static bool FinishIndirectImage(
