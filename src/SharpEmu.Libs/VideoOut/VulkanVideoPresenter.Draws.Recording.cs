@@ -270,6 +270,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            foreach (var snapshot in resources.FeedbackSnapshots)
+            {
+                RetireFeedbackSnapshot(snapshot);
+            }
+
             foreach (var (buffer, memory) in resources.OverflowBuffers ?? [])
             {
                 RecycleHostBuffer(buffer, memory);

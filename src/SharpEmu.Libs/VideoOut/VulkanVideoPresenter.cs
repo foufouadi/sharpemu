@@ -9,6 +9,7 @@ using SharpEmu.Libs.AvPlayer;
 using SharpEmu.Libs.Media;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Gpu.GpuCommands;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
@@ -242,6 +243,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             public string DebugName = "SharpEmu translated";
             public TextureResource[] Textures = [];
+            // Draw-local feedback copies stay alive until the GPU has consumed
+            // the descriptors that reference them.
+            public CachedImage[] FeedbackSnapshots = [];
             // Host buffers that took uploads the stream ring could not hold; recycled with the draw.
             public (VkBuffer Buffer, DeviceMemory Memory)[]? OverflowBuffers;
         }

@@ -52,10 +52,40 @@ public sealed class AgcResourceOwnerTests
             AgcExports.DriverRegisterOwner(ctx));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnregisterOwnerUsesTheSharedRegistryAcrossMemoryWrappers(bool nested)
+    {
+        var memory = new FakeCpuMemory(BaseAddress, 0x2000);
+        memory.WriteCString(NameAddress, "Owner");
+        var registration = new CpuContext(new MemoryWrapper(memory), Generation.Gen5);
+        registration[CpuRegister.Rdi] = OwnerAddress;
+        registration[CpuRegister.Rsi] = NameAddress;
+        Assert.Equal(0, AgcExports.DriverRegisterOwner(registration));
+        var owner = ReadUInt32(memory, OwnerAddress);
+        ICpuMemory removalMemory = new MemoryWrapper(memory);
+        if (nested)
+            removalMemory = new MemoryWrapper(removalMemory);
+        var removal = new CpuContext(removalMemory, Generation.Gen5);
+        removal[CpuRegister.Rdi] = owner;
+        Assert.Equal(0, AgcExports.DriverUnregisterOwnerAndResources(removal));
+        registration[CpuRegister.Rdi] = owner;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            AgcExports.DriverUnregisterOwnerAndResources(registration));
+    }
+
     private static uint ReadUInt32(FakeCpuMemory memory, ulong address)
     {
         Span<byte> buffer = stackalloc byte[4];
         Assert.True(memory.TryRead(address, buffer));
         return BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+    }
+
+    private sealed class MemoryWrapper(ICpuMemory inner) : ICpuMemory, ICpuMemoryWrapper
+    {
+        public ICpuMemory Inner => inner;
+        public bool TryRead(ulong address, Span<byte> destination) => inner.TryRead(address, destination);
+        public bool TryWrite(ulong address, ReadOnlySpan<byte> source) => inner.TryWrite(address, source);
     }
 }
