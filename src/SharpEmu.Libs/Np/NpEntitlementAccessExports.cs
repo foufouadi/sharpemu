@@ -23,6 +23,7 @@ public static class NpEntitlementAccessExports
 
     private const int NpEntitlementAccessErrorParameter = unchecked((int)0x817D0002);
     private const int NpEntitlementAccessErrorNoEntitlement = unchecked((int)0x817D0007);
+    private const int EntitlementKeySize = 16;
 
     // Offline add-on entitlements titles query through NpEntitlementAccess.
     // GTA V Enhanced (PPSA04264) gates Story Mode on these three labels; without
@@ -191,6 +192,40 @@ public static class NpEntitlementAccessExports
         TraceNpEntitlementAccess(
             $"get_addcont_info service={ctx[CpuRegister.Rdi]} label='{label}' -> no entitlement");
         return ctx.SetReturn(NpEntitlementAccessErrorNoEntitlement);
+    }
+
+    [SysAbiExport(
+        Nid = "5LiMEPuW0DQ",
+        ExportName = "sceNpEntitlementAccessGetEntitlementKey",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessGetEntitlementKey(CpuContext ctx)
+    {
+        var labelAddress = ctx[CpuRegister.Rsi];
+        var keyAddress = ctx[CpuRegister.Rdx];
+        if (labelAddress == 0 || keyAddress == 0)
+        {
+            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
+        }
+
+        Span<byte> labelBytes = stackalloc byte[EntitlementLabelSize];
+        if (!ctx.Memory.TryRead(labelAddress, labelBytes))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var label = ReadEntitlementLabel(labelBytes);
+        Span<byte> key = stackalloc byte[EntitlementKeySize];
+        key.Clear();
+        if (!ctx.Memory.TryWrite(keyAddress, key))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(OwnedAddcontEntitlements.Any(entitlement =>
+            string.Equals(label, entitlement.Label, StringComparison.Ordinal))
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : NpEntitlementAccessErrorNoEntitlement);
     }
 
     private static bool TryWriteAddcontEntitlementInfo(

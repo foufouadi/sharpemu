@@ -283,7 +283,11 @@ public static class KernelPthreadCompatExports
     public static int PthreadYield(CpuContext ctx)
     {
         _ = ctx;
-        Thread.Yield();
+        if (!Thread.Yield())
+        {
+            Thread.Sleep(0);
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -293,6 +297,13 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PosixPthreadYield(CpuContext ctx) => PthreadYield(ctx);
+
+    [SysAbiExport(
+        Nid = "6XG4B33N09g",
+        ExportName = "sched_yield",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SchedYield(CpuContext ctx) => PthreadYield(ctx);
 
     [SysAbiExport(
         Nid = "GBUY7ywdULE",

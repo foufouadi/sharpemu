@@ -2045,6 +2045,13 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "unlink",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixUnlink(CpuContext ctx) => KernelUnlink(ctx);
+
+    [SysAbiExport(
         Nid = "1-LFLmRFxxM",
         ExportName = "sceKernelMkdir",
         Target = Generation.Gen4 | Generation.Gen5,
