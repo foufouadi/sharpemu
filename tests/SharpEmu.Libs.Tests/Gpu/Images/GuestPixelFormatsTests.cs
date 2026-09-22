@@ -42,6 +42,7 @@ public sealed class GuestPixelFormatsTests
         Assert.Equal(GuestPixelFormat.Bc7Srgb, GuestPixelFormats.RemapTextureFormat(GuestPixelFormat.Bc7Srgb));
         Assert.Equal(Format.R8G8B8A8Unorm, GuestPixelFormats.HostFormat(GuestPixelFormat.Bits8_8_8_8UNorm));
         Assert.Equal(Format.R8G8Uscaled, GuestPixelFormats.HostFormat(GuestPixelFormat.Bits8_8UScaled));
+        Assert.Equal(Format.B10G11R11UfloatPack32, GuestPixelFormats.HostFormat(GuestPixelFormat.Bits11_11_10UNorm));
         Assert.Equal(Format.R8G8B8A8Srgb, GuestPixelFormats.HostFormat(GuestPixelFormat.Bits8_8_8_8Srgb));
         Assert.Equal(Format.BC1RgbaUnormBlock, GuestPixelFormats.HostFormat(GuestPixelFormat.Bc1UNorm));
         Assert.Equal(Format.Undefined, GuestPixelFormats.HostFormat(GuestPixelFormat.Invalid));

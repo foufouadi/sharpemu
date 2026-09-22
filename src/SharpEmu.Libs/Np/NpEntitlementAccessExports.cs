@@ -25,14 +25,20 @@ public static class NpEntitlementAccessExports
     private const int NpEntitlementAccessErrorNoEntitlement = unchecked((int)0x817D0007);
     private const int EntitlementKeySize = 16;
 
-    // Offline add-on entitlements titles query through NpEntitlementAccess.
+    // Offline entitlements queried by titles through NpEntitlementAccess.
     // GTA V Enhanced (PPSA04264) gates Story Mode on these three labels; without
     // them the frontend offers "Buy GTAV Story Mode" despite a full dump.
+    // Ghost of Yotei (PPSA26344) separately checks its application and base
+    // game entitlements before it creates the frontend.  These represent the
+    // locally installed main package only; optional editions and add-ons remain
+    // unowned.
     private static readonly AddcontEntitlement[] OwnedAddcontEntitlements =
     [
         new("85y-je", PackageTypePsal, DownloadStatusInstalled),
         new("5d5c48", PackageTypePsal, DownloadStatusInstalled),
         new("_mtqu6", PackageTypePsal, DownloadStatusInstalled),
+        new("GHOST2APP0000000", PackageTypePsal, DownloadStatusInstalled),
+        new("GHOST2BASE000000", PackageTypePsal, DownloadStatusInstalled),
     ];
 
     private readonly record struct AddcontEntitlement(

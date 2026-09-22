@@ -442,6 +442,12 @@ public static partial class Gen5SpirvTranslator
                         instruction,
                         Ext(32, _floatType, GetFloatSource(instruction, 0)));
                     break;
+                case "VRsqF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(32, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
                 case "VFractF32":
                     result = EmitFloatResult(
                         instruction,
@@ -2168,6 +2174,37 @@ public static partial class Gen5SpirvTranslator
                     condition = _module.AddInstruction(operation, _boolType, wideLeft, wideRight);
                 }
             }
+            else if (opcode.EndsWith("U16", StringComparison.Ordinal) || opcode.EndsWith("I16", StringComparison.Ordinal))
+            {
+                // VOPC 16-bit integer comparisons consume the low half of each VGPR.
+                // Signed comparisons sign-extend that half before the SPIR-V operation.
+                var signed = opcode.EndsWith("I16", StringComparison.Ordinal);
+                var left = GetInteger16Source(instruction, 0, signed);
+                var right = GetInteger16Source(instruction, 1, signed);
+                var operation = opcode switch
+                {
+                    "VCmpEqI16" or "VCmpxEqI16" or
+                    "VCmpEqU16" or "VCmpxEqU16" => SpirvOp.IEqual,
+                    "VCmpNeI16" or "VCmpxNeI16" or
+                    "VCmpNeU16" or "VCmpxNeU16" => SpirvOp.INotEqual,
+                    "VCmpLtI16" or "VCmpxLtI16" => SpirvOp.SLessThan,
+                    "VCmpLeI16" or "VCmpxLeI16" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI16" or "VCmpxGtI16" => SpirvOp.SGreaterThan,
+                    "VCmpGeI16" or "VCmpxGeI16" => SpirvOp.SGreaterThanEqual,
+                    "VCmpLtU16" or "VCmpxLtU16" => SpirvOp.ULessThan,
+                    "VCmpLeU16" or "VCmpxLeU16" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU16" or "VCmpxGtU16" => SpirvOp.UGreaterThan,
+                    "VCmpGeU16" or "VCmpxGeU16" => SpirvOp.UGreaterThanEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported 16-bit integer compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
             {
                 var left = GetRawSource(instruction, 0);
@@ -2369,6 +2406,15 @@ public static partial class Gen5SpirvTranslator
             }
 
             var left = GetRawSource(instruction, 0);
+            if (instruction.Opcode == "SBitreplicateB64B32")
+            {
+                // S_BITREPLICATE_B64_B32 broadcasts the source dword into both
+                // halves of its 64-bit SGPR destination and does not update SCC.
+                StoreS(destination, left);
+                StoreS(destination + 1, left);
+                return true;
+            }
+
             if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))
             {
                 var oldExec64 = BooleanToWaveMask(Load(_boolType, _exec));
@@ -3753,6 +3799,17 @@ public static partial class Gen5SpirvTranslator
                     _boolType,
                     bankEnabled,
                     sourceAllowsWrite));
+        }
+
+        private uint GetInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool signed)
+        {
+            var value = BitwiseAnd(GetRawSource(instruction, sourceIndex), UInt(0xFFFF));
+            return signed
+                ? ShiftRightArithmetic(ShiftLeftLogical(value, UInt(16)), UInt(16))
+                : value;
         }
 
         private uint GetFloat16Source(

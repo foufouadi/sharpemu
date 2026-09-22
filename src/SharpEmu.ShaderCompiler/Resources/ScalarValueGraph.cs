@@ -73,9 +73,6 @@ public sealed partial class ScalarValueGraph
     /// </remarks>
     internal (uint Pc, string Opcode) BuilderInstruction { get; set; }
 
-    private static readonly bool TrackUndefinedOrigins =
-        Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1";
-
     private readonly Dictionary<ScalarValue, (uint Pc, string Opcode)> _undefinedOrigins = [];
 
     /// <summary>
@@ -84,15 +81,12 @@ public sealed partial class ScalarValueGraph
     internal bool TryGetUndefinedOrigin(ScalarValue value, out (uint Pc, string Opcode) origin) =>
         _undefinedOrigins.TryGetValue(value, out origin);
 
-    // One undefined node per type keeps every value built over it stable across
-    // visits. Under the tracker diagnostic the node is interned per instruction
-    // instead: revisiting a block reaches the same instruction, so values stay
-    // just as stable, and a descriptor dword that resolves to an undefined value
-    // can then name the instruction that produced it rather than the twenty
-    // places that might have.
+    // Undefined nodes are interned per instruction. Revisiting a block reaches
+    // the same instruction, so graph values stay stable while resource planning
+    // can distinguish a known safe fallback from an unrelated malformed input.
     internal ScalarValue Undefined(ScalarValueType type)
     {
-        if (!TrackUndefinedOrigins || BuilderInstruction.Opcode is null)
+        if (BuilderInstruction.Opcode is null)
         {
             return Intern($"undef:{type}", () => ScalarValue.Undefined(type));
         }

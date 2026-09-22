@@ -326,6 +326,9 @@ public static class GuestPixelFormats
         new(GuestPixelFormat.Bits16_16UInt, 4, 0, 4, true, true),
         new(GuestPixelFormat.Bits16_16SInt, 4, 0, 4, true, false, true),
         new(GuestPixelFormat.Bits16_16Float, 4, 0, 4, true, false),
+        // Vulkan has no normalized 11:11:10 format. Keep the guest packing sampled
+        // through the native 32-bit packed-float view, matching the host backend.
+        new(GuestPixelFormat.Bits11_11_10UNorm, 4, 0, 4, true, false),
         new(GuestPixelFormat.Bits11_11_10UInt, 4, 0, 4, true, true),
         new(GuestPixelFormat.Bits11_11_10Float, 4, 0, 4, true, false),
         new(GuestPixelFormat.Bits10_10_10_2UNorm, 4, 0, 4, true, false),
@@ -444,6 +447,7 @@ public static class GuestPixelFormats
         (GuestPixelFormat.Bits16_16UInt, Format.R16G16Uint),
         (GuestPixelFormat.Bits16_16SInt, Format.R16G16Sint),
         (GuestPixelFormat.Bits16_16Float, Format.R16G16Sfloat),
+        (GuestPixelFormat.Bits11_11_10UNorm, Format.B10G11R11UfloatPack32),
         (GuestPixelFormat.Bits11_11_10Float, Format.B10G11R11UfloatPack32),
         (GuestPixelFormat.Bits10_10_10_2UNorm, Format.A2B10G10R10UnormPack32),
         (GuestPixelFormat.Bits10_10_10_2UInt, Format.A2B10G10R10UintPack32),

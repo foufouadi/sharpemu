@@ -130,9 +130,10 @@ public sealed unsafe partial class CachedImage : IDisposable
         Backing.Usage = create.Usage;
 
         var vk = device.Vk;
-        if (vk.CreateImage(device.Device, &create, null, out Backing.Handle) != Result.Success)
+        var createResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
+        if (createResult != Result.Success)
         {
-            throw CreateFailure(create);
+            throw CreateFailure(create, "vkCreateImage", createResult, 0);
         }
 
         vk.GetImageMemoryRequirements(device.Device, Backing.Handle, out var requirements);
@@ -158,21 +159,33 @@ public sealed unsafe partial class CachedImage : IDisposable
             }
         }
 
-        if (allocated != Result.Success || vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, 0) != Result.Success)
+        if (allocated != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
             device.FreeMemory(Backing.Memory);
             Backing.Handle = default;
             Backing.Memory = default;
-            throw CreateFailure(create);
+            throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
+        }
+
+        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, 0);
+        if (bindResult != Result.Success)
+        {
+            vk.DestroyImage(device.Device, Backing.Handle, null);
+            device.FreeMemory(Backing.Memory);
+            Backing.Handle = default;
+            Backing.Memory = default;
+            throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size);
         }
 
         Backing.AllocationSize = requirements.Size;
     }
 
-    private static Exception CreateFailure(in ImageCreateInfo create) =>
+    private static Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
         SubmissionScheduler.Fatal(
-            $"The image could not be created: extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={(int)create.Format} layers={create.ArrayLayers} levels={create.MipLevels}.");
+            $"The image could not be created: operation={operation} result={result} required_bytes={requiredBytes} " +
+            $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
+            $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X}.");
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration, bool allowCompressedImageFallback)
     {

@@ -188,6 +188,35 @@ public sealed partial class ResourceTracker
         return origins.Count == 0 ? string.Empty : $" (undefined from: {string.Join(", ", origins)})";
     }
 
+    private bool HasUndefinedOrigin(ScalarValue value, string opcodePrefix)
+    {
+        var seen = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        pending.Push(value);
+        while (pending.Count != 0)
+        {
+            var current = pending.Pop();
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.Undefined &&
+                _graph.TryGetUndefinedOrigin(current, out var origin) &&
+                origin.Opcode.StartsWith(opcodePrefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
     // ---- descriptor sources ----
 
     // Copies a handle's dwords into a source. A sampler that no clamp axis sets to
@@ -353,7 +382,15 @@ public sealed partial class ResourceTracker
         return ValidateSource(source, out _) ? InternSource(source) : DescriptorConstants.NoIndex;
     }
 
-    private uint GetHandleSource(ScalarValue? handle, ScalarValueKind expected, uint width, uint pc, bool sampler = false, bool sampleAdjust = false)
+    private uint GetHandleSource(
+        ScalarValue? handle,
+        ScalarValueKind expected,
+        uint width,
+        uint pc,
+        bool sampler = false,
+        bool sampleAdjust = false,
+        string? memoryOpcode = null,
+        MemoryAccess memoryAccess = MemoryAccess.Read)
     {
         if (handle is null || handle.Kind != expected)
         {
@@ -380,7 +417,8 @@ public sealed partial class ResourceTracker
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
             // descriptor). Buffer/sampler-adjacent handles or any other validation failure
             // still hard-fail, since those aren't safe to silently zero.
-            if (controlDependent && expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
+            if ((controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat")) &&
+                expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
             {
                 source = new DescriptorSource
                 {
@@ -391,7 +429,7 @@ public sealed partial class ResourceTracker
             {
                 throw Failure(
                     pc,
-                    $"{expected} dword {badDword} is not a valid runtime value" +
+                    $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} dword {badDword} is not a valid runtime value" +
                         DescribeUndefinedLeaves(source.Dwords[badDword]));
             }
         }
@@ -696,7 +734,13 @@ public sealed partial class ResourceTracker
                 return;
             }
 
-            var source = GetHandleSource(access.Handle, ScalarValueKind.BufferHandle, 4, memory.Pc);
+            var source = GetHandleSource(
+                access.Handle,
+                ScalarValueKind.BufferHandle,
+                4,
+                memory.Pc,
+                memoryOpcode: memory.Opcode,
+                memoryAccess: memory.Access);
             var resource = AddBuffer(source, memory, memory.Pc);
             if (resource == DescriptorConstants.NoIndex)
             {

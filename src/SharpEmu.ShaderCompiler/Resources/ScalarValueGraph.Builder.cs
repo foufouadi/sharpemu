@@ -359,6 +359,13 @@ public sealed partial class ScalarValueGraph
                 case "SMovB32":
                     state.WriteScalar(destinationRegister, Read(instruction.Sources[0], state));
                     return;
+                case "SBitreplicateB64B32":
+                {
+                    var replicated = Read(instruction.Sources[0], state);
+                    state.WriteScalar(destinationRegister, replicated);
+                    state.WriteScalar(destinationRegister + 1, replicated);
+                    return;
+                }
                 case "SMovkI32":
                     state.WriteScalar(destinationRegister, _graph.Constant(unchecked((uint)(short)instruction.Sources[0].Value)));
                     return;
@@ -1307,6 +1314,27 @@ public sealed partial class ScalarValueGraph
             var right = instruction.Sources.Count > 1 ? ReadVectorOperand(instruction.Sources[1], state) : _graph.Undefined(ScalarValueType.U32);
             var updatesExecutionMask = opcode.StartsWith("VCmpx", StringComparison.Ordinal);
             var suffix = opcode[(updatesExecutionMask ? "VCmpx".Length : "VCmp".Length)..];
+
+            // Integer 16-bit compares consume the low word of their operands. Signed forms
+            // sign-extend it before comparison; floating-point F16 compares use their own path.
+            if (suffix.EndsWith("16", StringComparison.Ordinal) && !suffix.EndsWith("F16", StringComparison.Ordinal))
+            {
+                var signed16 = suffix.EndsWith("I16", StringComparison.Ordinal);
+                ScalarValue Narrow16(ScalarValue value)
+                {
+                    var low = Binary(ScalarOperation.And32, value, _graph.Constant(0xffffu));
+                    return signed16
+                        ? Binary(
+                            ScalarOperation.ShiftRightArithmetic32,
+                            Binary(ScalarOperation.ShiftLeft32, low, _graph.Constant(16u)),
+                            _graph.Constant(16u))
+                        : low;
+                }
+
+                left = Narrow16(left);
+                right = Narrow16(right);
+            }
+
             var result = instruction.Control is Gen5SdwaControl
                 ? _graph.Undefined(ScalarValueType.Bool)
                 : suffix switch
@@ -1321,6 +1349,16 @@ public sealed partial class ScalarValueGraph
                     "GtI32" => Bool(ScalarOperation.SGreaterThan32, left, right),
                     "LeI32" => Bool(ScalarOperation.SLessThanEqual32, left, right),
                     "GeI32" => Bool(ScalarOperation.SGreaterThanEqual32, left, right),
+                    "EqU16" or "EqI16" => Bool(ScalarOperation.IEqual32, left, right),
+                    "NeU16" or "NeI16" => Bool(ScalarOperation.INotEqual32, left, right),
+                    "LtU16" => Bool(ScalarOperation.ULessThan32, left, right),
+                    "LeU16" => Bool(ScalarOperation.ULessThanEqual32, left, right),
+                    "GtU16" => Bool(ScalarOperation.UGreaterThan32, left, right),
+                    "GeU16" => Bool(ScalarOperation.UGreaterThanEqual32, left, right),
+                    "LtI16" => Bool(ScalarOperation.SLessThan32, left, right),
+                    "LeI16" => Bool(ScalarOperation.SLessThanEqual32, left, right),
+                    "GtI16" => Bool(ScalarOperation.SGreaterThan32, left, right),
+                    "GeI16" => Bool(ScalarOperation.SGreaterThanEqual32, left, right),
                     "LeF32" => Bool(ScalarOperation.FLessThanEqual, left, right),
                     "GeF32" => Bool(ScalarOperation.FGreaterThanEqual, left, right),
                     "LtF32" => Bool(ScalarOperation.FLessThan, left, right),

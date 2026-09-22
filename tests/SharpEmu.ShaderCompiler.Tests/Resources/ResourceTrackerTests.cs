@@ -488,6 +488,22 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
+    public void UnboundedRuntimeFormattedBufferLoad_UsesNullReadFallback()
+    {
+        var program = Program(
+            ScalarLoad(0, 0, destination: 8, count: 4, dynamicOffsetRegister: 2),
+            ScalarBufferLoad(8, 8, destination: 12, count: 1),
+            BufferLoad(16, 8, formatted: true),
+            EndProgram(20));
+        var plan = Extract(program);
+
+        Assert.Empty(plan.BufferCandidateTables);
+        var request = Request(program);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.NotEmpty(shader.Spirv);
+    }
+
+    [Fact]
     public void PhiValidation()
     {
         var program = Program(
