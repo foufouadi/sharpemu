@@ -323,6 +323,7 @@ internal static class HostMovieBridge
                     Console.Error.WriteLine(
                         "[LOADER][WARN] Bink2 host watchdog expired for " +
                         Path.GetFileName(path) + "; advancing to the next movie.");
+                    TimedOutMoviePaths.Add(path);
                     CloseActiveLocked();
                     AttachNextQueuedMovieLocked();
                 }
@@ -424,6 +425,16 @@ internal static class HostMovieBridge
     private static readonly Queue<string> PendingMoviePaths = new();
     private static readonly HashSet<string> PendingMoviePathSet =
         new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> TimedOutMoviePaths =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    internal static bool ShouldForceGuestMovieEof(string hostPath)
+    {
+        lock (Gate)
+        {
+            return TimedOutMoviePaths.Contains(hostPath);
+        }
+    }
     private static void AttachNextQueuedMovieLocked()
     {
         while (PendingMoviePaths.Count > 0)
@@ -506,6 +517,7 @@ internal static class HostMovieBridge
     {
         lock (Gate)
         {
+            TimedOutMoviePaths.Remove(hostPath);
             if (PendingMoviePathSet.Remove(hostPath))
             {
                 var retained = PendingMoviePaths
