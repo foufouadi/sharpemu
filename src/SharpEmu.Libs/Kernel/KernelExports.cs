@@ -560,5 +560,16 @@ public static class KernelExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    #pragma warning disable SHEM004
+    [SysAbiExport(
+        Nid = "cfwBSQyr5Ys",
+        ExportName = "sceKernelInternalUnknownCfwBSQyr5Ys",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelInternalUnknownCfwBSQyr5Ys(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
     #pragma warning restore SHEM004
 }
