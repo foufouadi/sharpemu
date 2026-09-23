@@ -4543,6 +4543,18 @@ public static partial class Gen5SpirvTranslator
         {
             var zero = _module.Constant(_intType, 0);
             var inRange = Load(_boolType, _exec);
+            // The uniform Wave64 dispatcher emits every guest block in one
+            // structured loop and predicates its side effects. ImageStore is
+            // a side effect too; without the block predicate, an inactive
+            // block can still overwrite the destination image.
+            if (_blockExecutionPredicate != 0)
+            {
+                inRange = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    _blockExecutionPredicate,
+                    inRange);
+            }
             for (uint component = 0;
                  component < coordinateComponentCount;
                  component++)
