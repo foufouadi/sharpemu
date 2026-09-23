@@ -43,44 +43,19 @@ public static class PipelineCacheSignature
     public static bool TryUnwrap(string signature, ReadOnlySpan<byte> file, out byte[] payload)
     {
         payload = [];
-        if (file.Length > int.MaxValue)
+        var prefix = Encoding.ASCII.GetBytes(signature);
+        if (file.Length < prefix.Length + sizeof(ulong) || file.Length > int.MaxValue)
         {
             return false;
         }
 
-        var newline = file.IndexOf((byte)'\n');
-        if (newline < 0)
+        if (!file[..prefix.Length].SequenceEqual(prefix))
         {
             return false;
         }
 
-        var actualSignature = Encoding.ASCII.GetString(file[..(newline + 1)]);
-        if (!string.Equals(actualSignature, signature, StringComparison.Ordinal))
-        {
-            // Pipeline binaries are keyed by the Vulkan device and driver;
-            // the SharpEmu build version only controls which shader records
-            // may be present. A newer build can safely reuse an older driver
-            // cache because Vulkan validates each pipeline key and ignores
-            // stale records. Keep the cache when the hardware suffix matches.
-            var expectedParts = signature.TrimEnd('\n').Split(':');
-            var actualParts = actualSignature.TrimEnd('\n').Split(':');
-            if (expectedParts.Length != actualParts.Length ||
-                expectedParts.Length < 6 ||
-                !string.Equals(expectedParts[0], actualParts[0], StringComparison.Ordinal) ||
-                !expectedParts[2..].SequenceEqual(actualParts[2..], StringComparer.Ordinal))
-            {
-                return false;
-            }
-        }
-
-        var hashOffset = newline + 1;
-        if (file.Length < hashOffset + sizeof(ulong))
-        {
-            return false;
-        }
-
-        var expectedHash = BinaryPrimitives.ReadUInt64LittleEndian(file[hashOffset..]);
-        var data = file[(hashOffset + sizeof(ulong))..];
+        var expectedHash = BinaryPrimitives.ReadUInt64LittleEndian(file[prefix.Length..]);
+        var data = file[(prefix.Length + sizeof(ulong))..];
         if (XxHash3.HashToUInt64(data) != expectedHash)
         {
             return false;
