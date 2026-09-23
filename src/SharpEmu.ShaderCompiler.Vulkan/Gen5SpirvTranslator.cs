@@ -155,11 +155,6 @@ public static partial class Gen5SpirvTranslator
         private uint _programCounter;
         private uint _programActive;
         private uint _iterationGuard;
-        // When a guest wave spans multiple native subgroups, the dispatcher must
-        // visit every guest block in lock-step so each workgroup barrier is reached
-        // by every invocation. This is the predicate for the block currently being
-        // emitted; zero means code outside that uniform dispatcher.
-        private uint _blockExecutionPredicate;
         private uint _globalBuffers;
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
@@ -306,15 +301,6 @@ public static partial class Gen5SpirvTranslator
                 }
                 EmitInitialState();
 
-                if (_stage == Gen5SpirvStage.Compute && _emulateWave64 && blocks.Count > 1)
-                {
-                    if (!TryEmitUniformWave64Dispatcher(blocks, out error))
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
                 var loopHeader = _module.AllocateId();
                 var switchHeader = _module.AllocateId();
                 var switchMerge = _module.AllocateId();
@@ -389,7 +375,6 @@ public static partial class Gen5SpirvTranslator
                     loopHeader,
                     loopMerge);
                 _module.AddLabel(loopMerge);
-                }
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -1262,99 +1247,6 @@ public static partial class Gen5SpirvTranslator
         }
 
         private enum SharedMemoryPhase { None, Read, Write }
-
-        // SPIR-V requires every invocation in a workgroup to execute an
-        // OpControlBarrier in uniform control flow. The normal interpreter uses
-        // a per-invocation program-counter switch, which is correct for ordinary
-        // shaders but makes barriers used to bridge two native wave32 subgroups
-        // undefined as soon as their PCs diverge. Execute all blocks in a common
-        // order instead, predicate each block's effects, and use a workgroup-wide
-        // active test only at the loop boundary.
-        private bool TryEmitUniformWave64Dispatcher(
-            IReadOnlyList<ShaderBlock> blocks,
-            out string error)
-        {
-            error = string.Empty;
-            var loopHeader = _module.AllocateId();
-            var loopBody = _module.AllocateId();
-            var loopContinue = _module.AllocateId();
-            var loopMerge = _module.AllocateId();
-
-            _module.AddStatement(SpirvOp.Branch, loopHeader);
-            _module.AddLabel(loopHeader);
-            _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
-            var workgroupActive = IsNotZero64(BooleanToWaveMask(
-                Load(_boolType, _programActive)));
-            _module.AddStatement(
-                SpirvOp.BranchConditional,
-                workgroupActive,
-                loopBody,
-                loopMerge);
-
-            _module.AddLabel(loopBody);
-            var selector = Load(_uintType, _programCounter);
-            var programIsActive = Load(_boolType, _programActive);
-            var anyBlock = _module.ConstantBool(false);
-            for (var index = 0; index < blocks.Count; index++)
-            {
-                var matchesBlock = _module.AddInstruction(
-                    SpirvOp.IEqual,
-                    _boolType,
-                    selector,
-                    UInt((uint)index));
-                _blockExecutionPredicate = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    programIsActive,
-                    matchesBlock);
-                anyBlock = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    anyBlock,
-                    matchesBlock);
-                if (!TryEmitBlock(blocks, index, out error))
-                {
-                    error = $"block=0x{blocks[index].StartPc:X}: {error}";
-                    return false;
-                }
-            }
-
-            _blockExecutionPredicate = 0;
-            var invalidProgramCounter = _module.AddInstruction(
-                SpirvOp.LogicalAnd,
-                _boolType,
-                programIsActive,
-                LogicalNot(anyBlock));
-            EmitConditional(
-                invalidProgramCounter,
-                () => Store(_programActive, _module.ConstantBool(false)));
-            _module.AddStatement(SpirvOp.Branch, loopContinue);
-
-            _module.AddLabel(loopContinue);
-            if (_maxDispatcherSteps > 0)
-            {
-                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                Store(_iterationGuard, steps);
-                var withinLimit = _module.AddInstruction(
-                    SpirvOp.ULessThan,
-                    _boolType,
-                    steps,
-                    UInt((uint)_maxDispatcherSteps));
-                _module.AddStatement(
-                    SpirvOp.BranchConditional,
-                    withinLimit,
-                    loopHeader,
-                    loopMerge);
-            }
-            else
-            {
-                _module.AddStatement(SpirvOp.Branch, loopHeader);
-            }
-
-            _module.AddLabel(loopMerge);
-            _blockExecutionPredicate = 0;
-            return true;
-        }
 
         private bool TryEmitBlock(
             IReadOnlyList<ShaderBlock> blocks,
@@ -5615,27 +5507,8 @@ public static partial class Gen5SpirvTranslator
             return _module.AddInstruction(SpirvOp.Load, type, pointer);
         }
 
-        private void Store(uint pointer, uint value)
-        {
-            if (_blockExecutionPredicate == 0)
-            {
-                _module.AddStatement(SpirvOp.Store, pointer, value);
-                return;
-            }
-
-            var storeLabel = _module.AllocateId();
-            var mergeLabel = _module.AllocateId();
-            _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
-            _module.AddStatement(
-                SpirvOp.BranchConditional,
-                _blockExecutionPredicate,
-                storeLabel,
-                mergeLabel);
-            _module.AddLabel(storeLabel);
+        private void Store(uint pointer, uint value) =>
             _module.AddStatement(SpirvOp.Store, pointer, value);
-            _module.AddStatement(SpirvOp.Branch, mergeLabel);
-            _module.AddLabel(mergeLabel);
-        }
 
         private uint UInt(uint value) => _module.Constant(_uintType, value);
 
@@ -5921,14 +5794,6 @@ public static partial class Gen5SpirvTranslator
 
         private void EmitConditional(uint condition, Action emit)
         {
-            if (_blockExecutionPredicate != 0)
-            {
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    _blockExecutionPredicate,
-                    condition);
-            }
             var activeLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
             _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
@@ -5945,14 +5810,6 @@ public static partial class Gen5SpirvTranslator
 
         private void EmitConditional(uint condition, Action whenTrue, Action whenFalse)
         {
-            if (_blockExecutionPredicate != 0)
-            {
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    _blockExecutionPredicate,
-                    condition);
-            }
             var trueLabel = _module.AllocateId();
             var falseLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();

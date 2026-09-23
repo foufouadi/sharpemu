@@ -10,32 +10,6 @@ namespace SharpEmu.ShaderCompiler.Tests;
 
 public sealed class Gen5SharedMemoryBarrierTests
 {
-    [Fact]
-    public void Wave64BarrierAcrossDivergentBlocksUsesUniformDispatcher()
-    {
-        var instructions = new List<Gen5ShaderInstruction>
-        {
-            new(0, Gen5ShaderEncoding.Vop3, "VReadlaneB32", [0u, 0u],
-                [Gen5Operand.Vector(0), new Gen5Operand(Gen5OperandKind.LiteralConstant, 0), Gen5Operand.Scalar(0)],
-                [Gen5Operand.Scalar(4)], new Gen5Vop3Control(0, 0, 0, false, 0, null)),
-            new(8, Gen5ShaderEncoding.Sopp, "SCbranchExecz", [1u], [], [], null),
-            new(12, Gen5ShaderEncoding.Sopp, "SNop", [0u], [], [], null),
-            new(16, Gen5ShaderEncoding.Sopp, "SEndpgm", [0u], [], [], null),
-        };
-        var (plan, resources, layout) = ResourceTestProgram.Prepare(
-            new Gen5ShaderProgram(0, instructions), userDataCount: 0);
-        var request = new ShaderCompileRequest(plan, resources, layout)
-        {
-            WaveSize = 64,
-            LocalSizeX = 64,
-        };
-
-        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
-        var opcodes = ReadOpcodes(shader.Spirv);
-        Assert.Contains((ushort)SpirvOp.ControlBarrier, opcodes);
-        Assert.DoesNotContain((ushort)SpirvOp.Switch, opcodes);
-    }
-
     [Theory]
     [InlineData(64u, 64u, false, 2)]
     [InlineData(64u, 64u, true, 2)]
@@ -80,18 +54,5 @@ public sealed class Gen5SharedMemoryBarrierTests
         }
         Assert.Equal(expectedBarriers, barriers);
         Assert.Equal(1, sharedReads);
-    }
-
-    private static IReadOnlyList<ushort> ReadOpcodes(byte[] spirv)
-    {
-        var opcodes = new List<ushort>();
-        for (var offset = 5 * sizeof(uint); offset < spirv.Length;)
-        {
-            var instruction = BinaryPrimitives.ReadUInt32LittleEndian(spirv.AsSpan(offset));
-            opcodes.Add((ushort)instruction);
-            offset += checked((int)(instruction >> 16) * sizeof(uint));
-        }
-
-        return opcodes;
     }
 }
