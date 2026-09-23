@@ -23,6 +23,10 @@ internal static class AmprFileRegistry
     private static readonly Dictionary<string, uint> _resolvedIdsByPath = new(HostFsPath.Comparer);
     private static readonly ConcurrentDictionary<uint, string> _resolvedPathsById = new();
     private static readonly ConcurrentDictionary<uint, byte> _ambiguousCompatibilityIds = new();
+    // Hash ids the APR resolve exports handed to the guest. Authoritative over
+    // the compatibility index so a later alias publish cannot re-poison them.
+    private static readonly ConcurrentDictionary<uint, string> _aprResolvedPathsById = new();
+    private static readonly ConcurrentDictionary<uint, byte> _loggedAprCollisionIds = new();
     // Resolved handles use a separate range from the 31-bit compatibility hashes.
     // Never reuse a handle while queued reads can still refer to it.
     private static uint _nextResolvedId = 0x80000000;
@@ -53,23 +57,54 @@ internal static class AmprFileRegistry
     // APR resolve exports return the guest-visible 31-bit path hash. Keep it
     // separate from the high-bit process-local handles used by Register(),
     // because titles compare these IDs with values baked into asset tables.
+    // The hash is only handed out while it names exactly one host file: the
+    // Demon's Souls dump has 13 same-hash pairs under /app0/ alone (paired
+    // particle shaders among them), and handing both files one id made each
+    // read the other's bytes and stalled the first level load. Colliding
+    // paths fall back to a collision-safe handle from Register().
     public static uint RegisterAprResolvedPath(string guestPath, string hostPath)
     {
-        if (TryGetApp0Relative(guestPath, out var relative) && relative.Length != 0)
+        var fileId = ComputeFileId(guestPath);
+        lock (_resolvedFileGate)
         {
-            RegisterApp0Relative(relative, hostPath);
+            if (_aprResolvedPathsById.TryGetValue(fileId, out var claimedPath))
+            {
+                if (IsSameHostFile(claimedPath, hostPath))
+                    return fileId;
+            }
+            else if (!_ambiguousCompatibilityIds.ContainsKey(fileId) &&
+                     (!_hostPathsById.TryGetValue(fileId, out var indexedPath) ||
+                      IsSameHostFile(indexedPath, hostPath)))
+            {
+                if (TryGetApp0Relative(guestPath, out var relative) && relative.Length != 0)
+                {
+                    RegisterApp0Relative(relative, hostPath);
+                }
+
+                _aprResolvedPathsById[fileId] = hostPath;
+                return fileId;
+            }
         }
 
-        var fileId = ComputeFileId(guestPath);
-        _hostPathsById[fileId] = hostPath;
-        _ambiguousCompatibilityIds.TryRemove(fileId, out _);
-        return fileId;
+        var handle = Register(guestPath, hostPath);
+        if (_loggedAprCollisionIds.TryAdd(fileId, 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] ampr.apr_id_collision id=0x{fileId:X8} path='{guestPath}' handle=0x{handle:X8}");
+        }
+
+        return handle;
     }
+
+    private static bool IsSameHostFile(string left, string right) =>
+        HostFsPath.Comparer.Equals(Path.GetFullPath(left), Path.GetFullPath(right));
 
     public static bool TryGetHostPath(uint id, out string hostPath)
     {
         if ((id & 0x80000000) != 0)
             return _resolvedPathsById.TryGetValue(id, out hostPath!);
+        if (_aprResolvedPathsById.TryGetValue(id, out hostPath!))
+            return true;
         hostPath = null!;
         return !_ambiguousCompatibilityIds.ContainsKey(id) && _hostPathsById.TryGetValue(id, out hostPath!);
     }
@@ -81,8 +116,10 @@ internal static class AmprFileRegistry
         {
             _hostPathsById.Clear();
             _ambiguousCompatibilityIds.Clear();
+            _loggedAprCollisionIds.Clear();
             lock (_resolvedFileGate)
             {
+                _aprResolvedPathsById.Clear();
                 _resolvedIdsByPath.Clear();
                 _resolvedPathsById.Clear();
                 _nextResolvedId = 0x80000000;
