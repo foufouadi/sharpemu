@@ -1282,9 +1282,13 @@ public static partial class Gen5SpirvTranslator
 
             _module.AddStatement(SpirvOp.Branch, loopHeader);
             _module.AddLabel(loopHeader);
-            _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
             var workgroupActive = IsNotZero64(BooleanToWaveMask(
                 Load(_boolType, _programActive)));
+            // OpLoopMerge must be immediately followed by the branch that
+            // selects the loop body or merge block. BooleanToWaveMask can
+            // emit ballot/barrier instructions, so compute the condition
+            // before emitting the structured loop declaration.
+            _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
             _module.AddStatement(
                 SpirvOp.BranchConditional,
                 workgroupActive,
