@@ -886,8 +886,7 @@ public static class AmprExports
 
             if (!AmprFileRegistry.TryGetHostPath(fileId, out hostPath))
             {
-                // A missing id leaves the guest's streaming request pending
-                // forever; say so even when read tracing is off.
+                // An unknown id stalls the guest's stream silently, so warn even without tracing.
                 if (Interlocked.Increment(ref _unknownReadFileIdWarnings) <= 16)
                 {
                     Console.Error.WriteLine(

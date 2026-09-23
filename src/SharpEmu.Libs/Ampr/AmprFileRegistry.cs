@@ -23,8 +23,7 @@ internal static class AmprFileRegistry
     private static readonly Dictionary<string, uint> _resolvedIdsByPath = new(HostFsPath.Comparer);
     private static readonly ConcurrentDictionary<uint, string> _resolvedPathsById = new();
     private static readonly ConcurrentDictionary<uint, byte> _ambiguousCompatibilityIds = new();
-    // Hash ids the APR resolve exports handed to the guest. Authoritative over
-    // the compatibility index so a later alias publish cannot re-poison them.
+    // Ids already handed to the guest; alias publishes must not re-poison them.
     private static readonly ConcurrentDictionary<uint, string> _aprResolvedPathsById = new();
     private static readonly ConcurrentDictionary<uint, byte> _loggedAprCollisionIds = new();
     // Resolved handles use a separate range from the 31-bit compatibility hashes.
@@ -54,16 +53,13 @@ internal static class AmprFileRegistry
         }
     }
 
-    // APR resolve exports return the guest-visible 31-bit path hash. Keep it
-    // separate from the high-bit process-local handles used by Register(),
-    // because titles compare these IDs with values baked into asset tables.
-    // The hash is only handed out while it names exactly one host file: the
-    // Demon's Souls dump has 13 same-hash pairs under /app0/ alone (paired
-    // particle shaders among them), and handing both files one id made each
-    // read the other's bytes and stalled the first level load. Colliding
-    // paths fall back to a collision-safe handle from Register().
     public static uint RegisterAprResolvedPath(string guestPath, string hostPath)
     {
+        // APR file ids are part of the guest ABI: ResolveFilepathsToIds returns
+        // the 31-bit FNV-1a hash of the guest path. Keep the collision-safe
+        // process-local handles used by Register() separate from this path so a
+        // title can compare resolved ids with ids baked into its asset tables.
+        // A hash shared by two files (13 /app0/ pairs in Demon's Souls) falls back to a handle.
         var fileId = ComputeFileId(guestPath);
         lock (_resolvedFileGate)
         {

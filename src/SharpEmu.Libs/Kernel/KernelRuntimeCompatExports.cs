@@ -1052,7 +1052,7 @@ public static class KernelRuntimeCompatExports
     [SysAbiExport(
         Nid = "cfwBSQyr5Ys",
         ExportName = "sceKernelDebugWriteCppExceptionInfo",
-        Target = Generation.Gen4 | Generation.Gen5,
+        Target = Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelDebugWriteCppExceptionInfo(CpuContext ctx)
     {
