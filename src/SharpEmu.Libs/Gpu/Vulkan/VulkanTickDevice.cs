@@ -128,47 +128,27 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         fixed (ulong* signalSemaphores = bundle.SignalSemaphores)
         fixed (ulong* signalTicks = bundle.SignalTicks)
         {
-            var waitInfos = stackalloc SemaphoreSubmitInfo[bundle.WaitCount];
-            for (var index = 0; index < bundle.WaitCount; index++)
+            var timelineInfo = new TimelineSemaphoreSubmitInfo
             {
-                waitInfos[index] = new SemaphoreSubmitInfo
-                {
-                    SType = StructureType.SemaphoreSubmitInfo,
-                    Semaphore = new VkSemaphore(waitSemaphores[index]),
-                    Value = waitTicks[index],
-                    StageMask = (PipelineStageFlags2)waitStages[index],
-                };
-            }
-
-            var signalInfos = stackalloc SemaphoreSubmitInfo[bundle.SignalCount];
-            for (var index = 0; index < bundle.SignalCount; index++)
-            {
-                signalInfos[index] = new SemaphoreSubmitInfo
-                {
-                    SType = StructureType.SemaphoreSubmitInfo,
-                    Semaphore = new VkSemaphore(signalSemaphores[index]),
-                    Value = signalTicks[index],
-                    StageMask = PipelineStageFlags2.AllCommandsBit,
-                };
-            }
-
-            var commandInfo = new CommandBufferSubmitInfo
-            {
-                SType = StructureType.CommandBufferSubmitInfo,
-                CommandBuffer = commandBuffer,
-                DeviceMask = 1,
+                SType = StructureType.TimelineSemaphoreSubmitInfo,
+                WaitSemaphoreValueCount = (uint)bundle.WaitCount,
+                PWaitSemaphoreValues = waitTicks,
+                SignalSemaphoreValueCount = (uint)bundle.SignalCount,
+                PSignalSemaphoreValues = signalTicks,
             };
-            var submitInfo = new SubmitInfo2
+            var submitInfo = new SubmitInfo
             {
-                SType = StructureType.SubmitInfo2,
-                WaitSemaphoreInfoCount = (uint)bundle.WaitCount,
-                PWaitSemaphoreInfos = waitInfos,
-                CommandBufferInfoCount = 1,
-                PCommandBufferInfos = &commandInfo,
-                SignalSemaphoreInfoCount = (uint)bundle.SignalCount,
-                PSignalSemaphoreInfos = signalInfos,
+                SType = StructureType.SubmitInfo,
+                PNext = &timelineInfo,
+                WaitSemaphoreCount = (uint)bundle.WaitCount,
+                PWaitSemaphores = (VkSemaphore*)waitSemaphores,
+                PWaitDstStageMask = (PipelineStageFlags*)waitStages,
+                CommandBufferCount = 1,
+                PCommandBuffers = &commandBuffer,
+                SignalSemaphoreCount = (uint)bundle.SignalCount,
+                PSignalSemaphores = (VkSemaphore*)signalSemaphores,
             };
-            var result = _vk.QueueSubmit2(_queue, 1, &submitInfo, default);
+            var result = _vk.QueueSubmit(_queue, 1, &submitInfo, default);
             if (result == Result.Success)
                 CommandProfile?.MarkSubmitted(buffer);
             failure = result.ToString();
