@@ -5,7 +5,6 @@ namespace SharpEmu.Libs.VideoOut;
 
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Core.Native;
-using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
 
 internal static unsafe partial class VulkanVideoPresenter
@@ -310,13 +309,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RecordHdrPresentation(uint imageIndex, bool isHdr)
         {
-            var sourceBarrier = new ImageMemoryBarrier2
+            var sourceBarrier = new ImageMemoryBarrier
             {
-                SType = StructureType.ImageMemoryBarrier2,
-                SrcAccessMask = AccessFlags2.MemoryWriteBit |
-                                AccessFlags2.TransferWriteBit |
-                                AccessFlags2.ColorAttachmentWriteBit,
-                DstAccessMask = AccessFlags2.ShaderReadBit,
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.MemoryWriteBit |
+                                AccessFlags.TransferWriteBit |
+                                AccessFlags.ColorAttachmentWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
                 OldLayout = ImageLayout.ShaderReadOnlyOptimal,
                 NewLayout = ImageLayout.ShaderReadOnlyOptimal,
                 SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -324,7 +323,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Image = _presentationImages[imageIndex],
                 SubresourceRange = ColorSubresourceRange(),
             };
-            VulkanSynchronization.PipelineBarrier(_vk,
+            _vk.CmdPipelineBarrier(
                 _commandBuffer,
                 PipelineStageFlags.AllCommandsBit,
                 PipelineStageFlags.FragmentShaderBit,

@@ -3,7 +3,6 @@
 
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
-using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
 
 using SharpEmu.Libs.VideoOut;
@@ -687,11 +686,11 @@ public sealed unsafe partial class GuestImageCache
 
         download.Flush(offset, range.Size);
         DownloadToBuffer(image, download, offset, range.Size, plan);
-        var barrier = new BufferMemoryBarrier2
+        var barrier = new BufferMemoryBarrier
         {
-            SType = StructureType.BufferMemoryBarrier2,
-            SrcAccessMask = AccessFlags2.MemoryWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.ShaderWriteBit,
-            DstAccessMask = AccessFlags2.HostReadBit,
+            SType = StructureType.BufferMemoryBarrier,
+            SrcAccessMask = AccessFlags.MemoryWriteBit | AccessFlags.TransferWriteBit | AccessFlags.ShaderWriteBit,
+            DstAccessMask = AccessFlags.HostReadBit,
             SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
             DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
             Buffer = download.Handle,
@@ -699,7 +698,7 @@ public sealed unsafe partial class GuestImageCache
             Size = range.Size,
         };
         _scheduler.EndRendering();
-        VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
+        _device.Vk.CmdPipelineBarrier(new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
         var backing = _backing;
         _scheduler.QueuePriorityCompletionAction(() =>
         {

@@ -8,7 +8,6 @@ using SharpEmu.HLE.GuestMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
-using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
@@ -1020,18 +1019,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             command.EndRendering();
             var native = new CommandBuffer(command.Handle);
             var vk = _device.Vk;
-            var before = new BufferMemoryBarrier2
+            var before = new BufferMemoryBarrier
             {
-                SType = StructureType.BufferMemoryBarrier2,
-                SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
-                DstAccessMask = AccessFlags2.TransferWriteBit,
+                SType = StructureType.BufferMemoryBarrier,
+                SrcAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit | AccessFlags.TransferReadBit | AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.TransferWriteBit,
                 SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                 DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                 Buffer = buffer.Handle,
                 Offset = 0,
                 Size = buffer.Size,
             };
-            VulkanSynchronization.PipelineBarrier(vk,
+            vk.CmdPipelineBarrier(
                 native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
                 0, null, 1, &before, 0, null);
             var regions = CollectionsMarshal.AsSpan(copies);
@@ -1041,9 +1040,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             var after = before;
-            after.SrcAccessMask = AccessFlags2.TransferWriteBit;
-            after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
-            VulkanSynchronization.PipelineBarrier(vk,
+            after.SrcAccessMask = AccessFlags.TransferWriteBit;
+            after.DstAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit;
+            vk.CmdPipelineBarrier(
                 native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
                 0, null, 1, &after, 0, null);
         }
