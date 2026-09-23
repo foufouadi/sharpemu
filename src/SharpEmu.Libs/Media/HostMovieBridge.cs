@@ -309,6 +309,9 @@ internal static class HostMovieBridge
     private static void ArmPlaybackWatchdogLocked(string hostPath)
     {
         _playbackWatchdog?.Dispose();
+        var timeout = TryReadBinkInfo(hostPath, out var info)
+            ? GetPlaybackWatchdogTimeout(info)
+            : TimeSpan.FromSeconds(150);
         _playbackWatchdog = new Timer(
             static state =>
             {
@@ -329,8 +332,26 @@ internal static class HostMovieBridge
                 }
             },
             hostPath,
-            TimeSpan.FromSeconds(90),
+            timeout,
             Timeout.InfiniteTimeSpan);
+    }
+
+    // The watchdog only exists to release a stalled host decoder, so it must
+    // outlast the whole movie: Demon's Souls ships a 171 s intro and 756 s
+    // credits, which a fixed bound cut short.
+    internal static TimeSpan GetPlaybackWatchdogTimeout(Bink2MovieInfo info)
+    {
+        if (info.FrameCount == 0 ||
+            info.FramesPerSecondNumerator == 0 ||
+            info.FramesPerSecondDenominator == 0)
+        {
+            return TimeSpan.FromSeconds(150);
+        }
+
+        var duration = (double)info.FrameCount *
+            info.FramesPerSecondDenominator /
+            info.FramesPerSecondNumerator;
+        return TimeSpan.FromSeconds(Math.Max(90, duration + 60));
     }
 
     internal static bool TryReadBinkInfo(string path, out Bink2MovieInfo info)
@@ -349,6 +370,7 @@ internal static class HostMovieBridge
             info = new Bink2MovieInfo(
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x14, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x18, 4)),
+                BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(8, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x1C, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x20, 4)));
             return info.FramesPerSecondNumerator != 0 &&
@@ -396,6 +418,7 @@ internal static class HostMovieBridge
     [StructLayout(LayoutKind.Sequential)]
     internal readonly struct Bink2MovieInfo
     {
+        public readonly uint FrameCount;
         public readonly uint Width;
         public readonly uint Height;
         public readonly uint FramesPerSecondNumerator;
@@ -404,13 +427,24 @@ internal static class HostMovieBridge
         internal Bink2MovieInfo(
             uint width,
             uint height,
+            uint frameCount,
             uint framesPerSecondNumerator,
             uint framesPerSecondDenominator)
         {
             Width = width;
             Height = height;
+            FrameCount = frameCount;
             FramesPerSecondNumerator = framesPerSecondNumerator;
             FramesPerSecondDenominator = framesPerSecondDenominator;
+        }
+
+        internal Bink2MovieInfo(
+            uint width,
+            uint height,
+            uint framesPerSecondNumerator,
+            uint framesPerSecondDenominator)
+            : this(width, height, 0, framesPerSecondNumerator, framesPerSecondDenominator)
+        {
         }
     }
 
