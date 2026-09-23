@@ -776,6 +776,11 @@ public static partial class Gen5SpirvTranslator
         {
             _deviceAddressInstructionPc = instruction.Pc;
             error = string.Empty;
+            if (instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal))
+            {
+                return TryEmitScratchMemory(instruction, control, out error);
+            }
+
             var request = _request;
             if (!request.Memory.TryGetIndex(instruction.Pc, 0, out var memoryIndex))
             {
@@ -875,6 +880,141 @@ public static partial class Gen5SpirvTranslator
             });
 
             return true;
+        }
+
+        private bool TryEmitScratchMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5GlobalMemoryControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (_scratch == 0 || _scratchDwordCount == 0)
+            {
+                error = "scratch storage was not declared";
+                return false;
+            }
+
+            var address = control.ScalarAddress < 125
+                ? LoadS(control.ScalarAddress)
+                : LoadV(control.VectorAddress);
+            if (control.OffsetBytes != 0)
+            {
+                address = IAdd(address, UInt(unchecked((uint)control.OffsetBytes)));
+            }
+
+            if (instruction.Opcode.StartsWith("ScratchStore", StringComparison.Ordinal))
+            {
+                EmitExecConditional(() =>
+                {
+                    if (TryGetSubdwordStoreInfo(instruction.Opcode, out var byteCount, out var sourceShift))
+                    {
+                        StoreScratchBytes(address, LoadV(control.SourceVectorRegister), byteCount, sourceShift);
+                        return;
+                    }
+
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        Store(
+                            ScratchPointer(address, index * sizeof(uint)),
+                            LoadV(control.SourceVectorRegister + index));
+                    }
+                });
+                return true;
+            }
+
+            if (!instruction.Opcode.StartsWith("ScratchLoad", StringComparison.Ordinal))
+            {
+                error = $"unsupported scratch opcode {instruction.Opcode}";
+                return false;
+            }
+
+            EmitExecConditional(() =>
+            {
+                if (TryGetSubdwordLoadInfo(instruction.Opcode, out var byteCount, out var signExtend, out var d16, out var d16High))
+                {
+                    var destination = control.DestinationVectorRegister;
+                    var value = LoadScratchBytes(address, byteCount, signExtend);
+                    if (d16)
+                    {
+                        value = d16High
+                            ? BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0x0000_FFFF)), ShiftLeftLogical(BitwiseAnd(value, UInt(0xFFFF)), UInt(16)))
+                            : BitwiseOr(BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)), BitwiseAnd(value, UInt(0xFFFF)));
+                    }
+
+                    StoreV(destination, value);
+                    return;
+                }
+
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    StoreV(
+                        control.DestinationVectorRegister + index,
+                        Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
+                }
+            });
+            return true;
+        }
+
+        private uint ScratchPointer(uint byteAddress, uint offsetBytes = 0)
+        {
+            var address = offsetBytes == 0
+                ? byteAddress
+                : IAdd(byteAddress, UInt(offsetBytes));
+            var dwordIndex = ShiftRightLogical(address, UInt(2));
+            if (_scratchDwordCount > 1)
+            {
+                dwordIndex = _module.AddInstruction(
+                    SpirvOp.UMod,
+                    _uintType,
+                    dwordIndex,
+                    UInt(_scratchDwordCount));
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _scratchElementPointer,
+                _scratch,
+                dwordIndex);
+        }
+
+        private uint LoadScratchBytes(uint byteAddress, uint byteCount, bool signExtend)
+        {
+            var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var value = BitwiseAnd(
+                ShiftRightLogical(Load(_uintType, ScratchPointer(byteAddress)), shift),
+                UInt(byteCount == 1 ? 0xFFu : 0xFFFFu));
+            if (signExtend)
+            {
+                value = Bitcast(
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, value),
+                        UInt(0),
+                        UInt(byteCount * 8)));
+            }
+
+            return value;
+        }
+
+        private void StoreScratchBytes(uint byteAddress, uint value, uint byteCount, uint sourceShift)
+        {
+            if (sourceShift != 0)
+            {
+                value = ShiftRightLogical(value, UInt(sourceShift));
+            }
+
+            var pointer = ScratchPointer(byteAddress);
+            var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var elementMask = UInt(byteCount == 1 ? 0xFFu : 0xFFFFu);
+            var shiftedMask = ShiftLeftLogical(elementMask, shift);
+            var merged = BitwiseOr(
+                BitwiseAnd(
+                    Load(_uintType, pointer),
+                    _module.AddInstruction(SpirvOp.Not, _uintType, shiftedMask)),
+                ShiftLeftLogical(BitwiseAnd(value, elementMask), shift));
+            Store(pointer, merged);
         }
 
         // ---- buffers ----
@@ -1347,6 +1487,24 @@ public static partial class Gen5SpirvTranslator
                 case "DsReadB32":
                     StoreV(instruction.Destinations[0].Value, LoadBlockWord(_globalDataShare, GlobalDataShareIndex(GetRawSource(instruction, 0), control.SingleOffsetBytes)));
                     return true;
+                case "DsReadI8":
+                {
+                    var address = GetRawSource(instruction, 0);
+                    var byteAddress = control.SingleOffsetBytes == 0
+                        ? address
+                        : IAdd(address, UInt(control.SingleOffsetBytes));
+                    var word = LoadBlockWord(_globalDataShare, GlobalDataShareIndex(address, control.SingleOffsetBytes));
+                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+                    var packed = ShiftRightLogical(word, shift);
+                    var signedByte = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, packed),
+                        UInt(0),
+                        UInt(8));
+                    StoreV(instruction.Destinations[0].Value, Bitcast(_uintType, signedByte));
+                    return true;
+                }
                 case "DsReadB64":
                 {
                     var index = GlobalDataShareIndex(GetRawSource(instruction, 0), control.SingleOffsetBytes);
@@ -1440,6 +1598,29 @@ public static partial class Gen5SpirvTranslator
         private bool TryEmitGlobalDataShareAtomic(Gen5ShaderInstruction instruction, Gen5DataShareControl control, out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode is "DsMinF32" or "DsMaxF32")
+            {
+                if (instruction.Sources.Count < 3)
+                {
+                    error = $"missing GDS operands for {instruction.Opcode}";
+                    return false;
+                }
+
+                var floatIndex = GlobalDataShareIndex(GetRawSource(instruction, 0), control.SingleOffsetBytes);
+                EmitExecConditional(() =>
+                {
+                    EmitConditional(IsBlockWordInRange(_globalDataShare, floatIndex), () =>
+                        EmitDataShareFloatAtomic(
+                            BlockWordPointer(_globalDataShare, floatIndex),
+                            GetRawSource(instruction, 1),
+                            GetRawSource(instruction, 2),
+                            instruction.Opcode == "DsMaxF32",
+                            scope: 1,
+                            semantics: 0x48));
+                });
+                return true;
+            }
+
             var atomicOp = instruction.Opcode switch
             {
                 "DsAddU32" or "DsAddRtnU32" => SpirvOp.AtomicIAdd,

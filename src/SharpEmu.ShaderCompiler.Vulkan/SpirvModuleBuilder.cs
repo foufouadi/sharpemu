@@ -210,6 +210,7 @@ public enum SpirvCapability : uint
     GroupNonUniformShuffle = 65,
     ShaderLayer = 5253,
     ShaderViewportIndex = 5254,
+    ShaderViewportIndexLayerExt = 5254,
     RuntimeDescriptorArray = 5302,
     PhysicalStorageBufferAddresses = 5347,
 }

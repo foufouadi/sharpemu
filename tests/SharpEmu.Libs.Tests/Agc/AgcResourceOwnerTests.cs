@@ -52,6 +52,13 @@ public sealed class AgcResourceOwnerTests
             AgcExports.DriverRegisterOwner(ctx));
     }
 
+    private static uint ReadUInt32(FakeCpuMemory memory, ulong address)
+    {
+        Span<byte> buffer = stackalloc byte[4];
+        Assert.True(memory.TryRead(address, buffer));
+        return BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -73,13 +80,6 @@ public sealed class AgcResourceOwnerTests
         registration[CpuRegister.Rdi] = owner;
         Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
             AgcExports.DriverUnregisterOwnerAndResources(registration));
-    }
-
-    private static uint ReadUInt32(FakeCpuMemory memory, ulong address)
-    {
-        Span<byte> buffer = stackalloc byte[4];
-        Assert.True(memory.TryRead(address, buffer));
-        return BinaryPrimitives.ReadUInt32LittleEndian(buffer);
     }
 
     private sealed class MemoryWrapper(ICpuMemory inner) : ICpuMemory, ICpuMemoryWrapper

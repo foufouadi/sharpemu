@@ -194,8 +194,8 @@ public static partial class AgcExports
         return (int)ctx[CpuRegister.Rax];
     }
 
-    // The interpreter evaluates the predicate when this packet executes.
-    // A zero predicate skips the requested number of dwords.
+    // The interpreter reads the predicate when this packet executes.
+    // A zero value skips the specified number of following dwords.
     [SysAbiExport(
         Nid = "BIPexNBSGog",
         ExportName = "sceAgcDcbCondExec",

@@ -233,6 +233,10 @@ public static partial class AgcExports
         internal void RetainTargetlessDraw(RegisterBanks banks, in TargetlessDrawArguments arguments)
         {
             var state = RequireCurrent();
+            if (RenderTrace.Enabled)
+            {
+                RenderTrace.Write($"TargetlessRetention submit={arguments.SubmitId} replaced={state.RetainedTargetlessDraw is not null} previousSubmit={state.RetainedTargetlessDraw?.Arguments.SubmitId} export=0x{banks.Shader.Vertex.ExportAddress:X16} pixel=0x{banks.Shader.Pixel.Address:X16}");
+            }
             state.RetainedTargetlessDraw = new RetainedTargetlessDraw(banks.Clone(), arguments);
         }
 
@@ -387,6 +391,10 @@ public static partial class AgcExports
             if (!VideoOutExports.TryGetDisplayBufferInfo(handle, displayBufferIndex, out var displayBuffer) ||
                 !state.KnownColorTargets.TryGetValue(displayBuffer.Address, out var words))
             {
+                if (RenderTrace.Enabled)
+                {
+                    RenderTrace.Write($"TargetlessReplay submit={retained.Arguments.SubmitId} outcome=discarded reason=display-buffer-or-target-unavailable handle={handle} index={displayBufferIndex}");
+                }
                 return;
             }
 
@@ -394,6 +402,10 @@ public static partial class AgcExports
             banks.Context.ColorTargets[0] = words;
             banks.Context.RenderTargetMask = 0xF;
             var arguments = retained.Arguments;
+            if (RenderTrace.Enabled)
+            {
+                RenderTrace.Write($"TargetlessReplay submit={arguments.SubmitId} outcome=begin destination=0x{displayBuffer.Address:X16}");
+            }
             if (arguments.Indexed)
             {
                 executor.DrawIndexed(arguments.SubmitId, banks, arguments.Indexed_);
@@ -403,6 +415,10 @@ public static partial class AgcExports
                 executor.DrawAuto(arguments.SubmitId, banks, arguments.Auto);
             }
 
+            if (RenderTrace.Enabled)
+            {
+                RenderTrace.Write($"TargetlessReplay submit={arguments.SubmitId} outcome=executor-returned destination=0x{displayBuffer.Address:X16}");
+            }
             TraceAgcShader(
                 $"agc.deferred_composite dst=0x{displayBuffer.Address:X16} export=0x{banks.Shader.Vertex.ExportAddress:X16} " +
                 $"pixel=0x{banks.Shader.Pixel.Address:X16} size={displayBuffer.Width}x{displayBuffer.Height}");

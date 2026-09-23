@@ -40,7 +40,7 @@ public sealed class MemcpyHleRoutingTests
     {
         Assert.True(
             InvokeIsHlePreferredNid(StrcasecmpNid),
-            $"strcasecmp ({StrcasecmpNid}) must route through HLE on every platform.");
+            $"strcasecmp ({StrcasecmpNid}) must route through HLE so null-argument recovery remains active.");
     }
 
     [Fact]
@@ -71,7 +71,9 @@ public sealed class MemcpyHleRoutingTests
 
         var claimed = InvokeTryCreateNativeImportIntrinsic(StrcasecmpNid, out var address);
 
-        Assert.False(claimed);
+        Assert.False(
+            claimed,
+            $"strcasecmp ({StrcasecmpNid}) must fall through to the HLE trampoline so a null guest pointer does not fault in the intrinsic stub.");
         Assert.Equal(0, address);
     }
 

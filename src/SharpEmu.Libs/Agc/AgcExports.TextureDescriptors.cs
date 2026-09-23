@@ -201,7 +201,7 @@ public static partial class AgcExports
             return false;
         }
 
-        // Prospero stores width-minus-one and height-minus-one in 14-bit fields.
+        // Prospero T# stores width-minus-one across 14 bits and height-minus-one in 14 bits.
         var address = (((ulong)(fields[1] & 0xFFu) << 32) | fields[0]) << 8;
         var width = (((fields[1] >> 30) & 0x3u) | ((fields[2] & 0x0FFFu) << 2)) + 1;
         var height = ((fields[2] >> 14) & 0x3FFFu) + 1;

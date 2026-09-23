@@ -337,7 +337,8 @@ internal sealed class RecordingRenderHost : IRenderHost
     public List<(RegisterBanks Banks, GraphicsPrograms Programs, TargetlessDrawArguments Arguments)> RetainedDraws { get; } = new();
 
     public void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear) =>
-        Calls.Add($"clear_targets {string.Join(",", targets.ToArray().Select(t => t.Slot))} {clear.Red},{clear.Green},{clear.Blue},{clear.Alpha}");
+        Calls.Add(FormattableString.Invariant(
+            $"clear_targets {string.Join(",", targets.ToArray().Select(t => t.Slot))} {clear.Red},{clear.Green},{clear.Blue},{clear.Alpha}"));
 
 
     public bool TryRetainTargetlessDraw(RegisterBanks banks, GraphicsPrograms programs, in TargetlessDrawArguments arguments)

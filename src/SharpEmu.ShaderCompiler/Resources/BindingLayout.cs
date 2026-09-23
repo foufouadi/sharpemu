@@ -7,7 +7,7 @@ using SharpEmu.ShaderCompiler.Ir;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
-// The fixed binding numbers of one stage: buffers, thirty-six image classes, samplers,
+// The fixed binding numbers of one stage: buffers, image classes, samplers,
 // and the shared buffers. A pixel stage adds Count to every number.
 public enum DescriptorBindingKind : uint
 {
@@ -44,16 +44,63 @@ public static class ImageDescriptorBinding
     private const uint StorageFloatBinding = 22;
     private const uint StorageUintBinding = 27;
     private const uint AtomicUintBinding = 32;
+    private const uint SampledCubeFloatBinding = 37;
+    private const uint SampledCubeUintBinding = 38;
+    private const uint SampledCubeSintBinding = 39;
+    private const uint StorageCubeFloatBinding = 40;
+    private const uint StorageCubeUintBinding = 41;
+    private const uint AtomicCubeUintBinding = 42;
     // IMAGE_ATOMIC_FMIN/FMAX (MIMG op 0x1E/0x1F) target a 32-bit float-format
     // storage UAV, not the uint UAV every integer image atomic requires - a
     // separate binding range so ForImage/Describe can round-trip the numeric
     // class instead of forcing every atomic image to Uint.
-    private const uint AtomicFloatBinding = 37;
-
-    public static bool IsCube(DescriptorBindingKind kind) => false;
+    private const uint AtomicFloatBinding = 43;
 
     public static DescriptorBindingKind? ForImage(ImageResource image)
     {
+        if (image.Cube)
+        {
+            if (image.Dimension is not (ImageDimension.Dim2D or ImageDimension.Dim2DArray))
+            {
+                return null;
+            }
+
+            if (image.ResourceClass == ImageResourceClass.Sampled)
+            {
+                if (image.Atomic)
+                {
+                    return null;
+                }
+
+                return image.NumericClass switch
+                {
+                    ImageNumericClass.Float => (DescriptorBindingKind)SampledCubeFloatBinding,
+                    ImageNumericClass.Uint => (DescriptorBindingKind)SampledCubeUintBinding,
+                    ImageNumericClass.Sint => (DescriptorBindingKind)SampledCubeSintBinding,
+                    _ => null,
+                };
+            }
+
+            if (image.ResourceClass == ImageResourceClass.Storage)
+            {
+                if (image.Atomic)
+                {
+                    return image.NumericClass == ImageNumericClass.Uint
+                        ? (DescriptorBindingKind)AtomicCubeUintBinding
+                        : null;
+                }
+
+                return image.NumericClass switch
+                {
+                    ImageNumericClass.Float => (DescriptorBindingKind)StorageCubeFloatBinding,
+                    ImageNumericClass.Uint => (DescriptorBindingKind)StorageCubeUintBinding,
+                    _ => null,
+                };
+            }
+
+            return null;
+        }
+
         uint baseBinding;
         var sampled = false;
         if (image.ResourceClass == ImageResourceClass.Sampled)
@@ -158,6 +205,16 @@ public static class ImageDescriptorBinding
     public static ImageResourceClass ResourceClass(DescriptorBindingKind kind)
     {
         var value = (uint)kind;
+        if (value is >= SampledCubeFloatBinding and <= SampledCubeSintBinding)
+        {
+            return ImageResourceClass.Sampled;
+        }
+
+        if (value is >= StorageCubeFloatBinding and <= AtomicCubeUintBinding)
+        {
+            return ImageResourceClass.Storage;
+        }
+
         if (value >= BindingLayout.FirstImageBinding && value < BindingLayout.FirstStorageImageBinding)
         {
             return ImageResourceClass.Sampled;
@@ -172,6 +229,9 @@ public static class ImageDescriptorBinding
     }
 
     public static uint ArrayIndex(DescriptorBindingKind kind) => (uint)kind - BindingLayout.FirstImageBinding;
+
+    public static bool IsCube(DescriptorBindingKind kind) =>
+        (uint)kind is >= SampledCubeFloatBinding and <= AtomicCubeUintBinding;
 
     private static readonly ImageDimension[] SampledDimensions =
     [
@@ -188,6 +248,29 @@ public static class ImageDescriptorBinding
     public static (ImageResourceClass ResourceClass, ImageNumericClass NumericClass, ImageDimension Dimension, bool Atomic) Describe(DescriptorBindingKind kind)
     {
         var index = (uint)kind;
+        if (index is >= SampledCubeFloatBinding and <= SampledCubeSintBinding)
+        {
+            var numericClass = index switch
+            {
+                SampledCubeFloatBinding => ImageNumericClass.Float,
+                SampledCubeUintBinding => ImageNumericClass.Uint,
+                _ => ImageNumericClass.Sint,
+            };
+            return (ImageResourceClass.Sampled, numericClass, ImageDimension.Dim2DArray, false);
+        }
+
+        if (index is >= StorageCubeFloatBinding and <= StorageCubeUintBinding)
+        {
+            return (ImageResourceClass.Storage,
+                index == StorageCubeFloatBinding ? ImageNumericClass.Float : ImageNumericClass.Uint,
+                ImageDimension.Dim2DArray, false);
+        }
+
+        if (index == AtomicCubeUintBinding)
+        {
+            return (ImageResourceClass.Storage, ImageNumericClass.Uint, ImageDimension.Dim2DArray, true);
+        }
+
         if (index >= SampledFloatBinding && index < StorageFloatBinding)
         {
             var offset = index - SampledFloatBinding;
@@ -201,7 +284,7 @@ public static class ImageDescriptorBinding
             return (ImageResourceClass.Storage, offset / 5 == 0 ? ImageNumericClass.Float : ImageNumericClass.Uint, StorageDimensions[offset % 5], false);
         }
 
-        if (index >= AtomicUintBinding && index < AtomicFloatBinding)
+        if (index >= AtomicUintBinding && index < SampledCubeFloatBinding)
         {
             return (ImageResourceClass.Storage, ImageNumericClass.Uint, StorageDimensions[index - AtomicUintBinding], true);
         }
@@ -221,7 +304,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 {
     public const uint FirstImageBinding = 1;
     public const uint FirstStorageImageBinding = 22;
-    public const uint ImageBindingCount = 41;
+    public const uint ImageBindingCount = 47;
     public const uint NoShaderBase = uint.MaxValue;
     public const uint ShaderBaseDwordCount = 2;
     private const int ScalarRegisterCount = 256;

@@ -229,6 +229,7 @@ public static partial class AgcExports
             TryPrepareCommandDwords(ctx, commandBufferAddress, 22, false, out _) &&
             Append(5) && Append(8) && Append(9);
 
+        // Keep allocation boundaries while the first packet carries the context operation.
         var complete = (ContextStateOperation)operation switch
         {
             ContextStateOperation.Clear => Append(5),

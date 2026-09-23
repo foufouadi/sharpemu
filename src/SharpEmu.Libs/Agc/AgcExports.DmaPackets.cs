@@ -55,7 +55,10 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        TraceAgc($"agc.dcb_copy_data buf=0x{commandBufferAddress:X16} cmd=0x{packetAddress:X16} control=0x{control:X8}");
+        TraceAgc(
+            $"agc.dcb_copy_data buf=0x{commandBufferAddress:X16} cmd=0x{packetAddress:X16} " +
+            $"dstSel=0x{destinationSelector:X2} srcSel=0x{sourceSelector:X2} " +
+            $"dst=0x{destinationAddress:X16} src=0x{sourceValue:X16} control=0x{control:X8}");
         return ReturnPointer(ctx, packetAddress);
     }
 

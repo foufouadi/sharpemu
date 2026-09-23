@@ -36,9 +36,9 @@ public static partial class AgcExports
     private const uint ItWriteData = 0x37;
     private const uint ItDispatchDirect = 0x15;
     private const uint ItDispatchIndirect = 0x16;
-    private const uint ItCopyData = 0x40;
     private const uint ItSetPredication = 0x20;
     private const uint ItCondExec = 0x22;
+    private const uint ItCopyData = 0x40;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
     private const uint ItCondWrite = 0x45;

@@ -780,6 +780,7 @@ public static partial class Gen5ShaderTranslator
             0x0E => "SCmpkLeU32",
             0x0F => "SAddkI32",
             0x10 => "SMulkI32",
+            0x13 => "SSetregB32",
             // RDNA2 uses four SOPK forms to wait for one counter.
             // The selected counter does not change the translated operation.
             0x17 or 0x18 or 0x19 or 0x1A => "SWaitcnt",
@@ -1066,6 +1067,7 @@ public static partial class Gen5ShaderTranslator
             0xF5 => "VCmpxNeU64",
             0xF6 => "VCmpxGeU64",
             0xF7 => "VCmpxTU64",
+            0xB5 => "VCmpxNeI64",
             0xF8 => "VCmpxUF16",
             0xF9 => "VCmpxNgeF16",
             0xFA => "VCmpxNlgF16",
@@ -1108,6 +1110,7 @@ public static partial class Gen5ShaderTranslator
             }
             : opcode switch
         {
+            0x0B5 => "VCmpxNeI64",
             0x101 => "VCndmaskB32",
             0x103 => "VAddF32",
             0x104 => "VSubF32",
@@ -1126,9 +1129,9 @@ public static partial class Gen5ShaderTranslator
             0x146 => "VCubetcF32",
             0x147 => "VCubemaF32",
             0x14A => "VBfiB32",
+            0x14E => "VAlignbitB32",
             0x14B => "VFmaF32",
             0x14C => "VFmaF64",
-            0x14E => "VAlignbitB32",
             0x151 => "VMin3F32",
             0x152 => "VMin3I32",
             0x153 => "VMin3U32",
@@ -1158,6 +1161,8 @@ public static partial class Gen5ShaderTranslator
             0x1AF => "VRcpF64",
             0x1B0 => "VRsqF64",
             0x1B4 => "VSqrtF64",
+            0x303 => "VAddNcU16",
+            0x34B => "VFmaF16",
             0x360 => "VReadlaneB32",
             0x361 => "VWritelaneB32",
             0x362 => "VLdexpF32",
@@ -1176,7 +1181,6 @@ public static partial class Gen5ShaderTranslator
             0x346 => "VLshlAddU32",
             0x345 => "VXadU32",
             0x347 => "VAddLshlU32",
-            0x34B => "VFmaF16",
             0x36D => "VAdd3U32",
             0x36F => "VLshlOrU32",
             0x178 => "VXor3B32",
@@ -1185,7 +1189,6 @@ public static partial class Gen5ShaderTranslator
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
             // GFX10 16-bit integer ALU, VOP3-only.
-            0x303 => "VAddNcU16",
             0x304 => "VSubNcU16",
             0x307 => "VLshrrevB16",
             0x308 => "VAshrrevI16",
@@ -1295,12 +1298,11 @@ public static partial class Gen5ShaderTranslator
             0x0A => "DsOrB32",
             0x0B => "DsXorB32",
             0x0D => "DsWriteB32",
-            // RDNA encodes the same LDS dword store at 0x13.
-            0x13 => "DsWriteB32",
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
             0x10 => "DsCmpstB32",
-            0x12 => "DsMskorB32",
+            0x12 => "DsMinF32",
+            0x13 => "DsMaxF32",
             0x20 => "DsAddRtnU32",
             0x21 => "DsSubRtnU32",
             0x23 => "DsIncRtnU32",
@@ -1318,6 +1320,7 @@ public static partial class Gen5ShaderTranslator
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            0x39 => "DsReadI8",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
             // gfx10 groups the 64-bit LDS atomics at 0x40..0x4C, directly ahead
@@ -1334,6 +1337,7 @@ public static partial class Gen5ShaderTranslator
             0x77 => "DsRead2B64",
             0xB0 => "DsWriteAddtidB32",
             0xB1 => "DsReadAddtidB32",
+            0xB3 => "DsBpermuteB32",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -1354,7 +1358,10 @@ public static partial class Gen5ShaderTranslator
         out uint sizeDwords,
         out string error)
     {
-        var opcode = (word >> 18) & 0x7F;
+        // GFX10 MIMG uses bit 0 as opcode bit 7.  Treating the opcode as only
+        // bits 18..24 makes the 0x80+ family (including sample-adjust forms)
+        // decode as the corresponding low opcode.
+        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
         name = $"{prefix}Raw{opcode:X2}";
         sizeDwords = 2;
         error = string.Empty;
@@ -1402,7 +1409,7 @@ public static partial class Gen5ShaderTranslator
         out uint sizeDwords,
         out string error)
     {
-        var opcode = (word >> 18) & 0x7F;
+        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
         name = opcode switch
         {
             0x00 => "BufferLoadFormatX",
@@ -1449,9 +1456,9 @@ public static partial class Gen5ShaderTranslator
             0x3C => "BufferAtomicInc",
             0x3D => "BufferAtomicDec",
             0x3E => "BufferWbinvl1",
-            0x3F => "BufferWbinvl1Vol",
+            0x3F => "BufferAtomicFmin",
+            0x40 => "BufferAtomicFmax",
             // GFX9 buffer atomic encodings used by the guest shaders.
-            0x40 => "BufferAtomicSwap",
             0x41 => "BufferAtomicCmpswap",
             0x42 => "BufferAtomicAdd",
             0x43 => "BufferAtomicSub",
@@ -1479,12 +1486,13 @@ public static partial class Gen5ShaderTranslator
         out string error)
     {
         var segment = (word >> 14) & 0x3;
-        var opcode = (word >> 18) & 0x7F;
+        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
         sizeDwords = 2;
         error = string.Empty;
         var prefix = segment switch
         {
             0x0 => "Flat",
+            0x1 => "Scratch",
             0x2 => "Global",
             _ => string.Empty,
         };
@@ -1576,7 +1584,9 @@ public static partial class Gen5ShaderTranslator
 
     private static bool DecodeMimg(uint word, out string name, out uint sizeDwords, out string error)
     {
-        var opcode = ((word >> 18) & 0x7Fu) | ((word & 1u) << 7);
+        // RDNA2 MIMG OP[7] is bit 0 while OP[6:0] occupies bits 24:18.
+        // Ignoring bit 0 aliases 0xE6/0xE7 BVH operations to 0x66/0x67.
+        var opcode = ((word >> 18) & 0x7F) | ((word & 1) << 7);
         sizeDwords = 2 + ((word >> 1) & 0x3);
         error = string.Empty;
         name = opcode switch
@@ -1607,24 +1617,71 @@ public static partial class Gen5ShaderTranslator
             0x1E => "ImageAtomicFmin",
             0x1F => "ImageAtomicFmax",
             0x20 => "ImageSample",
+            0x21 => "ImageSampleCl",
             0x22 => "ImageSampleD",
+            0x23 => "ImageSampleDCl",
             0x24 => "ImageSampleL",
             0x25 => "ImageSampleB",
+            0x26 => "ImageSampleBCl",
             0x27 => "ImageSampleLz",
+            0x28 => "ImageSampleC",
+            0x29 => "ImageSampleCCl",
+            0x2A => "ImageSampleCD",
+            0x2B => "ImageSampleCDCl",
+            0x2C => "ImageSampleCL",
+            0x2D => "ImageSampleCB",
+            0x2E => "ImageSampleCBCl",
             0x2F => "ImageSampleCLz",
             0x30 => "ImageSampleO",
+            0x31 => "ImageSampleClO",
+            0x32 => "ImageSampleDO",
+            0x33 => "ImageSampleDClO",
             0x34 => "ImageSampleLO",
+            0x35 => "ImageSampleBO",
+            0x36 => "ImageSampleBClO",
             0x37 => "ImageSampleLzO",
+            0x38 => "ImageSampleCO",
+            0x39 => "ImageSampleCClO",
+            0x3A => "ImageSampleCDO",
+            0x3B => "ImageSampleCDClO",
+            0x3C => "ImageSampleCLO",
+            0x3D => "ImageSampleCBO",
+            0x3E => "ImageSampleCBClO",
+            0x3F => "ImageSampleCLzO",
             0x40 => "ImageGather4",
             0x47 => "ImageGather4Lz",
             0x48 => "ImageGather4C",
             0x4E => "ImageGather4CBCl",
             0x4F => "ImageGather4CLz",
             0x57 => "ImageGather4LzO",
+            0x58 => "ImageGather4CO",
             0x5F => "ImageGather4CLzO",
-            // SAMPLE_A uses the normal implicit-LOD coordinate form; the
-            // descriptor's adjust bits are canonicalized by resource tracking.
+            0x60 => "ImageGetLod",
+            0x61 => "ImageGather4H",
+            0x68 => "ImageSampleCd",
+            0x69 => "ImageSampleCdCl",
+            0x6A => "ImageSampleCCd",
+            0x6B => "ImageSampleCCdCl",
+            0x6C => "ImageSampleCdO",
+            0x6D => "ImageSampleCdClO",
+            0x6E => "ImageSampleCCdO",
+            0x6F => "ImageSampleCCdClO",
             0xA0 => "ImageSampleA",
+            0xA1 => "ImageSampleClA",
+            0xA5 => "ImageSampleBA",
+            0xA6 => "ImageSampleBClA",
+            0xA8 => "ImageSampleCA",
+            0xA9 => "ImageSampleCClA",
+            0xAD => "ImageSampleCBA",
+            0xAE => "ImageSampleCBClA",
+            0xB0 => "ImageSampleAO",
+            0xB1 => "ImageSampleClAO",
+            0xB5 => "ImageSampleBAO",
+            0xB6 => "ImageSampleBClAO",
+            0xB8 => "ImageSampleCAO",
+            0xB9 => "ImageSampleCClAO",
+            0xBD => "ImageSampleCBAO",
+            0xBE => "ImageSampleCBClAO",
             0xE6 => "ImageBvhIntersectRay",
             0xE7 => "ImageBvh64IntersectRay",
             _ => string.Empty,
@@ -1772,6 +1829,7 @@ public static partial class Gen5ShaderTranslator
     {
         "DsAddU32" or "DsSubU32" or "DsIncU32" or "DsDecU32" or
         "DsMinI32" or "DsMaxI32" or "DsMinU32" or "DsMaxU32" or
+        "DsMinF32" or "DsMaxF32" or
         "DsAndB32" or "DsOrB32" or "DsXorB32" or "DsCmpstB32" or
         "DsAddRtnU32" or "DsSubRtnU32" or "DsIncRtnU32" or "DsDecRtnU32" or
         "DsMinRtnI32" or "DsMaxRtnI32" or "DsMinRtnU32" or "DsMaxRtnU32" or
@@ -1914,6 +1972,14 @@ public static partial class Gen5ShaderTranslator
                     {
                         sources = [.. sources, Gen5Operand.Scalar(scalarSource)];
                     }
+                }
+                else if (opcode == "SSetregB32")
+                {
+                    sources =
+                    [
+                        Gen5Operand.Scalar((word >> 16) & 0x7F),
+                        new Gen5Operand(Gen5OperandKind.EncodedConstant, word & 0xFFFF),
+                    ];
                 }
                 else
                 {
@@ -2242,6 +2308,10 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData1),
                     ],
                     "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    "DsBpermuteB32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
                     "DsCmpstB32" or "DsCmpstRtnB32" => [
@@ -2260,6 +2330,13 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData0 + 1),
                     ],
+                    // GFX10 DS_MIN/MAX_F32 use DATA0 as the replacement value and
+                    // DATA1 as the floating-point compare operand.
+                    "DsMinF32" or "DsMaxF32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData1),
+                    ],
                     _ when IsDataShareAtomic(opcode) => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
@@ -2271,7 +2348,8 @@ public static partial class Gen5ShaderTranslator
                     "DsAppend" or "DsConsume" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsReadB32" or "DsReadAddtidB32" or "DsSwizzleB32" => [
+                    "DsReadB32" or "DsReadI8" or "DsReadAddtidB32" or
+                    "DsSwizzleB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsReadB64" or "DsRead2B32" or "DsRead2St64B32" => [
@@ -2314,9 +2392,14 @@ public static partial class Gen5ShaderTranslator
                 var usesFlatAddress = opcode.StartsWith(
                     "Flat",
                     StringComparison.Ordinal);
+                var usesScratchAddress = opcode.StartsWith(
+                    "Scratch",
+                    StringComparison.Ordinal);
                 var memoryOpcode = usesFlatAddress
                     ? "Global" + opcode["Flat".Length..]
-                    : opcode;
+                    : usesScratchAddress
+                        ? "Global" + opcode["Scratch".Length..]
+                        : opcode;
                 var dwordCount = memoryOpcode switch
                 {
                     "GlobalLoadUbyte" or
@@ -2351,6 +2434,10 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorAddress + 1),
                     ]
+                    : usesScratchAddress && scalarAddress < 125
+                        ? [Gen5Operand.Scalar(scalarAddress)]
+                        : usesScratchAddress
+                            ? [Gen5Operand.Vector(vectorAddress)]
                     :
                     [
                         Gen5Operand.Vector(vectorAddress),
@@ -2528,7 +2615,11 @@ public static partial class Gen5ShaderTranslator
                 sources = imageSources;
                 destinations = opcode.StartsWith("ImageStore", StringComparison.Ordinal)
                     ? []
-                    : [Gen5Operand.Vector(vectorData)];
+                    : opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay"
+                        ? Enumerable.Range((int)vectorData, 4)
+                            .Select(index => Gen5Operand.Vector((uint)index))
+                            .ToArray()
+                        : [Gen5Operand.Vector(vectorData)];
                 var dimension = (word >> 3) & 0x7;
                 control = new Gen5ImageControl(
                     (word >> 8) & 0xF,
