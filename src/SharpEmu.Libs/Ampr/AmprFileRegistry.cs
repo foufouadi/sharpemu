@@ -358,7 +358,20 @@ internal static class AmprFileRegistry
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "SharpEmu",
                 "ampr-index");
-        Directory.CreateDirectory(cacheDir);
+        try
+        {
+            Directory.CreateDirectory(cacheDir);
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
+        {
+            // Sandboxed launches and mitigated child processes can lose access
+            // to the profile AppData directory. Keep the index beside the
+            // executable so the next launch can still reuse it.
+            cacheDir = Path.Combine(AppContext.BaseDirectory, "user", "ampr-index");
+            Directory.CreateDirectory(cacheDir);
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] ampr.app0_index_cache_fallback path={cacheDir}: {exception.Message}");
+        }
 
         // Distinct roots must not share a cache file. Folding case is only
         // correct where the host filesystem folds it too.
