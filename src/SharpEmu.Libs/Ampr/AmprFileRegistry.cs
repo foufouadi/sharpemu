@@ -361,6 +361,9 @@ internal static class AmprFileRegistry
         try
         {
             Directory.CreateDirectory(cacheDir);
+            var probePath = Path.Combine(cacheDir, $".write-test-{Environment.ProcessId}");
+            using (File.Create(probePath)) { }
+            File.Delete(probePath);
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
         {
