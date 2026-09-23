@@ -26,6 +26,11 @@ internal interface IMediaFrameDecoder : IDisposable
 internal sealed class MediaFramePlayback : IDisposable
 {
     private const int BufferCount = 5;
+    // A movie that has not finished decoding within this bound must not hold
+    // the guest on its last frame forever.  This is deliberately generous for
+    // the largest shipped intro movies, while still allowing the next guest
+    // movie (and eventually the menu) to open when a host decoder stalls.
+    private const double MaxPlaybackSeconds = 120;
 
     private readonly object _gate = new();
     private readonly IMediaFrameDecoder _decoder;
@@ -196,6 +201,14 @@ internal sealed class MediaFramePlayback : IDisposable
 
             var elapsedSeconds = CurrentPlaybackSecondsLocked();
             TraceClockSkewLocked();
+            if (_playbackClockStarted && elapsedSeconds >= MaxPlaybackSeconds)
+            {
+                _finished = true;
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] Bink2 playback watchdog expired at " +
+                    $"{elapsedSeconds:F1}s; advancing to the next movie.");
+                return false;
+            }
             var targetFrameIndex = CurrentTargetFrameIndexLocked();
             DecodedFrame? replacement = null;
             while (_decodedFrames.Count > 0 &&
