@@ -42,6 +42,7 @@ internal static class HostMovieBridge
     private static byte[]? _frameBuffer;
     private static bool _frameBufferPresented;
     private static MediaFramePlayback? _playback;
+    private static Timer? _playbackWatchdog;
     private static long _frameSerial;
     private static uint _presentationWidth = MaxHostVideoWidth;
     private static uint _presentationHeight = MaxHostVideoHeight;
@@ -287,6 +288,7 @@ internal static class HostMovieBridge
         _frameBuffer = GC.AllocateUninitializedArray<byte>(GetFrameBufferLength(info));
         _frameBufferPresented = false;
         FillDummyFrame(_frameBuffer, info.Width, info.Height);
+        ArmPlaybackWatchdogLocked(hostPath);
         Console.Error.WriteLine(
             "[LOADER][INFO] Bink dummy attached: " + Path.GetFileName(hostPath) + " " +
             info.Width + "x" + info.Height + ".");
@@ -301,6 +303,33 @@ internal static class HostMovieBridge
         _activePath = hostPath;
         _activeInfo = info;
         _playback = new MediaFramePlayback(decoder);
+        ArmPlaybackWatchdogLocked(hostPath);
+    }
+
+    private static void ArmPlaybackWatchdogLocked(string hostPath)
+    {
+        _playbackWatchdog?.Dispose();
+        _playbackWatchdog = new Timer(
+            static state =>
+            {
+                var path = (string)state!;
+                lock (Gate)
+                {
+                    if (!string.Equals(_activePath, path, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+
+                    Console.Error.WriteLine(
+                        "[LOADER][WARN] Bink2 host watchdog expired for " +
+                        Path.GetFileName(path) + "; advancing to the next movie.");
+                    CloseActiveLocked();
+                    AttachNextQueuedMovieLocked();
+                }
+            },
+            hostPath,
+            TimeSpan.FromSeconds(90),
+            Timeout.InfiniteTimeSpan);
     }
 
     internal static bool TryReadBinkInfo(string path, out Bink2MovieInfo info)
@@ -349,6 +378,8 @@ internal static class HostMovieBridge
 
     private static void CloseActiveLocked()
     {
+        _playbackWatchdog?.Dispose();
+        _playbackWatchdog = null;
         _playback?.Dispose();
         _playback = null;
         _activePath = null;
