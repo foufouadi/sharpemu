@@ -50,6 +50,22 @@ internal static class AmprFileRegistry
         }
     }
 
+    // APR resolve exports return the guest-visible 31-bit path hash. Keep it
+    // separate from the high-bit process-local handles used by Register(),
+    // because titles compare these IDs with values baked into asset tables.
+    public static uint RegisterAprResolvedPath(string guestPath, string hostPath)
+    {
+        if (TryGetApp0Relative(guestPath, out var relative) && relative.Length != 0)
+        {
+            RegisterApp0Relative(relative, hostPath);
+        }
+
+        var fileId = ComputeFileId(guestPath);
+        _hostPathsById[fileId] = hostPath;
+        _ambiguousCompatibilityIds.TryRemove(fileId, out _);
+        return fileId;
+    }
+
     public static bool TryGetHostPath(uint id, out string hostPath)
     {
         if ((id & 0x80000000) != 0)
