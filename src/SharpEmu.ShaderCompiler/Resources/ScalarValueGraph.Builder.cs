@@ -1471,8 +1471,12 @@ public sealed partial class ScalarValueGraph
                 {
                     var handle = binding.Handle!;
                     var offset = state.ReadVector(bufferControl.VectorAddress);
-                    vectorRead = _graph.MemoryRead(ScalarValueKind.ScalarBufferWord, handle, offset, memoryIndex);
-                    binding = binding with { Read = vectorRead };
+                    // A lane-varying address loads a lane-varying value.
+                    if (!offset.IsUndefined)
+                    {
+                        vectorRead = _graph.MemoryRead(ScalarValueKind.ScalarBufferWord, handle, offset, memoryIndex);
+                        binding = binding with { Read = vectorRead };
+                    }
                 }
 
                 _graph.Accesses[memoryIndex] = binding;
@@ -1662,7 +1666,11 @@ public sealed partial class ScalarValueGraph
             ThreadBits.Remove(register - 1);
             if (register == ExecLow)
             {
-                Exec = _graph.Undefined(ScalarValueType.Bool);
+                // An all-or-nothing constant keeps the mask known, so s_cbranch_execz stays decidable.
+                Exec = value.IsConstant && Scalars[ExecHigh] is { IsConstant: true, ConstantU32: 0 } &&
+                    value.ConstantU32 is 0 or FullWaveMask
+                    ? _graph.Constant(value.ConstantU32 != 0)
+                    : _graph.Undefined(ScalarValueType.Bool);
             }
             else if (register == VccLow)
             {

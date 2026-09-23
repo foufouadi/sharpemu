@@ -1031,7 +1031,8 @@ public static class ResourceMaterializer
                     return Fail($"storage image descriptor {index} uses unsupported format {format}");
                 }
 
-                if (rawSintStorage)
+                // Atomics use the uint view; float min/max compare-exchange its bits.
+                if (rawSintStorage || (baseImage.Atomic && numericClass == ImageNumericClass.Float))
                 {
                     numericClass = ImageNumericClass.Uint;
                 }

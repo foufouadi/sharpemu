@@ -131,6 +131,8 @@ public sealed class ShaderResourcePlan
             else if (indirect.Dense)
             {
                 plan.MarkCleanFlatSlots(plan.DescriptorSources[(int)indirect.HeapSource], cleanSlots);
+                if (indirect.WaveIndexed is not null)
+                    plan.MarkHeapReadSlots(plan.DescriptorSources[(int)indirect.HeapSource], cleanSlots);
             }
             else
             {
@@ -169,6 +171,21 @@ public sealed class ShaderResourcePlan
 
     // The flattened table the host fills per draw: table reads, then the written ranges.
     public int FlattenedTableReservedCount => TableReads.Count + WrittenRangeCount * WrittenRangeDwordCount;
+
+    // A wave-indexed table picks its keys from a mask word read off the same heap.
+    private void MarkHeapReadSlots(DescriptorSource heap, byte[] slots)
+    {
+        for (var slot = 0; slot < TableReads.Count && slot < slots.Length; slot++)
+        {
+            var value = TableReads[slot].Value;
+            if (value.Kind == ScalarValueKind.ScalarAddressWord && value.Operands.Length != 0 &&
+                value.Operands[0].Kind == ScalarValueKind.AddressHandle &&
+                value.Operands[0].Operands.SequenceEqual(heap.Dwords))
+            {
+                slots[slot] = 1;
+            }
+        }
+    }
 
     // Every flattened slot an indirect table's descriptor depends on must be read
     // through the clean reader, including the slots those reads depend on.

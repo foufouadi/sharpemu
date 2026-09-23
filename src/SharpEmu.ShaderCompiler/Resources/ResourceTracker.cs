@@ -398,6 +398,10 @@ public sealed partial class ResourceTracker
         }
 
         var source = MakeSource(handle, width, sampler, sampleAdjust, pc);
+        if (expected == ScalarValueKind.ImageHandle && !IsContiguousScalarBufferRecord(source))
+        {
+            throw Failure(pc, $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} is not a valid runtime value");
+        }
 
         // Image descriptors loaded straight from a scalar buffer at a dynamically-uniform
         // offset (e.g. a bindless material heap entry read via S_BUFFER_LOAD, without going
@@ -435,6 +439,31 @@ public sealed partial class ResourceTracker
         }
 
         return InternSource(source);
+    }
+
+    // An image descriptor read from a scalar buffer must be one contiguous record.
+    private bool IsContiguousScalarBufferRecord(DescriptorSource source)
+    {
+        if (!source.Dwords.Any(dword => dword.Kind == ScalarValueKind.ScalarBufferWord))
+        {
+            return true;
+        }
+
+        var first = ScalarReadMemory(source.Dwords[0], out _);
+        for (var dword = 0; dword < source.Dwords.Length; dword++)
+        {
+            var read = source.Dwords[dword];
+            var memory = ScalarReadMemory(read, out _);
+            if (first is null || memory is null ||
+                memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
+                !_graph.Equivalent(read.Operands[0], source.Dwords[0].Operands[0]) ||
+                !_graph.Equivalent(read.Operands[1], source.Dwords[0].Operands[1]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // A runtime V# is one whose four dwords cannot be resolved at plan time, but
@@ -711,7 +740,10 @@ public sealed partial class ResourceTracker
             // (e.g. a descriptor-array entry indexed by a loop counter) cannot be
             // bound ahead of time. Record it as a runtime guest descriptor so the
             // backend can choose a lowering strategy for each access.
-            if (IsRuntimeDescriptorHandle(access.Handle))
+            // A vector access through a V# the draw can evaluate keeps the explicit binding.
+            if (IsRuntimeDescriptorHandle(access.Handle) &&
+                (memory.Kind != MemoryResourceKind.Buffer ||
+                 !ValidateSource(MakeSource(access.Handle!, 4, false, false, memory.Pc), out _)))
             {
                 // A formatted vector access can enumerate its bounded candidates; a scalar
                 // buffer read only needs the descriptor's base, which its SGPRs already

@@ -251,9 +251,9 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                // Robust buffer reads from an empty/out-of-range V# return zero.
+                // An unbound (empty) V# reads as zero; overrunning a bound buffer stays a failure.
                 result = 0;
-                return true;
+                return (uint)records == 0;
             }
 
             address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
@@ -265,16 +265,16 @@ public sealed class RuntimeValueEvaluator
             {
                 return false;
             }
-
-            if (address < GuestNullPageSize)
-            {
-                result = 0;
-                return true;
-            }
         }
 
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
         {
+            if (value.Kind != ScalarValueKind.ScalarBufferWord && baseAddress == 0 && address < GuestNullPageSize)
+            {
+                result = 0;
+                return true;
+            }
+
             if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
             {
                 Console.Error.WriteLine($"[RV-EVAL-DIAG] ReadMemory failed address=0x{address:X} readerNull={_inputs.ReadMemory is null} value.Kind={value.Kind}");
