@@ -3957,7 +3957,8 @@ public static partial class Gen5SpirvTranslator
                     resource.IsStorage || resource.Multisampled
                         ? [queryImage]
                         : [queryImage, LoadImageIntegerAddress(image, 0)]);
-                var levels = !resource.IsStorage && !resource.Multisampled
+                // NVIDIA's compiler crashes on an unused level query of a 3D image.
+                var levels = (image.Dmask & 0x8u) != 0 && !resource.IsStorage && !resource.Multisampled
                     ? _module.AddInstruction(
                         SpirvOp.ImageQueryLevels,
                         _uintType,
