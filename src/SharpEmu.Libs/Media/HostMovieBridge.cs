@@ -309,16 +309,6 @@ internal static class HostMovieBridge
     private static void ArmPlaybackWatchdogLocked(string hostPath)
     {
         _playbackWatchdog?.Dispose();
-        var timeout = TimeSpan.FromSeconds(150);
-        if (TryReadBinkInfo(hostPath, out var info) &&
-            info.FramesPerSecondNumerator != 0 &&
-            info.FramesPerSecondDenominator != 0)
-        {
-            var duration = (double)info.FramesPerSecondDenominator /
-                info.FramesPerSecondNumerator;
-            duration *= info.FrameCount;
-            timeout = TimeSpan.FromSeconds(Math.Clamp(duration + 30, 90, 300));
-        }
         _playbackWatchdog = new Timer(
             static state =>
             {
@@ -339,7 +329,7 @@ internal static class HostMovieBridge
                 }
             },
             hostPath,
-            timeout,
+            TimeSpan.FromSeconds(90),
             Timeout.InfiniteTimeSpan);
     }
 
@@ -359,7 +349,6 @@ internal static class HostMovieBridge
             info = new Bink2MovieInfo(
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x14, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x18, 4)),
-                BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(8, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x1C, 4)),
                 BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x20, 4)));
             return info.FramesPerSecondNumerator != 0 &&
@@ -407,7 +396,6 @@ internal static class HostMovieBridge
     [StructLayout(LayoutKind.Sequential)]
     internal readonly struct Bink2MovieInfo
     {
-        public readonly uint FrameCount;
         public readonly uint Width;
         public readonly uint Height;
         public readonly uint FramesPerSecondNumerator;
@@ -416,24 +404,13 @@ internal static class HostMovieBridge
         internal Bink2MovieInfo(
             uint width,
             uint height,
-            uint frameCount,
             uint framesPerSecondNumerator,
             uint framesPerSecondDenominator)
         {
             Width = width;
             Height = height;
-            FrameCount = frameCount;
             FramesPerSecondNumerator = framesPerSecondNumerator;
             FramesPerSecondDenominator = framesPerSecondDenominator;
-        }
-
-        internal Bink2MovieInfo(
-            uint width,
-            uint height,
-            uint framesPerSecondNumerator,
-            uint framesPerSecondDenominator)
-            : this(width, height, 0, framesPerSecondNumerator, framesPerSecondDenominator)
-        {
         }
     }
 
