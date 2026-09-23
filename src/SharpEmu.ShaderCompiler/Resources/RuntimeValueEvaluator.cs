@@ -12,13 +12,6 @@ public sealed class RuntimeValueEvaluator
 {
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
 
-    // A bindless pointer the guest leaves unbound for a dispatch resolves its address-handle
-    // dwords to zero; a small immediate offset on top of that still lands under this guest
-    // null-page threshold. Treat such reads as zero instead of faulting the host, so the
-    // descriptor built from them collapses to a null resource. Ported from KytyPS5's identical
-    // fix ("shader: treat a null-based SRT constant read as zero").
-    private const ulong GuestNullPageSize = 0x10000ul;
-
     private readonly ShaderResourcePlan _plan;
     private readonly ResourceRuntimeInputs _inputs;
     private readonly IReadOnlyList<byte> _cleanFlatSlots;
@@ -269,12 +262,6 @@ public sealed class RuntimeValueEvaluator
 
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
         {
-            if (value.Kind != ScalarValueKind.ScalarBufferWord && baseAddress == 0 && address < GuestNullPageSize)
-            {
-                result = 0;
-                return true;
-            }
-
             if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
             {
                 Console.Error.WriteLine($"[RV-EVAL-DIAG] ReadMemory failed address=0x{address:X} readerNull={_inputs.ReadMemory is null} value.Kind={value.Kind}");

@@ -182,8 +182,8 @@ public sealed class Gen5ShaderAtomicDecodeTests
     }
 
     [Theory]
-    [InlineData(0xD8FA3412u, "DsAppend")]
-    [InlineData(0xD8F63412u, "DsConsume")]
+    [InlineData(0xD8F83412u, "DsAppend")]
+    [InlineData(0xD8F43412u, "DsConsume")]
     public void DsWaveCounter_UsesM0AndReturnsOldValue(uint word, string opcode)
     {
         var instruction = DecodeSingle(word, 0x07000000);
