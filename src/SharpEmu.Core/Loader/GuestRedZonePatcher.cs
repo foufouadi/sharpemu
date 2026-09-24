@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Iced.Intel;
+using SharpEmu.Core.Cpu.Emulation;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
 
@@ -61,7 +62,8 @@ internal static class GuestRedZonePatcher
             return default;
         }
 
-        var sites = CollectPatchSites(memory, programHeaders, imageBase, functionStarts, protectRedZone, splitVectorStores, out var scan);
+        var hostTraps = protectRedZone ? HostExtensionSupport.Missing : RecoverableExtensions.None;
+        var sites = CollectPatchSites(memory, programHeaders, imageBase, functionStarts, protectRedZone, splitVectorStores, hostTraps, out var scan);
         if (sites.Count == 0)
         {
             Console.Error.WriteLine(
@@ -145,6 +147,7 @@ internal static class GuestRedZonePatcher
         IReadOnlyList<ulong> functionStarts,
         bool protectRedZone,
         bool splitVectorStores,
+        RecoverableExtensions hostTraps,
         out PatchResult result)
     {
         var sites = new List<PatchSite>();
@@ -221,7 +224,7 @@ internal static class GuestRedZonePatcher
                 {
                     var instruction = decoded[instructionIndex].Instruction;
                     if ((!usesRedZone && !(splitVectorStores && RosettaVectorStorePatch.RequiresStoreSplit(instruction))) ||
-                        !IsFaultableGuestMemoryInstruction(instruction))
+                        !IsFaultableGuestInstruction(instruction, hostTraps))
                     {
                         continue;
                     }
@@ -233,9 +236,9 @@ internal static class GuestRedZonePatcher
                     // one. Forward spans cannot overlap by construction; the
                     // check costs nothing and documents the invariant.
                     var backward = false;
-                    if (!TryBuildPatchSpan(decoded, instructionIndex, branchTargets, out var span, out var refusal))
+                    if (!TryBuildPatchSpan(decoded, instructionIndex, branchTargets, hostTraps, out var span, out var refusal))
                     {
-                        backward = TryBuildEnclosingPatchSpan(decoded, instructionIndex, branchTargets, out span);
+                        backward = TryBuildEnclosingPatchSpan(decoded, instructionIndex, branchTargets, hostTraps, out span);
                     }
 
                     if ((!backward && refusal != SpanRefusal.None) || span.Address < lastSiteEnd)
@@ -344,7 +347,8 @@ internal static class GuestRedZonePatcher
         out ulong spanAddress,
         out int spanLength,
         out int coreStart,
-        out int coreCount)
+        out int coreCount,
+        RecoverableExtensions hostTraps = RecoverableExtensions.None)
     {
         spanAddress = 0;
         spanLength = 0;
@@ -367,7 +371,7 @@ internal static class GuestRedZonePatcher
             return false;
         }
 
-        if (!TryBuildEnclosingPatchSpan(decoded, faultIndex, CollectBranchTargets(decoded), out var site))
+        if (!TryBuildEnclosingPatchSpan(decoded, faultIndex, CollectBranchTargets(decoded), hostTraps, out var site))
         {
             return false;
         }
@@ -384,13 +388,13 @@ internal static class GuestRedZonePatcher
     /// all of them and nothing that reads or writes through RSP, because the
     /// shift would move such an access by 128 bytes.
     /// </summary>
-    private static bool TryComputeShiftedCore(IList<Instruction> instructions, out int coreStart, out int coreCount)
+    private static bool TryComputeShiftedCore(IList<Instruction> instructions, RecoverableExtensions hostTraps, out int coreStart, out int coreCount)
     {
         coreStart = -1;
         var coreEnd = -1;
         for (var index = 0; index < instructions.Count; index++)
         {
-            if (!IsFaultableGuestMemoryInstruction(instructions[index]))
+            if (!IsFaultableGuestInstruction(instructions[index], hostTraps))
             {
                 continue;
             }
@@ -433,6 +437,7 @@ internal static class GuestRedZonePatcher
         IReadOnlyList<DecodedInstruction> decoded,
         int faultIndex,
         IReadOnlySet<ulong> branchTargets,
+        RecoverableExtensions hostTraps,
         out PatchSite site)
     {
         site = default;
@@ -479,7 +484,7 @@ internal static class GuestRedZonePatcher
                 instructions.Add(decoded[index].Instruction);
             }
 
-            if (!TryComputeShiftedCore(instructions, out var coreStart, out var coreCount))
+            if (!TryComputeShiftedCore(instructions, hostTraps, out var coreStart, out var coreCount))
             {
                 return false;
             }
@@ -495,13 +500,7 @@ internal static class GuestRedZonePatcher
         IReadOnlyList<DecodedInstruction> decoded,
         int startIndex,
         IReadOnlySet<ulong> branchTargets,
-        out PatchSite site) =>
-        TryBuildPatchSpan(decoded, startIndex, branchTargets, out site, out _);
-
-    private static bool TryBuildPatchSpan(
-        IReadOnlyList<DecodedInstruction> decoded,
-        int startIndex,
-        IReadOnlySet<ulong> branchTargets,
+        RecoverableExtensions hostTraps,
         out PatchSite site,
         out SpanRefusal refusal)
     {
@@ -541,7 +540,7 @@ internal static class GuestRedZonePatcher
             return false;
         }
 
-        if (!TryComputeShiftedCore(instructions, out var coreStart, out var coreCount))
+        if (!TryComputeShiftedCore(instructions, hostTraps, out var coreStart, out var coreCount))
         {
             refusal = SpanRefusal.TooShort;
             site = default;
@@ -598,6 +597,15 @@ internal static class GuestRedZonePatcher
 
         return false;
     }
+
+    // An instruction the host can stop on: a guest memory access, or an instruction from an
+    // extension the host lacks, which traps with #UD before the backend emulates it. Either
+    // way the host builds its exception frame below RSP, over the guest's red zone.
+    internal static bool IsFaultableGuestInstruction(in Instruction instruction, RecoverableExtensions hostTraps) =>
+        IsFaultableGuestMemoryInstruction(instruction) ||
+        (instruction.FlowControl == FlowControl.Next &&
+         !TouchesStackPointer(instruction) &&
+         HostExtensionSupport.TrapsOnHost(instruction, hostTraps));
 
     internal static bool IsFaultableGuestMemoryInstruction(in Instruction instruction)
     {

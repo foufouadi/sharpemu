@@ -1,6 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using Iced.Intel;
+using SharpEmu.Core.Cpu.Emulation;
 using SharpEmu.Core.Loader;
 
 using Xunit;
@@ -126,5 +128,65 @@ public sealed class GuestRedZoneEnclosingSpanTests
 
         Assert.False(GuestRedZonePatcher.TryBuildEnclosingSpan(
             code, Base, Base + 2, out _, out _, out _, out _));
+    }
+
+    // A register-only instruction from an extension the host lacks traps with #UD, and the
+    // host's exception frame lands on the red zone just as it does for a memory fault.
+    [Fact]
+    public void ProtectsAnInstructionTheHostTrapsOn()
+    {
+        // jne +8
+        // shr r11, 12       -> 4 bytes, no memory operand
+        // extrq xmm0, xmm1  -> 4 bytes, SSE4a: the site on a host without it
+        // mov rax,[rcx]     -> branch target
+        byte[] code =
+        [
+            0x75, 0x08,
+            0x49, 0xC1, 0xEB, 0x0C,
+            0x66, 0x0F, 0x79, 0xC1,
+            0x48, 0x8B, 0x01,
+        ];
+
+        Assert.True(GuestRedZonePatcher.TryBuildEnclosingSpan(
+            code, Base, Base + 6, out var address, out var length, out var coreStart, out var coreCount,
+            RecoverableExtensions.Sse4a));
+        Assert.Equal(Base + 2, address);
+        Assert.Equal(8, length);
+        Assert.Equal(1, coreStart);
+        Assert.Equal(1, coreCount);
+
+        // A host that implements SSE4a never stops there, so nothing needs the shift.
+        Assert.False(GuestRedZonePatcher.TryBuildEnclosingSpan(
+            code, Base, Base + 6, out _, out _, out _, out _, RecoverableExtensions.None));
+        Assert.False(GuestRedZonePatcher.TryBuildEnclosingSpan(
+            code, Base, Base + 6, out _, out _, out _, out _, RecoverableExtensions.Bmi1 | RecoverableExtensions.MonitorX));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x66, 0x0F, 0x79, 0xC1 }, RecoverableExtensions.Sse4a)]
+    [InlineData(new byte[] { 0x0F, 0x01, 0xFA }, RecoverableExtensions.MonitorX)]
+    [InlineData(new byte[] { 0x0F, 0x01, 0xFB }, RecoverableExtensions.MonitorX)]
+    [InlineData(new byte[] { 0xF3, 0x0F, 0xBC, 0xC1 }, RecoverableExtensions.Bmi1)]
+    [InlineData(new byte[] { 0xF3, 0x0F, 0xBD, 0xC1 }, RecoverableExtensions.Lzcnt)]
+    [InlineData(new byte[] { 0xC4, 0xE2, 0x70, 0xF5, 0xC2 }, RecoverableExtensions.Bmi2)]
+    [InlineData(new byte[] { 0x0F, 0x01, 0xFC }, RecoverableExtensions.ClZero)]
+    [InlineData(new byte[] { 0x0F, 0x01, 0xFD }, RecoverableExtensions.Rdpru)]
+    [InlineData(new byte[] { 0x01, 0xC8 }, RecoverableExtensions.None)]
+    public void MapsTheExtensionEachInstructionNeeds(byte[] bytes, RecoverableExtensions expected)
+    {
+        var instruction = Decode(bytes);
+        Assert.Equal(expected, HostExtensionSupport.Required(instruction));
+        Assert.Equal(expected != RecoverableExtensions.None,
+            GuestRedZonePatcher.IsFaultableGuestInstruction(instruction, expected | RecoverableExtensions.Sse4a));
+        Assert.False(GuestRedZonePatcher.IsFaultableGuestInstruction(instruction, RecoverableExtensions.None));
+    }
+
+    private static Instruction Decode(byte[] bytes)
+    {
+        var decoder = Iced.Intel.Decoder.Create(64, new ByteArrayCodeReader(bytes));
+        decoder.IP = Base;
+        decoder.Decode(out var instruction);
+        Assert.Equal(bytes.Length, instruction.Length);
+        return instruction;
     }
 }
