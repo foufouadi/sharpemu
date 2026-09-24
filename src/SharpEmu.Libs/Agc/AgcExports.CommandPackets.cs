@@ -87,7 +87,9 @@ public static partial class AgcExports
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var dwordCount = (uint)ctx[CpuRegister.Rsi];
-        if (commandBufferAddress == 0 || dwordCount < 2 || dwordCount > 0x4001)
+        // One dword is the header-only NOP; its all-ones count field leaves 0x4000 as the
+        // longest NOP that still has a body.
+        if (commandBufferAddress == 0 || dwordCount == 0 || dwordCount > 0x4000)
         {
             return ReturnPointer(ctx, 0);
         }
@@ -111,7 +113,7 @@ public static partial class AgcExports
 
     // RenderThread/Subrender probe this before writing a NOP. Unresolved
     // GetSize returns NOT_FOUND and leaves command-buffer sizing broken.
-    // CbNop rejects dwordCount < 2, so report that floor.
+    // The size reported is that of a two-dword NOP.
     [SysAbiExport(
         Nid = "t7PlZ9nt5Lc",
         ExportName = "sceAgcCbNopGetSize",

@@ -150,7 +150,7 @@ public sealed partial class GpuCommandInterpreter
         var customCode = packet.CustomCode;
         if (customCode == PacketCustomCode.Zero)
         {
-            if ((payload[0] & 0xFFFF_0000u) == MarkerMagic)
+            if (!payload.IsEmpty && (payload[0] & 0xFFFF_0000u) == MarkerMagic)
             {
                 return MarkerPacket(packet, payload);
             }

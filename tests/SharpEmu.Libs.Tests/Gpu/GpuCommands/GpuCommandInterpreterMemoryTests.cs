@@ -40,6 +40,21 @@ public sealed class GpuCommandInterpreterMemoryTests
             StreamRunner.Low(destination), StreamRunner.High(destination));
 
     [Fact]
+    public void HeaderOnlyNop_IsSkippedAsOneDword()
+    {
+        var runner = new StreamRunner();
+        runner.Host.WriteDword(Label, 0);
+
+        // The packet after the NOP must run, and a NOP ending the buffer is complete on its own.
+        var stream = StreamRunner.Concat(
+            [PacketHeader.HeaderOnlyNop],
+            WriteData(5u << 8, Label, 0x1234),
+            [PacketHeader.HeaderOnlyNop]);
+        Assert.Equal(SubmissionProgress.Complete, runner.Run(stream));
+        Assert.Equal(0x1234u, runner.Host.ReadDword(Label));
+    }
+
+    [Fact]
     public void WriteData_CopiesOrWritesOneAddress()
     {
         var runner = new StreamRunner();

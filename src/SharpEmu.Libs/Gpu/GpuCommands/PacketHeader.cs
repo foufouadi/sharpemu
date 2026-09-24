@@ -10,7 +10,12 @@ public static class PacketHeader
 
     public const uint MaxLength = 0x3FFFu + 2u;
 
-    public static uint Length(uint header) => ((header >> 16) & 0x3FFFu) + 2u;
+    // A type-3 NOP whose count field is all ones is the header-only NOP (Mesa's PKT3_NOP_PAD):
+    // it has no body, unlike every other type-3 packet, whose length is count + 2.
+    public const uint HeaderOnlyNop = 0xFFFF_1000u;
+
+    public static uint Length(uint header) =>
+        (header & 0xFFFF_FF00u) == HeaderOnlyNop ? 1u : ((header >> 16) & 0x3FFFu) + 2u;
 
     public static uint Opcode(uint header) => (header >> 8) & 0xFFu;
 

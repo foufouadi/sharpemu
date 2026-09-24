@@ -586,8 +586,7 @@ public static partial class AgcExports
         ((op & 0xFFu) << 8) |
         ((register & 0x3Fu) << 2);
 
-    private static uint Pm4Length(uint header) =>
-        ((header >> 16) & 0x3FFFu) + 2u;
+    private static uint Pm4Length(uint header) => PacketHeader.Length(header);
 
     private static bool TryReadByte(CpuContext ctx, ulong address, out byte value)
     {

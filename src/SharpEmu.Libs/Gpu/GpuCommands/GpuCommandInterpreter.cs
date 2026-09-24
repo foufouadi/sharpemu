@@ -238,11 +238,6 @@ public sealed partial class GpuCommandInterpreter
                 return;
             }
 
-            if (remaining < 2)
-            {
-                throw _host.Fatal($"The packet is shorter than two dwords: offset=0x{offset:X5} header=0x{header:X8} address=0x{packetAddress:X16}.");
-            }
-
             var length = PacketHeader.Length(header);
             if (length > remaining)
             {

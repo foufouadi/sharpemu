@@ -26,6 +26,18 @@ public sealed class PacketHeaderTests
     }
 
     [Fact]
+    public void HeaderOnlyNop_HasNoBody()
+    {
+        // PM4 encodes a one-dword NOP as a type-3 NOP whose count field is all ones.
+        Assert.Equal(PacketHeader.HeaderOnlyNop, PacketHeader.Make(1, PacketOpcode.Nop));
+        Assert.Equal(1u, PacketHeader.Length(PacketHeader.HeaderOnlyNop));
+        Assert.Equal(1u, PacketHeader.Length(PacketHeader.HeaderOnlyNop | 1u));
+        Assert.Equal(0x3FFFu + 1u, PacketHeader.Length(PacketHeader.Make(0x3FFFu + 1u, PacketOpcode.Nop)));
+        // The all-ones count keeps its usual meaning for every other opcode.
+        Assert.Equal(PacketHeader.MaxLength, PacketHeader.Length(0xFFFF_0000u | (PacketOpcode.WriteData << 8)));
+    }
+
+    [Fact]
     public void PredicateBit_IsTheLowestHeaderBit()
     {
         var header = PacketHeader.Make(3, PacketOpcode.DrawIndexAuto) | 1u;
