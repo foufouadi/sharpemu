@@ -146,6 +146,27 @@ public sealed class ResourceTrackerTests
         Assert.Contains("pc=0x00000200", error.Message);
     }
 
+    [Fact]
+    public void ControlDependentImageHandle_IsRejectedInsteadOfReplacedWithNull()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        for (uint index = 0; index < 8; index++)
+        {
+            instructions.Add(MoveScalarRegister(index * 4, 16 + index, index));
+        }
+
+        instructions.Add(Branch(32, "SCbranchScc0", 2));
+        instructions.Add(MoveScalarRegister(36, 16, 0));
+        instructions.Add(Branch(40, "SBranch", 1));
+        instructions.Add(MoveScalarRegister(44, 16, 8));
+        instructions.Add(Image(48, "ImageLoad", 16));
+        instructions.Add(EndProgram(56));
+
+        var error = Assert.Throws<ResourcePlanException>(() => Extract(Program([.. instructions])));
+        Assert.Contains("ImageHandle dword 0 is not a valid runtime value", error.Message);
+        Assert.Contains("pc=0x00000030", error.Message);
+    }
+
     private static uint[] StorageDescriptorUserData(uint mipBase, uint mipLast) =>
     [
         0x1000, Format32x4Float << 20, 3 | (3 << 14), IdentitySwizzle | (mipBase << 12) | (mipLast << 16) | (ImageType2D << 28), 0, 3 << 4, 0, 0, 2,

@@ -181,35 +181,6 @@ public sealed partial class ResourceTracker
         return origins.Count == 0 ? string.Empty : $" (undefined from: {string.Join(", ", origins)})";
     }
 
-    private bool HasUndefinedOrigin(ScalarValue value, string opcodePrefix)
-    {
-        var seen = new HashSet<ScalarValue>();
-        var pending = new Stack<ScalarValue>();
-        pending.Push(value);
-        while (pending.Count != 0)
-        {
-            var current = pending.Pop();
-            if (!seen.Add(current))
-            {
-                continue;
-            }
-
-            if (current.Kind == ScalarValueKind.Undefined &&
-                _graph.TryGetUndefinedOrigin(current, out var origin) &&
-                origin.Opcode.StartsWith(opcodePrefix, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            foreach (var operand in current.Operands)
-            {
-                pending.Push(operand);
-            }
-        }
-
-        return false;
-    }
-
     // ---- descriptor sources ----
 
     // Copies a handle's dwords into a source. A sampler that no clamp axis sets to
@@ -291,11 +262,8 @@ public sealed partial class ResourceTracker
         }
     }
 
-    private bool ValidateSource(DescriptorSource source, out uint badDword) => ValidateSource(source, out badDword, out _);
-
-    private bool ValidateSource(DescriptorSource source, out uint badDword, out bool controlDependent)
+    private bool ValidateSource(DescriptorSource source, out uint badDword)
     {
-        controlDependent = false;
         for (badDword = 0; badDword < source.DwordCount; badDword++)
         {
             var dword = source.Dwords[badDword];
@@ -304,7 +272,7 @@ public sealed partial class ResourceTracker
                 return false;
             }
 
-            if (!_plan.ValidateRuntimeValue(dword, out controlDependent))
+            if (!_plan.ValidateRuntimeValue(dword))
             {
                 return false;
             }
@@ -407,32 +375,12 @@ public sealed partial class ResourceTracker
         // already handle ScalarBufferWord dwords generically (the same mechanism buffer
         // descriptors rely on via MaterializationSources), so let ValidateSource below be the
         // single source of truth instead of a narrower, ImageHandle-specific blanket ban.
-        if (!ValidateSource(source, out var badDword, out var controlDependent))
+        if (!ValidateSource(source, out var badDword))
         {
-            // A bindless image/sampler descriptor whose dwords resolve through a
-            // control-dependent phi (e.g. a hash-table/linear-probe material lookup, as seen
-            // in Ghost of Yotei) has no single compile-time source: real support needs
-            // GPU-side dynamic descriptor indexing, which this resource tracker doesn't
-            // implement. Rather than fail shader recompilation outright, degrade to a null
-            // descriptor for that one access and let it read as a null/black texture,
-            // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
-            // descriptor). Buffer/sampler-adjacent handles or any other validation failure
-            // still hard-fail, since those aren't safe to silently zero.
-            if ((controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat")) &&
-                expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
-            {
-                source = new DescriptorSource
-                {
-                    Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
-                };
-            }
-            else
-            {
-                throw Failure(
-                    pc,
-                    $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} dword {badDword} is not a valid runtime value" +
-                        DescribeUndefinedLeaves(source.Dwords[badDword]));
-            }
+            throw Failure(
+                pc,
+                $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} dword {badDword} is not a valid runtime value" +
+                    DescribeUndefinedLeaves(source.Dwords[badDword]));
         }
 
         return InternSource(source);

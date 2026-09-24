@@ -16,12 +16,8 @@ public sealed class RuntimeValueValidator
     private readonly ScalarValue? _activeMask;
     private readonly HashSet<ScalarValue> _visiting = [];
 
-    // Set when a failure traces back to a phi that isn't loop-invariant (e.g. a
-    // hash-table/linear-probe bindless lookup): the value genuinely has no single
-    // compile-time source, as opposed to using an operation or memory shape we just
-    // don't recognize. Callers use this to decide whether degrading to a null
-    // descriptor is reasonable instead of failing outright (KytyPS5 does the same
-    // for image/sampler handles specifically).
+    // Set when a failure traces back to a phi that isn't loop-invariant. Callers can
+    // distinguish that from an unsupported operation or memory shape in diagnostics.
     public bool ControlDependent { get; private set; }
 
     public RuntimeValueValidator(ScalarValueGraph graph, uint userDataBase, uint userDataCount, int tableReadCount, ScalarValue? activeMask = null)
