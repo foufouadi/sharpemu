@@ -1491,8 +1491,12 @@ public static partial class Gen5SpirvTranslator
             {
                 if (_stage == Gen5SpirvStage.Compute)
                 {
+                    // Guest code orders buffer and image traffic between the waves of a group
+                    // with s_waitcnt + s_barrier as well as LDS traffic; s_waitcnt emits
+                    // nothing, so the barrier carries AcquireRelease over workgroup, uniform
+                    // and image memory.
                     var workgroup = UInt(2);
-                    var semantics = UInt(0x108);
+                    var semantics = UInt(0x948);
                     _module.AddStatement(
                         SpirvOp.ControlBarrier,
                         workgroup,

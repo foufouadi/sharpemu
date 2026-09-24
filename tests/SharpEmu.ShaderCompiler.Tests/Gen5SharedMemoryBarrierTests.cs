@@ -55,4 +55,25 @@ public sealed class Gen5SharedMemoryBarrierTests
         Assert.Equal(expectedBarriers, barriers);
         Assert.Equal(1, sharedReads);
     }
+
+    // s_waitcnt + s_barrier also orders global memory between the waves of a group, so the
+    // barrier releases and acquires buffer and image memory, not only LDS.
+    [Fact]
+    public void GuestBarrier_OrdersWorkgroupUniformAndImageMemory()
+    {
+        var instructions = new List<Gen5ShaderInstruction>
+        {
+            ResourceTestProgram.BufferAccess(0, "BufferStoreDword", 4, vectorData: 1),
+            new(8, Gen5ShaderEncoding.Sopp, "SBarrier", [0u], [], [], null),
+            ResourceTestProgram.BufferAccess(12, "BufferLoadDword", 4, vectorData: 2),
+            new(20, Gen5ShaderEncoding.Sopp, "SEndpgm", [0u], [], [], null),
+        };
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(new Gen5ShaderProgram(0, instructions));
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = 64, LocalSizeX = 128 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        var barrier = Assert.Single(SpirvWords.Instructions(shader.Spirv), instruction => SpirvWords.Opcode(instruction) == SpirvWords.OpControlBarrier);
+        const uint acquireRelease = 0x8, uniformMemory = 0x40, workgroupMemory = 0x100, imageMemory = 0x800;
+        Assert.Equal(acquireRelease | uniformMemory | workgroupMemory | imageMemory, SpirvWords.ConstantValue(shader.Spirv, barrier[3]));
+    }
 }

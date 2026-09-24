@@ -40,6 +40,12 @@ public static class SpirvWords
 
     public static uint Opcode(uint[] instruction) => instruction[0] & 0xFFFFu;
 
+    public const uint OpConstant = 43;
+
+    // The value of a 32-bit OpConstant by its result id.
+    public static uint ConstantValue(byte[] spirv, uint id) =>
+        Instructions(spirv).Single(instruction => Opcode(instruction) == OpConstant && instruction[2] == id)[3];
+
     // Result ids of every instruction with this opcode.
     public static HashSet<uint> ResultsOf(byte[] spirv, uint opcode) =>
         [.. Instructions(spirv).Where(instruction => Opcode(instruction) == opcode).Select(instruction => instruction[2])];
