@@ -853,7 +853,19 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            var limit = _deviceInfo.MaxComputeWorkGroupCount;
+            if (DispatchSplit.Fits(groupsX, groupsY, groupsZ, limit))
+            {
+                _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            }
+            else
+            {
+                foreach (var chunk in DispatchSplit.Chunks(groupsX, groupsY, groupsZ, limit))
+                {
+                    _vk.CmdDispatchBase(command, chunk.BaseX, chunk.BaseY, chunk.BaseZ, chunk.CountX, chunk.CountY, chunk.CountZ);
+                }
+            }
+
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
             CountDraw();

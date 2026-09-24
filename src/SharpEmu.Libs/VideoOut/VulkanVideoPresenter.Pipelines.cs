@@ -770,6 +770,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 var pipelineInfo = new ComputePipelineCreateInfo
                 {
                     SType = StructureType.ComputePipelineCreateInfo,
+                    // A guest grid past maxComputeWorkGroupCount runs as vkCmdDispatchBase tiles.
+                    Flags = PipelineCreateFlags.CreateDispatchBaseBit,
                     Stage = stageInfo,
                     Layout = layout,
                 };
