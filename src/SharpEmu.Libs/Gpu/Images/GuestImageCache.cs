@@ -15,7 +15,10 @@ namespace SharpEmu.Libs.Gpu.Images;
 // downloaded back when scheduled, with metadata tracking and overlap resolution.
 public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestImageStore, IDisposable
 {
-    private const ulong TicksBeforeRemoval = 32;
+    // An overlapped image may be released only after this many presented frames without a lookup.
+    // Frames, not queue submissions: a title can submit dozens of times per frame, which would
+    // make an image used every frame look stale inside the frame that still reads it.
+    private const ulong FramesBeforeRemoval = 32;
     private const ulong MiB = 1024 * 1024;
 
     private readonly GpuDeviceInfo _device;
@@ -37,6 +40,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _memoryPressureBytes = 1536 * MiB;
     private ulong _criticalMemoryBytes = 3072 * MiB;
     private ulong _collectionTick;
+    private ulong _presentedFrames;
     private uint _queryEpoch;
     private bool _readbackLinearImages;
     private bool _disposed;
@@ -209,7 +213,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             request.View = request.View with { BaseLayer = (uint)viewLayer };
         }
 
-        image.LastAccessTick = _scheduler.CurrentTick;
+        image.LastAccessFrame = _presentedFrames;
         TouchImage(image);
         return result;
     }

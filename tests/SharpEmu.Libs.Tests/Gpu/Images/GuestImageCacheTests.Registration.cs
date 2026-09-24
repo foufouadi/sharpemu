@@ -195,6 +195,46 @@ public sealed partial class GuestImageCacheTests : IClassFixture<HeadlessVulkanF
         harness.Shutdown();
     }
 
+    // An image the guest re-describes with another tiling is released only once it has gone
+    // unused for FramesBeforeRemoval presented frames; queue submissions inside a frame do not
+    // age it, however many a title makes.
+    [Fact]
+    public void OverlappedImage_AgesInPresentedFramesNotSubmissions()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x40000, ReadWrite);
+
+        (ResourceSlotIdentifier Linear, ImageRequest Retiled) Describe(ulong imageAddress)
+        {
+            var linear = LinearRequest(imageAddress, 0x4000, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm, GuestImageType.Color2D, new Extent3D(64, 64, 1), 1, 4, 1);
+            var retiled = linear;
+            retiled.Description.TileMode = GuestTileMode.RenderTarget;
+            return (harness.Find(ref linear), retiled);
+        }
+
+        var (busy, busyRetiled) = Describe(address);
+        harness.Worker.Run(() =>
+        {
+            for (var submission = 0; submission < 64; submission++)
+            {
+                harness.Scheduler.Flush();
+            }
+        });
+        Assert.NotEqual(busy, harness.Find(ref busyRetiled));
+        Assert.True(harness.Images.Contains(busy));
+
+        var (stale, staleRetiled) = Describe(address + 0x10000);
+        for (var frame = 0; frame < 33; frame++)
+        {
+            harness.Images.AdvancePresentedFrame();
+        }
+
+        Assert.NotEqual(stale, harness.Find(ref staleRetiled));
+        Assert.False(harness.Images.Contains(stale));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void RenderTargetGrowth_ReplacesTheEqualAllocation()
     {

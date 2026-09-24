@@ -438,8 +438,7 @@ public sealed partial class GuestImageCache
         }
 
         ref var cachedInfo = ref cached.Description;
-        var currentTick = _scheduler.CurrentTick;
-        var safeToDelete = currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
+        var safeToDelete = _presentedFrames - Math.Min(_presentedFrames, cached.LastAccessFrame) > FramesBeforeRemoval;
         var requestedBlock = requested.BytesPerBlock * requested.Samples;
         var cachedBlock = cachedInfo.BytesPerBlock * cachedInfo.Samples;
         var requestedBlockExtent = requested.BlockExtent;

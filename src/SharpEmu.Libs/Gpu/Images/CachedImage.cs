@@ -80,7 +80,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     public ulong WatchBegin;
     public ulong WatchEnd;
     public ResourceSlotIdentifier DepthOwner;
-    public ulong LastAccessTick;
+    // The presented frame in which a lookup last returned this image.
+    public ulong LastAccessFrame;
     public int RecencyEntryIndex;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description)

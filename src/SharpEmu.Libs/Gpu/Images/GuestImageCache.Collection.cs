@@ -87,6 +87,13 @@ public sealed partial class GuestImageCache
         }
     }
 
+    // Marks a presented frame, the unit an overlapped image's staleness is measured in.
+    public void AdvancePresentedFrame()
+    {
+        using var held = _lock.Hold();
+        _presentedFrames++;
+    }
+
     // Publishes every scheduled linear GPU-written image to guest memory.
     public void FlushScheduledReadbacks()
     {
@@ -120,7 +127,7 @@ public sealed partial class GuestImageCache
         {
             if (image.Registered)
             {
-                image.LastAccessTick = _scheduler.CurrentTick;
+                image.LastAccessFrame = _presentedFrames;
                 live.Add(imageIdentifier);
             }
         });
@@ -129,7 +136,7 @@ public sealed partial class GuestImageCache
             var owner = _slots.TryGet(imageIdentifier);
             if (owner != null && owner.Registered)
             {
-                owner.LastAccessTick = 0;
+                owner.LastAccessFrame = 0;
                 owner.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, 0);
             }
         }

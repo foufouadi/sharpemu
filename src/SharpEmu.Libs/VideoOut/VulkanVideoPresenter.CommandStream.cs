@@ -505,6 +505,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Copies the display surface through the store; presentation shows the copy once its tick retires.
         internal void CaptureFlip(int handle, int index, ulong requestId, int flipMode, long flipArg)
         {
+            _imageCache.AdvancePresentedFrame();
             // A no-buffer flip has no image to capture; its completion still retires in order.
             if (VideoOutExports.ReleaseNoBufferFlip(index, requestId))
             {
