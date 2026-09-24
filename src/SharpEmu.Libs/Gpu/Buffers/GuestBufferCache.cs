@@ -1057,7 +1057,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
         }
 
-        if (isTexelBuffer && !isWritten)
+        if (isTexelBuffer)
         {
             return RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
         }

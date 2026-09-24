@@ -68,6 +68,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     private bool _maybeHashValid;
     private bool _gpuModified;
     private bool _bufferModified;
+    private bool _bufferHoldsGpuContents;
 
     public ImageDescription Description;
     public readonly ImageBacking Backing = new();
@@ -362,11 +363,20 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public bool IsGpuModified => _gpuModified;
 
-    public void MarkGpuModified() => _gpuModified = true;
+    public void MarkGpuModified()
+    {
+        _gpuModified = true;
+        _bufferHoldsGpuContents = false;
+    }
 
     public void ClearGpuModified() => _gpuModified = false;
 
     public bool IsBufferModified => _bufferModified;
+
+    // The guest buffer cache holds this image's current GPU contents.
+    public bool BufferHoldsGpuContents => _bufferHoldsGpuContents;
+
+    public void MarkBufferHoldsGpuContents() => _bufferHoldsGpuContents = true;
 
     public void MarkBufferModified() => _bufferModified = true;
 

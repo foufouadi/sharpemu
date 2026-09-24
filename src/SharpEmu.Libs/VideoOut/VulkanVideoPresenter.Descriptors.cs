@@ -25,29 +25,6 @@ internal static unsafe partial class VulkanVideoPresenter
         private const ulong NullStorageBufferBytes = 16;
         private const uint MaxMemoryOffsetAdjustment = 256;
         private const uint TransientDataAlignment = 256;
-
-        /// <summary>
-        /// Whether binding a formatted writable buffer over an image's memory
-        /// hands ownership to the buffer straight away.
-        /// </summary>
-        /// <remarks>
-        /// The shader only declares that it <em>may</em> write the range, so this
-        /// fires on every bind of every draw. When the range belongs to a render
-        /// target the image is refreshed from guest memory that the GPU never
-        /// wrote, which replaced the rendered frame with its tiled backing read
-        /// as linear. Demon's Souls showed 412 such refreshes and 207 GB of image
-        /// traffic in one capture; suppressing them removed the banding and cut
-        /// the frame time from 7471 ms to 4272 ms.
-        ///
-        /// Writes that actually happened still invalidate: GuestBufferCache does
-        /// that from its fill and DMA-copy paths, which is where the ownership
-        /// tests exercise it. What is missing for the declared-write case is a
-        /// reconciliation after the submission, once the GPU-modified ranges are
-        /// known; until that exists, set SHARPEMU_SPECULATIVE_IMAGE_INVALIDATION=1
-        /// to restore the old bind-time behaviour.
-        /// </remarks>
-        private static readonly bool SpeculativeImageInvalidation =
-            Environment.GetEnvironmentVariable("SHARPEMU_SPECULATIVE_IMAGE_INVALIDATION") == "1";
         private const int MaxImageOccurrences = 64;
 
         private readonly record struct BufferView(VkBuffer Buffer, ulong Offset, ulong Range);
@@ -101,24 +78,12 @@ internal static unsafe partial class VulkanVideoPresenter
             return program;
         }
 
-        // Every atomic image binding (integer or float) is declared as a
-        // UINT storage image at the SPIR-V level (Gen5SpirvTranslator.
-        // Resources.cs's DeclareImageClass forces R32ui format + uint sampled
-        // type for all atomics, since the float atomics reach the real bits
-        // through a bitcast + integer compare-exchange, not a native SPIR-V
-        // float image atomic). The bound VkImageView must match that or
-        // vkCmdDispatch fails VUID-vkCmdDispatch-format-07753 - so the view
-        // request here ignores the image's logical Float numeric class for
-        // an atomic binding and requests the same Uint reinterpretation.
-        private static TextureNumericClass NumericClassOf(ImageResource image) =>
-            image.Atomic
-                ? TextureNumericClass.Uint
-                : image.NumericClass switch
-                {
-                    ImageNumericClass.Uint => TextureNumericClass.Uint,
-                    ImageNumericClass.Sint => TextureNumericClass.Sint,
-                    _ => TextureNumericClass.Float,
-                };
+        private static TextureNumericClass NumericClassOf(ImageResource image) => image.NumericClass switch
+        {
+            ImageNumericClass.Uint => TextureNumericClass.Uint,
+            ImageNumericClass.Sint => TextureNumericClass.Sint,
+            _ => TextureNumericClass.Float,
+        };
 
         private static ShaderImageShape ShapeOf(ImageResource image) => new(
             Volume: image.Dimension == ImageDimension.Dim3D,
@@ -434,9 +399,9 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             memoryOffset = (uint)adjustment;
-            if (SpeculativeImageInvalidation && resource.Formatted && resource.Written)
+            if (resource.Formatted && resource.Written)
             {
-                _imageCache.InvalidateMemoryFromGpu(address, size);
+                _imageCache.InvalidateMemoryForBoundWrite(address, size);
             }
 
             return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
