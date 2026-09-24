@@ -2080,7 +2080,7 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode is "DsMinF32" or "DsMaxF32")
             {
-                if (instruction.Sources.Count < 3)
+                if (instruction.Sources.Count < 2)
                 {
                     error = $"missing LDS operands for {instruction.Opcode}";
                     return false;
@@ -2092,7 +2092,6 @@ public static partial class Gen5SpirvTranslator
                     EmitDataShareFloatAtomic(
                         floatPointer,
                         GetRawSource(instruction, 1),
-                        GetRawSource(instruction, 2),
                         instruction.Opcode == "DsMaxF32",
                         scope: 2,
                         semantics: 0x108));
@@ -2146,10 +2145,11 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        // DS_MIN_F32/DS_MAX_F32 take one data operand, compared with the stored value; the
+        // DATA1 field is not read (LLVM and ACO both emit these ops with a single operand).
         private void EmitDataShareFloatAtomic(
             uint pointer,
             uint data,
-            uint compare,
             bool maxValue,
             uint scope,
             uint semantics)
@@ -2178,13 +2178,15 @@ public static partial class Gen5SpirvTranslator
                 preheader,
                 exchanged,
                 continueLabel);
+            // The data replaces the stored value when it is smaller (min) or larger (max);
+            // an unordered compare keeps the stored value.
             var observedFloat = Bitcast(_floatType, observed);
-            var compareFloat = Bitcast(_floatType, compare);
+            var dataFloat = Bitcast(_floatType, data);
             var replace = _module.AddInstruction(
                 maxValue ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan,
                 _boolType,
-                maxValue ? observedFloat : compareFloat,
-                maxValue ? compareFloat : observedFloat);
+                dataFloat,
+                observedFloat);
             var next = _module.AddInstruction(SpirvOp.Select, _uintType, replace, data, observed);
 
             _module.AddStatement(
