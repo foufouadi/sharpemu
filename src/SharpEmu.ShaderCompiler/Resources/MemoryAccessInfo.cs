@@ -90,6 +90,9 @@ public sealed class MemoryAccessInfo
     public bool IndexEnabled { get; init; }
     public bool OffsetEnabled { get; init; }
     public bool PlanningOnly { get; set; }
+    // A scalar buffer load whose descriptor only exists on the device: the shader reads
+    // through the descriptor in its registers instead of a host-bound buffer.
+    public bool DeviceDescriptor { get; set; }
 
     // The guest V# behind a buffer access, filled in by the resource tracker.
     // Null until then. Its provenance tells the backend which lowering
@@ -112,7 +115,8 @@ public sealed class MemoryAccessInfo
         DataSigned == other.DataSigned && Typed == other.Typed && Formatted == other.Formatted &&
         ImageHasMip == other.ImageHasMip && ImageR128 == other.ImageR128 && Glc == other.Glc && Slc == other.Slc &&
         IndexEnabled == other.IndexEnabled && OffsetEnabled == other.OffsetEnabled &&
-        Resource == other.Resource && Sampler == other.Sampler && PlanningOnly == other.PlanningOnly;
+        Resource == other.Resource && Sampler == other.Sampler && PlanningOnly == other.PlanningOnly &&
+        DeviceDescriptor == other.DeviceDescriptor;
 }
 
 // Every memory access of a program, indexed by program counter and component.

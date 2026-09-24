@@ -375,6 +375,10 @@ public sealed partial class ResourceTracker
         return ValidateSource(source, out _) ? InternSource(source) : DescriptorConstants.NoIndex;
     }
 
+    private bool IsHostBufferHandle(ScalarValue? handle) =>
+        handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
+        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword));
+
     private uint GetHandleSource(
         ScalarValue? handle,
         ScalarValueKind expected,
@@ -759,6 +763,15 @@ public sealed partial class ResourceTracker
                 return;
             }
 
+            // A scalar buffer descriptor built from data the shader loads itself cannot be
+            // bound by the host; the device reads through the descriptor in registers.
+            if (memory.Kind == MemoryResourceKind.ScalarBuffer && !IsHostBufferHandle(access.Handle))
+            {
+                memory.DeviceDescriptor = true;
+                _info.UsesDeviceAddresses = true;
+                return;
+            }
+
             var source = GetHandleSource(
                 access.Handle,
                 ScalarValueKind.BufferHandle,
@@ -1071,10 +1084,6 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        // The selector table may start after a small header in the scalar buffer.
-        // The read's immediate offset is part of the effective selector offset.
-        selectorOffset = unchecked(selectorOffset + materialMemory.Offset);
-
         if (!UsesOnly(materialRead, [heapOffset]) || !UsesOnly(heapOffset, heapReads))
         {
             return false;
@@ -1103,6 +1112,7 @@ public sealed partial class ResourceTracker
             IndirectImage = new IndirectImageSelector(materialSourceIndex, heapSourceIndex, selectorStride, selectorOffset, 0)
             {
                 SelectorValues = IndirectSelectorValues.Create(_plan, selector),
+                MaterialImmediate = materialMemory.Offset,
             },
         };
 

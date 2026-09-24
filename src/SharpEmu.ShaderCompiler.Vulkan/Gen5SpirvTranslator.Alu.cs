@@ -1264,10 +1264,14 @@ public static partial class Gen5SpirvTranslator
                     break;
                 }
                 case "VAlignbitB32":
+                case "VAlignbyteB32":
                 {
                     var high = GetRawSource(instruction, 0);
                     var low = GetRawSource(instruction, 1);
-                    var shift = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    // ({S0,S1} >> shift)[31:0]; ALIGNBYTE shifts by whole bytes of S2[1:0].
+                    var shift = instruction.Opcode == "VAlignbyteB32"
+                        ? ShiftLeftLogical(BitwiseAnd(GetRawSource(instruction, 2), UInt(3)), UInt(3))
+                        : BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
                     var lowPart = ShiftRightLogical(low, shift);
                     var inverse = BitwiseAnd(ISubU(UInt(32), shift), UInt(31));
                     var highPartRaw = ShiftLeftLogical(high, inverse);
@@ -2063,14 +2067,16 @@ public static partial class Gen5SpirvTranslator
             else if (opcode is
                      "VCmpFF32" or "VCmpxFF32" or
                      "VCmpFF16" or "VCmpxFF16" or
-                     "VCmpFI32" or "VCmpFU32")
+                     "VCmpFI32" or "VCmpFU32" or
+                     "VCmpFI64" or "VCmpxFI64" or "VCmpFU64" or "VCmpxFU64")
             {
                 condition = _module.ConstantBool(false);
             }
             else if (opcode is
                      "VCmpTruF32" or "VCmpxTruF32" or
                      "VCmpTruF16" or "VCmpxTruF16" or
-                     "VCmpTI32" or "VCmpTU32")
+                     "VCmpTI32" or "VCmpTU32" or
+                     "VCmpTI64" or "VCmpxTI64" or "VCmpTU64" or "VCmpxTU64")
             {
                 condition = _module.ConstantBool(true);
             }
@@ -2257,6 +2263,11 @@ public static partial class Gen5SpirvTranslator
                         right = Bitcast(signedType, right);
                     }
                 }
+                else if (opcode.EndsWith("I64", StringComparison.Ordinal))
+                {
+                    left = Bitcast(_longType, left);
+                    right = Bitcast(_longType, right);
+                }
 
                 var operation = opcode switch
                 {
@@ -2272,6 +2283,16 @@ public static partial class Gen5SpirvTranslator
                     "VCmpLeI16" or "VCmpxLeI16" => SpirvOp.SLessThanEqual,
                     "VCmpGtI16" or "VCmpxGtI16" => SpirvOp.SGreaterThan,
                     "VCmpGeI16" or "VCmpxGeI16" => SpirvOp.SGreaterThanEqual,
+                    "VCmpEqU64" or "VCmpxEqU64" or
+                    "VCmpEqI64" or "VCmpxEqI64" => SpirvOp.IEqual,
+                    "VCmpLtU64" or "VCmpxLtU64" => SpirvOp.ULessThan,
+                    "VCmpLeU64" or "VCmpxLeU64" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU64" or "VCmpxGtU64" => SpirvOp.UGreaterThan,
+                    "VCmpGeU64" or "VCmpxGeU64" => SpirvOp.UGreaterThanEqual,
+                    "VCmpLtI64" or "VCmpxLtI64" => SpirvOp.SLessThan,
+                    "VCmpLeI64" or "VCmpxLeI64" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI64" or "VCmpxGtI64" => SpirvOp.SGreaterThan,
+                    "VCmpGeI64" or "VCmpxGeI64" => SpirvOp.SGreaterThanEqual,
                     "VCmpLtI32" or "VCmpxLtI32" => SpirvOp.SLessThan,
                     "VCmpLeI32" or "VCmpxLeI32" => SpirvOp.SLessThanEqual,
                     "VCmpGtI32" or "VCmpxGtI32" => SpirvOp.SGreaterThan,
@@ -2332,10 +2353,12 @@ public static partial class Gen5SpirvTranslator
             }
             else
             {
-                var compareDestination = instruction.Control is Gen5SdwaControl
-                    { ScalarDestination: { } scalarDestination }
-                    ? scalarDestination
-                    : 106u;
+                var compareDestination = instruction.Control switch
+                {
+                    Gen5SdwaControl { ScalarDestination: { } scalarDestination } => scalarDestination,
+                    Gen5Vop3Control { ScalarDestination: { } scalarDestination } => scalarDestination,
+                    _ => 106u,
+                };
                 StoreWaveMask(compareDestination, activeCondition);
             }
 
@@ -3594,12 +3617,7 @@ public static partial class Gen5SpirvTranslator
 
             var targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFF8)), selector);
             targetLane = BitwiseAnd(targetLane, UInt(31));
-            var shuffled = _module.AddInstruction(
-                SpirvOp.GroupNonUniformShuffle,
-                _uintType,
-                UInt(3),
-                value,
-                targetLane);
+            var shuffled = ShuffleLane(value, targetLane);
             if (control.FetchInactive)
             {
                 return shuffled;
@@ -3612,12 +3630,7 @@ public static partial class Gen5SpirvTranslator
                 UInt(1),
                 UInt(0));
             var sourceActive = IsNotZero(
-                _module.AddInstruction(
-                    SpirvOp.GroupNonUniformShuffle,
-                    _uintType,
-                    UInt(3),
-                    activeWord,
-                    targetLane));
+                ShuffleLane(activeWord, targetLane));
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -3637,12 +3650,7 @@ public static partial class Gen5SpirvTranslator
                 targetLane,
                 lane);
             safeTarget = BitwiseAnd(safeTarget, UInt(31));
-            var shuffled = _module.AddInstruction(
-                SpirvOp.GroupNonUniformShuffle,
-                _uintType,
-                UInt(3),
-                value,
-                safeTarget);
+            var shuffled = ShuffleLane(value, safeTarget);
 
             var sourceAvailable = inRange;
             if (!control.FetchInactive)
@@ -3653,12 +3661,7 @@ public static partial class Gen5SpirvTranslator
                     Load(_boolType, _exec),
                     UInt(1),
                     UInt(0));
-                var shuffledActive = _module.AddInstruction(
-                    SpirvOp.GroupNonUniformShuffle,
-                    _uintType,
-                    UInt(3),
-                    activeWord,
-                    safeTarget);
+                var shuffledActive = ShuffleLane(activeWord, safeTarget);
                 sourceAvailable = _module.AddInstruction(
                     SpirvOp.LogicalAnd,
                     _boolType,
@@ -4740,12 +4743,7 @@ public static partial class Gen5SpirvTranslator
 
             var targetLane = IAdd(rowBase, selector);
             targetLane = BitwiseAnd(targetLane, UInt(31));
-            var shuffled = _module.AddInstruction(
-                SpirvOp.GroupNonUniformShuffle,
-                _uintType,
-                UInt(3),
-                value,
-                targetLane);
+            var shuffled = ShuffleLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)
             {
@@ -4759,12 +4757,7 @@ public static partial class Gen5SpirvTranslator
                 UInt(1),
                 UInt(0));
             var sourceActive = IsNotZero(
-                _module.AddInstruction(
-                    SpirvOp.GroupNonUniformShuffle,
-                    _uintType,
-                    UInt(3),
-                    activeWord,
-                    targetLane));
+                ShuffleLane(activeWord, targetLane));
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
