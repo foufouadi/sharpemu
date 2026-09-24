@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.Libs.Tests.Gpu.Buffers;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
 using Silk.NET.Vulkan;
@@ -56,6 +57,63 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
     private readonly HeadlessVulkan? _vulkan;
 
     public ImageRequestBuildersTests(HeadlessVulkanFixture fixture) => _vulkan = fixture.Vulkan;
+
+    private sealed class FixedFormatSupport(FormatFeatureFlags features) : SharpEmu.Libs.Gpu.Buffers.IImageFormatSupport
+    {
+        public bool TryGetImageFormatProperties(Format format, ImageType type, ImageTiling tiling, ImageUsageFlags usage, ImageCreateFlags flags, out ImageFormatProperties properties)
+        {
+            properties = default;
+            return true;
+        }
+
+        public FormatFeatureFlags OptimalTilingFeatures(Format format) => features;
+    }
+
+    private const FormatFeatureFlags Filterable = FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit;
+
+    // Narrow sRGB textures keep their UNORM storage and are sampled through the sRGB view of
+    // the same class, so the decode happens before filtering as on the guest.
+    [Theory]
+    [InlineData(GuestPixelFormat.Bits8Srgb, Format.R8Unorm, Format.R8Srgb)]
+    [InlineData(GuestPixelFormat.Bits8_8Srgb, Format.R8G8Unorm, Format.R8G8Srgb)]
+    public void NarrowSrgbTexture_SamplesThroughTheDecodingView(GuestPixelFormat guestFormat, Format storageFormat, Format decodingFormat)
+    {
+        var words = RegisterWords.Texture(Base, guestFormat, 64, 32);
+        var resolution = ImageRequestBuilders.Texture(words, Sampled2D, new FixedFormatSupport(Filterable));
+        Assert.Equal(storageFormat, resolution.Request.Description.PixelFormat);
+        Assert.Equal(decodingFormat, resolution.Request.View.Format);
+        Assert.Equal(decodingFormat, resolution.ViewFormat);
+        Assert.True(ViewFormatRules.IsSupportedSampledColorView(storageFormat, decodingFormat, resolution.Swizzle));
+
+        // Without a filterable decoding format the stand-in is sampled as before.
+        foreach (var features in new[] { FormatFeatureFlags.SampledImageBit, (FormatFeatureFlags)0 })
+        {
+            Assert.Equal(storageFormat, ImageRequestBuilders.Texture(words, Sampled2D, new FixedFormatSupport(features)).Request.View.Format);
+        }
+
+        // Storage views cannot be sRGB, and the four-channel format already has a host sRGB format.
+        var storage = ImageRequestBuilders.Texture(words, Sampled2D with { Storage = true }, new FixedFormatSupport(Filterable));
+        Assert.Equal(storageFormat, storage.Request.View.Format);
+        var wide = ImageRequestBuilders.Texture(RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8Srgb, 64, 32), Sampled2D, new FixedFormatSupport(Filterable));
+        Assert.Equal(Format.R8G8B8A8Srgb, wide.Request.View.Format);
+    }
+
+    // The device decides between the decoding view and the stand-in; either view is created on
+    // the UNORM image without a validation message.
+    [Fact]
+    public void NarrowSrgbTexture_ViewFollowsTheDeviceSupport()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var decodes = (_vulkan.DeviceInfo.OptimalTilingFeatures(Format.R8Srgb) & Filterable) == Filterable;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ImageCacheTestSupport.ReadWrite);
+        var request = ImageRequestBuilders.Texture(RegisterWords.Texture(address, GuestPixelFormat.Bits8Srgb, 64, 32), Sampled2D, _vulkan.DeviceInfo).Request;
+        Assert.Equal(decodes ? Format.R8Srgb : Format.R8Unorm, request.View.Format);
+        var imageIdentifier = harness.Acquire(ref request);
+        Assert.Equal(Format.R8Unorm, harness.Image(imageIdentifier).Description.PixelFormat);
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
+    }
 
     [Fact]
     public void ColorTarget_LinearTargetFromRegisters()

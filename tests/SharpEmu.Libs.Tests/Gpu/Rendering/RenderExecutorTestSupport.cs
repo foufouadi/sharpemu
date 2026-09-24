@@ -32,6 +32,10 @@ internal sealed class AcceptingFormatSupport : IImageFormatSupport
         properties = new ImageFormatProperties { SampleCounts = SampleCountFlags.Count1Bit | SampleCountFlags.Count2Bit | SampleCountFlags.Count4Bit | SampleCountFlags.Count8Bit };
         return true;
     }
+
+    public FormatFeatureFlags OptimalTilingFeatures(Format format) =>
+        FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit |
+        FormatFeatureFlags.ColorAttachmentBit | FormatFeatureFlags.DepthStencilAttachmentBit | FormatFeatureFlags.StorageImageBit;
 }
 
 // Records every host call in order and fakes the buffer and image caches.

@@ -45,6 +45,12 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
             };
             return true;
         }
+
+        public FormatFeatureFlags OptimalTilingFeatures(Format format) =>
+            FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit |
+            FormatFeatureFlags.StorageImageBit | FormatFeatureFlags.ColorAttachmentBit |
+            FormatFeatureFlags.ColorAttachmentBlendBit | FormatFeatureFlags.DepthStencilAttachmentBit |
+            FormatFeatureFlags.TransferSrcBit | FormatFeatureFlags.TransferDstBit;
     }
 
     // One stage of a draw: its snapshots, samplers and shader data, then the copied buffers once bound.

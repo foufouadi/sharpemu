@@ -149,8 +149,11 @@ public static partial class ImageRequestBuilders
 
     private static bool IsMultisampledTexture(GuestImageType type) => type is GuestImageType.Color2DMsaa or GuestImageType.Color2DMsaaArray;
 
+    private static int _srgbDecodeUnsupportedReported;
+
     // Builds the request for a sampled or storage texture; the words are the eight T# dwords.
-    public static TextureRequestResolution Texture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
+    // The format support decides whether a narrow sRGB texture can be sampled through a decoding view.
+    public static TextureRequestResolution Texture(ReadOnlySpan<uint> words, in ShaderImageShape shape, IImageFormatSupport? formats = null)
     {
         Span<uint> padded = stackalloc uint[8];
         words[..Math.Min(words.Length, 8)].CopyTo(padded);
@@ -243,6 +246,11 @@ public static partial class ImageRequestBuilders
         // Atomic storage images are declared as UINT in SPIR-V, including float atomics.
         var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
         var viewFormat = storage && storageViewFormat != Format.Undefined ? storageViewFormat : pixelFormat;
+        if (!storage && !shape.DepthCompare)
+        {
+            viewFormat = SampledDecodingView(format, viewFormat, formats);
+        }
+
         var blockBytes = GuestPixelFormats.BlockCompressedBytes(format);
         var description = ImageDescription.Create();
         description.Data = new GuestSpan(address, size.Size);
@@ -266,7 +274,34 @@ public static partial class ImageRequestBuilders
 
         var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers);
         var request = new ImageRequest(description, view, storage ? ImageRole.StorageImage : ImageRole.Texture);
-        return new TextureRequestResolution(request, shaderConversion, pixelFormat, DestinationSwizzle(descriptor));
+        return new TextureRequestResolution(request, shaderConversion, storage ? pixelFormat : viewFormat, DestinationSwizzle(descriptor));
+    }
+
+    // The guest texture unit decodes sRGB before filtering. A narrow sRGB texture lives in its
+    // UNORM stand-in, so it is sampled through the sRGB view of the same class when the device
+    // can sample and filter that format; otherwise the UNORM view stays and the missing decode
+    // is reported once.
+    private static Format SampledDecodingView(GuestPixelFormat format, Format viewFormat, IImageFormatSupport? formats)
+    {
+        var decoding = GuestPixelFormats.SrgbDecodingView(format);
+        if (decoding == Format.Undefined)
+        {
+            return viewFormat;
+        }
+
+        const FormatFeatureFlags required = FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit;
+        if (formats != null && (formats.OptimalTilingFeatures(decoding) & required) == required)
+        {
+            return decoding;
+        }
+
+        if (Interlocked.Exchange(ref _srgbDecodeUnsupportedReported, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[GPU][WARN] The device cannot sample {decoding}; sRGB texture format {(uint)format} is sampled without its sRGB decode.");
+        }
+
+        return viewFormat;
     }
 
     // After the lookup: a stencil association redirects to its depth owner; the view rules run on the owner.

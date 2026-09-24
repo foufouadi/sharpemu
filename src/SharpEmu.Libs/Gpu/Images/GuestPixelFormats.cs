@@ -551,6 +551,15 @@ public static class GuestPixelFormats
     public static GuestPixelFormat RemapTextureFormat(GuestPixelFormat format) =>
         format == GuestPixelFormat.Bits11_11_10UInt ? GuestPixelFormat.Bits32UInt : format;
 
+    // Narrow sRGB formats are stored in their UNORM stand-in; a view in the sRGB format of
+    // the same compatibility class decodes them. Undefined for every other format.
+    public static Format SrgbDecodingView(GuestPixelFormat format) => format switch
+    {
+        GuestPixelFormat.Bits8Srgb => Format.R8Srgb,
+        GuestPixelFormat.Bits8_8Srgb => Format.R8G8Srgb,
+        _ => Format.Undefined,
+    };
+
     public static Format HostFormat(GuestPixelFormat format) =>
         (uint)format < LookupSize ? HostLookup[(int)format] : Format.Undefined;
 

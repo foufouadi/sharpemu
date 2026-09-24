@@ -77,6 +77,8 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         }
     }
 
+    public FormatFeatureFlags OptimalTilingFeatures(Format format) => GetFormatProperties(format).OptimalTilingFeatures;
+
     public bool TryGetImageFormatProperties(Format format, ImageType type, ImageTiling tiling, ImageUsageFlags usage, ImageCreateFlags flags, out ImageFormatProperties properties)
     {
         lock (_gate)

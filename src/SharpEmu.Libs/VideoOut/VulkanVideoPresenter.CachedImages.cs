@@ -509,7 +509,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         private TextureResource ResolveTexture(GuestDrawTexture texture)
         {
-            var resolution = ImageRequestBuilders.Texture(texture.Descriptor ?? [], texture.Shape);
+            var resolution = ImageRequestBuilders.Texture(texture.Descriptor ?? [], texture.Shape, _deviceInfo);
             _ = BeginBatchedGuestCommands();
             var request = resolution.Request;
             var imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);

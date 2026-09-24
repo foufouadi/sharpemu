@@ -27,6 +27,9 @@ public sealed class CachedImageFormatSupportTests
                 ? supportsBlockViews
                 : supportsSampling && (usage & ImageUsageFlags.StorageBit) == 0;
         }
+
+        public FormatFeatureFlags OptimalTilingFeatures(Format format) =>
+            supportsSampling ? FormatFeatureFlags.SampledImageBit | FormatFeatureFlags.SampledImageFilterLinearBit : 0;
     }
 
     private static ImageCreateInfo CreateCompressedImageConfiguration(Format format) => new()
