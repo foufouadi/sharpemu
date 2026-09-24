@@ -392,7 +392,8 @@ public sealed class ResourceTrackerTests
     {
         var plan = Extract(IndirectImageProgram(false, materialImmediate: 4));
         var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
-        Assert.Equal(4u, selector.SelectorOffset);
+        // The header immediate (4) adds to the +4 in the selector address arithmetic.
+        Assert.Equal(8u, selector.SelectorOffset);
     }
 
     [Fact]
