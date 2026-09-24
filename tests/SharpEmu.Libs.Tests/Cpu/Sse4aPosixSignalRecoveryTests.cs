@@ -244,6 +244,43 @@ public sealed unsafe class Sse4aPosixSignalRecoveryTests : IDisposable
         }
     }
 
+    [Fact]
+    public void RdpruSigillReturnsAMonotonicCounterInEdxEax()
+    {
+        if ((!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) ||
+            RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return;
+
+        // rdpru
+        var code = AllocateProbeVisibleCode([0x0F, 0x01, 0xFD]);
+        try
+        {
+            ulong Read(uint selector)
+            {
+                var frame = new FakeSignalFrame((ulong)code, includeFloatingPointState: false)
+                {
+                    Counter = selector,
+                    Accumulator = 0xDEAD_BEEF_DEAD_BEEF,
+                    Data = 0xDEAD_BEEF_DEAD_BEEF,
+                };
+                Assert.True(frame.Dispatch());
+                Assert.Equal((ulong)code + 3, frame.Rip);
+                Assert.True(frame.Accumulator <= uint.MaxValue);
+                Assert.True(frame.Data <= uint.MaxValue);
+                return (frame.Data << 32) | frame.Accumulator;
+            }
+
+            var first = Read(1);
+            Assert.NotEqual(0UL, first);
+            Assert.True(Read(0) >= first);
+            Assert.Equal(0UL, Read(2));
+        }
+        finally
+        {
+            FreeProbeVisibleCode(code);
+        }
+    }
+
     // Build the signal frame that the host system gives to the signal handler.
     // Use the register offsets for Linux or macOS.
     private sealed class FakeSignalFrame
@@ -292,6 +329,31 @@ public sealed unsafe class Sse4aPosixSignalRecoveryTests : IDisposable
                 fixed (byte* state = OperatingSystem.IsMacOS() ? _machineContext : _userContext)
                     *(ulong*)(state + (OperatingSystem.IsMacOS() ? 16 : LinuxUcontextGregsOffset + 13 * 8)) = value;
             }
+        }
+
+        // RCX and RDX, at their Linux gregs or macOS thread-state offsets.
+        public ulong Counter
+        {
+            get => GeneralRegister(OperatingSystem.IsMacOS() ? 32 : LinuxUcontextGregsOffset + 14 * 8);
+            set => SetGeneralRegister(OperatingSystem.IsMacOS() ? 32 : LinuxUcontextGregsOffset + 14 * 8, value);
+        }
+
+        public ulong Data
+        {
+            get => GeneralRegister(OperatingSystem.IsMacOS() ? 40 : LinuxUcontextGregsOffset + 12 * 8);
+            set => SetGeneralRegister(OperatingSystem.IsMacOS() ? 40 : LinuxUcontextGregsOffset + 12 * 8, value);
+        }
+
+        private ulong GeneralRegister(int offset)
+        {
+            fixed (byte* state = OperatingSystem.IsMacOS() ? _machineContext : _userContext)
+                return *(ulong*)(state + offset);
+        }
+
+        private void SetGeneralRegister(int offset, ulong value)
+        {
+            fixed (byte* state = OperatingSystem.IsMacOS() ? _machineContext : _userContext)
+                *(ulong*)(state + offset) = value;
         }
 
         public void SetXmmLow(int fxsaveOffset, ulong value)

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Diagnostics;
 using System.Threading;
 using Iced.Intel;
 using SharpEmu.Core.Cpu.Emulation;
@@ -22,11 +23,12 @@ public sealed partial class DirectExecutionBackend
     private static int _sse4aSoftwareFallbackAnnounced;
     private static long _sse4aInstructionsEmulated;
     private static int _monitorxSoftwareFallbackAnnounced;
+    private static int _rdpruSoftwareFallbackAnnounced;
     private static long _monitorxInstructionsEmulated;
 
     private unsafe bool TryRecoverAmdCompatInstruction(void* contextRecord, ulong rip)
     {
-        if (TryRecoverMonitorxMwaitx(contextRecord, rip))
+        if (TryRecoverMonitorxMwaitx(contextRecord, rip) || TryRecoverRdpru(contextRecord, rip))
         {
             return true;
         }
@@ -68,6 +70,34 @@ public sealed partial class DirectExecutionBackend
             Console.Error.WriteLine(
                 "[LOADER][INFO] Host lacks AMD MONITORX/MWAITX used by the guest; " +
                 "emulating those instructions in software.");
+        }
+
+        return true;
+    }
+
+    private unsafe bool TryRecoverRdpru(void* contextRecord, ulong rip)
+    {
+        var opcode = new byte[RdpruEmulator.Length];
+        if (!TryReadExecutableBytes(rip, opcode) || !RdpruEmulator.IsRdpru(opcode))
+        {
+            return false;
+        }
+
+        var (eax, edx, eflags) = RdpruEmulator.Execute(
+            (uint)ReadCtxU64(contextRecord, CTX_RCX),
+            (ulong)Stopwatch.GetTimestamp(),
+            ReadCtxU32(contextRecord, CTX_EFLAGS));
+        // A 32-bit register write clears the upper half of RAX and RDX, as on hardware.
+        WriteCtxU64(contextRecord, CTX_RAX, eax);
+        WriteCtxU64(contextRecord, CTX_RDX, edx);
+        WriteCtxU32(contextRecord, CTX_EFLAGS, eflags);
+        WriteCtxU64(contextRecord, CTX_RIP, rip + RdpruEmulator.Length);
+
+        if (Interlocked.Exchange(ref _rdpruSoftwareFallbackAnnounced, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][INFO] Host lacks AMD RDPRU used by the guest; " +
+                "emulating it with a monotonic host counter.");
         }
 
         return true;
