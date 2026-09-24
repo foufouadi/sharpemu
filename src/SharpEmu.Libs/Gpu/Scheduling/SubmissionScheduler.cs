@@ -30,6 +30,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private readonly TickTimeline _timeline;
     private readonly TickedBufferRing _ring;
     private readonly RecordingBuffer _command;
+    private readonly List<Action<RecordingBuffer>> _initialRecordings = [];
     private readonly Action<SubmitBundle>? _prepareSubmit;
     private readonly Action<ulong>? _submitted;
     private readonly Action<ulong>? _completed;
@@ -419,7 +420,45 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _command.Buffer = _ring.AcquireBuffer();
         _command.Begin();
+        RecordPendingInitialization();
         return _command;
+    }
+
+    // Records work every later command relies on, such as zeroing a device buffer that is read
+    // before anything writes it: into the command buffer being recorded, or first in the next
+    // one when none is, ahead of any other command.
+    public void RecordBeforeFirstUse(Action<RecordingBuffer> record)
+    {
+        if (!_command.IsInvalid)
+        {
+            record(_command);
+            return;
+        }
+
+        lock (_initialRecordings)
+        {
+            _initialRecordings.Add(record);
+        }
+    }
+
+    private void RecordPendingInitialization()
+    {
+        Action<RecordingBuffer>[] pending;
+        lock (_initialRecordings)
+        {
+            if (_initialRecordings.Count == 0)
+            {
+                return;
+            }
+
+            pending = [.. _initialRecordings];
+            _initialRecordings.Clear();
+        }
+
+        foreach (var record in pending)
+        {
+            record(_command);
+        }
     }
 
     // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged.

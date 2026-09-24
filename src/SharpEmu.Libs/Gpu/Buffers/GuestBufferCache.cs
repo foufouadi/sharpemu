@@ -82,11 +82,22 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         StreamOffsetAlignment = device.MinUniformBufferOffsetAlignment;
         _gds.Mapped.Clear();
         _gds.Flush(0, _gds.Size);
-        var nullId = _registry.AllocateBuffer(new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, 16), 0, 16);
+        var nullBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, 16);
+        var nullId = _registry.AllocateBuffer(nullBuffer, 0, 16);
         if (nullId != NullBufferId)
         {
             throw SubmissionScheduler.Fatal("The null buffer occupies the wrong slot.");
         }
+
+        // Device memory starts undefined, and these buffers are read before anything writes
+        // them: the BDA page table by every physical access, the fault bitset by the fault pass
+        // and the null buffer by every unbound slot. A zero word is what makes each read safe.
+        scheduler.RecordBeforeFirstUse(command =>
+        {
+            _bdaPageTable.RecordFill(command, 0, _bdaPageTable.Size, 0);
+            _faults.RecordClear(command);
+            nullBuffer.RecordFill(command, 0, nullBuffer.Size, 0);
+        });
     }
 
     public IGuestImageCache? ImageCache { get; set; }

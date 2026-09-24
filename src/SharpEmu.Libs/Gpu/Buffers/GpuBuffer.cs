@@ -207,14 +207,16 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 2, after, 0, null);
     }
 
-    public void Fill(ulong offset, ulong size, uint value)
+    public void Fill(ulong offset, ulong size, uint value) => RecordFill(_scheduler.Current, offset, size, value);
+
+    // Fills the range with the value in the given command buffer, ordered against every other access.
+    public void RecordFill(RecordingBuffer command, ulong offset, ulong size, uint value)
     {
         if (((offset | size) & 3) != 0)
         {
             throw SubmissionScheduler.Fatal("The buffer fill range must be aligned to four bytes.");
         }
 
-        var command = _scheduler.Current;
         command.EndRendering();
         var vk = _device.Vk;
         var native = new CommandBuffer(command.Handle);

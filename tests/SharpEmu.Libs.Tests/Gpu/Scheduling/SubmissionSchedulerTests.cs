@@ -46,6 +46,30 @@ public sealed class SubmissionSchedulerTests
     }
 
     [Fact]
+    public void InitializationRecordedBeforeFirstUseLeadsTheNextCommandBuffer()
+    {
+        _device.CompleteOnSubmit = true;
+        using var scheduler = new SubmissionScheduler(_device, _rendering);
+        var recorded = new List<nint>();
+        scheduler.RecordBeforeFirstUse(command => recorded.Add(command.Handle));
+        Assert.Empty(recorded);
+
+        scheduler.Begin(new SubmissionContext());
+        var first = Assert.Single(recorded);
+        Assert.Equal(scheduler.Current.Handle, first);
+        Assert.Equal("begin b0", _device.Log[^1]);
+
+        // While a command buffer records, the work goes straight into it.
+        scheduler.RecordBeforeFirstUse(command => recorded.Add(command.Handle));
+        Assert.Equal([first, first], recorded);
+
+        // Each registration runs once.
+        scheduler.Submit();
+        scheduler.BeginCommand();
+        Assert.Equal(2, recorded.Count);
+    }
+
+    [Fact]
     public void SubmitRejectsAFullSignalListAndAMissingBuffer()
     {
         using var fatal = new FatalScope();

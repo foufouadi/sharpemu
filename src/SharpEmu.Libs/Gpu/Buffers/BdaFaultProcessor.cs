@@ -166,6 +166,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         vk.UpdateDescriptorSets(device.Device, 2 * MaxPendingFaults, writes, 0, null);
     }
 
+    // Zeroes the whole fault bitset: no page has faulted before the first pass.
+    internal void RecordClear(RecordingBuffer command) => _faultBuffer.RecordFill(command, 0, _faultBuffer.Size, 0);
+
     public GpuBuffer FaultBuffer
     {
         get
