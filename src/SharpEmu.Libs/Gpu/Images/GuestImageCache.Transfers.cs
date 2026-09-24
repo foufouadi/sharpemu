@@ -674,15 +674,10 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var range = image.Description.Data;
-        var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
-        if (!download.TryMap(range.Size, out var offset, Math.Max(image.Description.BytesPerBlock, 4u)))
-        {
-            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the image: address=0x{range.Address:X16} size=0x{range.Size:X}.");
-        }
-
-        download.Commit();
+        var (download, offset, dedicated) = MapImageReadback(range.Size, Math.Max(image.Description.BytesPerBlock, 4u));
         if (!_backing.TryReadBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
         {
+            dedicated?.Dispose();
             return false;
         }
 
@@ -705,12 +700,30 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             download.Invalidate(offset, range.Size);
-            if (!backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
+            var written = backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size));
+            dedicated?.Dispose();
+            if (!written)
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
             }
         });
         return true;
+    }
+
+    // Readback staging for one image: the shared download ring when it can hold the image,
+    // otherwise a buffer of its own that the publication releases, so an image larger than
+    // the ring (a 4K RGBA16F target is 66 MiB) reads back like any other.
+    private (GpuBuffer Buffer, ulong Offset, GpuBuffer? Dedicated) MapImageReadback(ulong size, ulong alignment)
+    {
+        var ring = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
+        if (ring.TryMap(size, out var offset, alignment))
+        {
+            ring.Commit();
+            return (ring, offset, null);
+        }
+
+        var dedicated = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, size);
+        return (dedicated, 0, dedicated);
     }
 
     // Clears the one image that owns exactly this range; false when no single owner or clear value fits.

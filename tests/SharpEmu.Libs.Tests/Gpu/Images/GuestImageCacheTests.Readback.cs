@@ -429,4 +429,40 @@ public sealed partial class GuestImageCacheTests
 
         harness.Shutdown();
     }
+
+    // The download ring holds 32 MiB; a larger image reads back through a buffer of its own.
+    [Fact]
+    public void OversizedReadback_PublishesThroughADedicatedBuffer()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        const uint width = 4096, height = 2560;
+        const ulong size = (ulong)width * height * 4;
+        using var harness = new CacheHarness(_vulkan, backingBytes: 48UL * 1024 * 1024);
+        var download = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Download);
+        Assert.True(size > download.Size);
+        var address = harness.MapBacked(size, ReadWrite);
+        var request = LinearRequest(address, size, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm, GuestImageType.Color2D, new Extent3D(width, height, 1), 1, 4, 1);
+        ulong[] samples = [0, size / 2, size - 4];
+        var imageIdentifier = harness.Find(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, size, 0xc3c3c3c3u)));
+        foreach (var offset in samples)
+        {
+            harness.Write(address + offset, Bytes(0u));
+        }
+
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 81);
+            harness.Images.ResetRecency(new[] { imageIdentifier }, 81);
+            harness.Images.RunGarbageCollector();
+        });
+        Assert.False(harness.Images.Contains(imageIdentifier));
+        harness.Finish();
+        foreach (var offset in samples)
+        {
+            Assert.Equal(0xc3c3c3c3u, harness.ReadUInt32(address + offset));
+        }
+
+        harness.Shutdown();
+    }
 }
