@@ -114,10 +114,7 @@ public sealed partial class DirectExecutionBackend
 
 			ulong rip = ReadCtxU64(contextRecord, 248);
 			ulong rsp = ReadCtxU64(contextRecord, 152);
-			var faultAddress = ReadFaultAddress(exceptionRecord);
-			if (RecordGuestFault(
-					TryRecoverGuestInt41(exceptionCode, contextRecord, rip),
-					GuestFaultHandler.GuestInt41, rip, rsp, faultAddress))
+			if (TryRecoverGuestInt41(exceptionCode, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -125,52 +122,36 @@ public sealed partial class DirectExecutionBackend
 				exceptionCode == 3221225477u &&
 				exceptionRecord->NumberParameters >= 2 &&
 				exceptionRecord->ExceptionInformation[0] == 1uL &&
-				RecordGuestFault(
-					SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
-						exceptionRecord->ExceptionInformation[1]),
-					GuestFaultHandler.ImageWriteTracker, rip, rsp, faultAddress))
+				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
+					exceptionRecord->ExceptionInformation[1]))
 			{
 				return -1;
 			}
-			if (RecordGuestFault(
-					TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip),
-					GuestFaultHandler.AuxiliaryThreadExecute, rip, rsp, faultAddress))
+			if (TryRecoverAuxiliaryThreadExecuteFault(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
 
-			if (exceptionCode == 3221225477u &&
-				RecordGuestFault(
-					TryHandleLazyCommittedPage(exceptionRecord, rip, rsp),
-					GuestFaultHandler.LazyCommit, rip, rsp, faultAddress))
+			if (exceptionCode == 3221225477u && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
 			{
 				return -1;
 			}
 			if (exceptionCode == 3221225477u &&
-				RecordGuestFault(
-					TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip),
-					GuestFaultHandler.AllocatorHole, rip, rsp, faultAddress))
+				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u &&
-				RecordGuestFault(
-					TryResolveGpuFault(exceptionRecord),
-					GuestFaultHandler.GpuFault, rip, rsp, faultAddress))
+			if (exceptionCode == 3221225477u && TryResolveGpuFault(exceptionRecord))
 			{
 				return -1;
 			}
 			if (exceptionCode == StatusIllegalInstruction &&
-				RecordGuestFault(
-					TryRecoverIllegalInstruction(contextRecord, rip),
-					GuestFaultHandler.IllegalInstruction, rip, rsp, faultAddress))
+				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
 				return -1;
 			}
 			if (exceptionCode == StatusIllegalInstruction &&
-				RecordGuestFault(
-					TryRecoverAmdCompatInstruction(contextRecord, rip),
-					GuestFaultHandler.AmdCompat, rip, rsp, faultAddress))
+				TryRecoverAmdCompatInstruction(contextRecord, rip))
 			{
 				return -1;
 			}
@@ -447,7 +428,6 @@ public sealed partial class DirectExecutionBackend
 						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
-					DumpGuestFaultCensus("access violation");
 					break;
 				case 2147483651u:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");

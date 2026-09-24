@@ -1,7 +1,6 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System;
 using System.Collections.Generic;
 
 namespace SharpEmu.ShaderCompiler.Resources;
@@ -210,14 +209,6 @@ public sealed class RuntimeValueEvaluator
             !EvaluateWide(handle.Operands[1], out var high) ||
             !Operand(value, 1, out var offset))
         {
-            if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
-            {
-                Console.Error.WriteLine($"[RV-EVAL-DIAG] EvaluateRawRead failed handle.Kind={handle.Kind} handle.Operands={handle.Operands.Length} " +
-                    $"op0.Kind={(handle.Operands.Length > 0 ? handle.Operands[0].Kind.ToString() : "n/a")} " +
-                    $"op1.Kind={(handle.Operands.Length > 1 ? handle.Operands[1].Kind.ToString() : "n/a")} " +
-                    $"offsetOperand.Kind={(value.Operands.Length > 1 ? value.Operands[1].Kind.ToString() : "n/a")}");
-            }
-
             return false;
         }
 
@@ -262,11 +253,6 @@ public sealed class RuntimeValueEvaluator
 
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
         {
-            if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
-            {
-                Console.Error.WriteLine($"[RV-EVAL-DIAG] ReadMemory failed address=0x{address:X} readerNull={_inputs.ReadMemory is null} value.Kind={value.Kind}");
-            }
-
             return false;
         }
 
@@ -363,11 +349,6 @@ public sealed class RuntimeValueEvaluator
                 {
                     if (!evaluator.Evaluate(source.Dwords[index], out words[index]))
                     {
-                        if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
-                        {
-                            Console.Error.WriteLine($"[RV-EVAL-DIAG] evaluate failed source={sourceIndex} dword={index} Kind={source.Dwords[index].Kind} Op={source.Dwords[index].Operation}");
-                        }
-
                         return false;
                     }
                 }
@@ -386,12 +367,6 @@ public sealed class RuntimeValueEvaluator
                 var selected = clean ? cleanEvaluator : evaluator;
                 if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out var word))
                 {
-                    if (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1")
-                    {
-                        Console.Error.WriteLine($"[RV-EVAL-DIAG] evaluate failed tableRead FlatOffset={read.FlatOffset} Kind={read.Value.Kind} Op={read.Value.Operation}");
-                        DumpValueTree(read.Value, 0, 6);
-                    }
-
                     return false;
                 }
 
@@ -402,25 +377,6 @@ public sealed class RuntimeValueEvaluator
         results = evaluated;
         table = flattened;
         return true;
-    }
-
-    private static void DumpValueTree(ScalarValue value, int depth, int maxDepth)
-    {
-        var indent = new string(' ', depth * 2);
-        var payload = value.Kind is ScalarValueKind.Constant or ScalarValueKind.UserData or ScalarValueKind.ScalarAddressWord or
-            ScalarValueKind.ScalarBufferWord or ScalarValueKind.ResourceTableWord or ScalarValueKind.Phi
-            ? $" Payload={value.Payload}"
-            : "";
-        Console.Error.WriteLine($"[RV-EVAL-DIAG] {indent}Kind={value.Kind} Op={value.Operation}{payload} Operands={value.Operands.Length}");
-        if (depth >= maxDepth)
-        {
-            return;
-        }
-
-        foreach (var operand in value.Operands)
-        {
-            DumpValueTree(operand, depth + 1, maxDepth);
-        }
     }
 
     private static bool[] EvaluateActiveSources(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, RuntimeValueEvaluator cleanEvaluator)

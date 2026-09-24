@@ -35,17 +35,6 @@ public static unsafe class RenderDocCapture
             ? Math.Clamp(captureTimeoutSeconds, 1, 120) * 1_000
             : 15_000;
 
-    // SHARPEMU_RENDERDOC_CAPTURE_AFTER_FLIPS=N requests one capture once guest flip N is
-    // reached, so an unattended run can capture without the F12 key.
-    private static readonly long _captureAfterFlips =
-        long.TryParse(
-            Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_CAPTURE_AFTER_FLIPS"),
-            out var captureAfterFlips) && captureAfterFlips > 0
-            ? captureAfterFlips
-            : 0;
-    private static int _automaticCaptureRequested;
-    private static long _observedFlipBoundaries;
-
     public static bool IsAvailable => _api is not null;
 
     public static bool ApplyVulkanLoaderEnvironment()
@@ -184,14 +173,6 @@ public static unsafe class RenderDocCapture
         if (_api is null)
         {
             return;
-        }
-
-        // The flip's image version is per display buffer, so count boundaries here.
-        if (_captureAfterFlips != 0 &&
-            Interlocked.Increment(ref _observedFlipBoundaries) >= _captureAfterFlips &&
-            Interlocked.Exchange(ref _automaticCaptureRequested, 1) == 0)
-        {
-            RequestCapture();
         }
 
         var state = Volatile.Read(ref _state);

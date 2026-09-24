@@ -7453,7 +7453,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			VirtualFree((void*)_workerAbortStub, 0u, 32768u);
 			_workerAbortStub = 0;
 		}
-		DumpGuestFaultCensus("shutdown");
 		if (_guestContextTransferStub != 0)
 		{
 			VirtualFree((void*)_guestContextTransferStub, 0u, 32768u);

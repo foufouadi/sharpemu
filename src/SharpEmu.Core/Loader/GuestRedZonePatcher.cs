@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
-using System.Globalization;
 using System.Runtime.InteropServices;
 using Iced.Intel;
 using SharpEmu.Core.Memory;
@@ -21,20 +20,6 @@ internal static class GuestRedZonePatcher
     private const ulong AllocationAlignment = 0x10000;
     private const ulong MaximumRelativeJumpDistance = 0x7FFF_FFFF;
 
-    // SHARPEMU_REDZONE_TRACE=0x800AD92D6[,...] reports, for the function that
-    // contains each address, whether the scan found it, whether it was treated
-    // as red-zone bearing, and what happened to every faultable instruction in
-    // it. A site that TryBuildPatchSpan refuses never reaches the site list, so
-    // the summary counters alone cannot distinguish "protected" from "silently
-    // skipped".
-    private static readonly ulong[] TraceAddresses = ParseTraceAddresses();
-
-    // SHARPEMU_REDZONE_SITES_FILE=<path> appends one line per faultable
-    // instruction that stays unprotected, so the set can be intersected with a
-    // fault census offline.
-    private static readonly string? UnprotectedSitesFile =
-        Environment.GetEnvironmentVariable("SHARPEMU_REDZONE_SITES_FILE");
-
     internal enum SpanRefusal
     {
         None,
@@ -42,27 +27,6 @@ internal static class GuestRedZonePatcher
         BranchTargetAfter,
         StackAfter,
         TooShort,
-    }
-
-    private static ulong[] ParseTraceAddresses()
-    {
-        var raw = Environment.GetEnvironmentVariable("SHARPEMU_REDZONE_TRACE");
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return [];
-        }
-
-        var parsed = new List<ulong>();
-        foreach (var part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var text = part.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? part[2..] : part;
-            if (ulong.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))
-            {
-                parsed.Add(address);
-            }
-        }
-
-        return parsed.ToArray();
     }
 
     public static PatchResult Patch(
@@ -161,7 +125,6 @@ internal static class GuestRedZonePatcher
             BranchTargetRefusals = scan.BranchTargetRefusals,
             StackRefusals = scan.StackRefusals,
             TooShortRefusals = scan.TooShortRefusals,
-            ShortJumpRecoverable = scan.ShortJumpRecoverable,
             TrampolineBytes = trampolineCursor - trampolineBase,
         };
         Console.Error.WriteLine(
@@ -169,8 +132,7 @@ internal static class GuestRedZonePatcher
             $"sites={result.PatchedSites}/{result.CandidateSites} failed={result.FailedSites} " +
             $"unrelocatable={result.UnrelocatableSites} " +
             $"(control_flow={result.ControlFlowRefusals} branch_target_after={result.BranchTargetRefusals} " +
-            $"stack_after={result.StackRefusals} too_short={result.TooShortRefusals} " +
-            $"rel8_recoverable={result.ShortJumpRecoverable}) " +
+            $"stack_after={result.StackRefusals} too_short={result.TooShortRefusals}) " +
             $"rosetta_vector_stores={result.VectorStoreCount} " +
             $"trampolines=0x{trampolineBase:X16}+0x{result.TrampolineBytes:X}.");
         return result;
@@ -192,9 +154,6 @@ internal static class GuestRedZonePatcher
         var vectorStoreCount = 0;
         var unrelocatableSites = 0;
         var refusalCounts = new int[5];
-        var rel8Recoverable = 0;
-        var tracedSeen = new HashSet<ulong>();
-        var siteReport = UnprotectedSitesFile is null ? null : new List<string>();
 
         foreach (var header in programHeaders)
         {
@@ -245,44 +204,8 @@ internal static class GuestRedZonePatcher
                 instructionCount += decoded.Count;
                 var usesRedZone = protectRedZone && decoded.Any(static entry => UsesRedZone(entry.Instruction));
 
-                var traced = false;
-                foreach (var address in TraceAddresses)
-                {
-                    if (address >= functionStart && address < functionEnd)
-                    {
-                        traced = true;
-                        tracedSeen.Add(address);
-                    }
-                }
-
-                if (traced)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][REDZONE] function=0x{functionStart:X16} end=0x{functionEnd:X16} " +
-                        $"instructions={decoded.Count} uses_red_zone={usesRedZone}");
-
-                    // A backward span needs the exact instruction boundaries and
-                    // branch targets around the site, so dump the whole decode.
-                    var tracedTargets = CollectBranchTargets(decoded);
-                    foreach (var entry in decoded)
-                    {
-                        var listed = entry.Instruction;
-                        Console.Error.WriteLine(
-                            $"[LOADER][REDZONE]   ins 0x{listed.IP:X16} len={listed.Length} {listed.Mnemonic} " +
-                            $"target={tracedTargets.Contains(listed.IP)} " +
-                            $"faultable={IsFaultableGuestMemoryInstruction(listed)} " +
-                            $"stack={TouchesStackPointer(listed)} flow={listed.FlowControl}");
-                    }
-                }
-
                 if (!usesRedZone && !splitVectorStores)
                 {
-                    if (traced)
-                    {
-                        Console.Error.WriteLine(
-                            "[LOADER][REDZONE]   function skipped: no red-zone access found, nothing is protected.");
-                    }
-
                     continue;
                 }
 
@@ -292,23 +215,7 @@ internal static class GuestRedZonePatcher
                 }
                 var branchTargets = CollectBranchTargets(decoded);
 
-                // Alignment padding between the last real instruction of this
-                // function and the next function start is the only island a
-                // short jump may safely use: both bounds come from the same
-                // .eh_frame_hdr table the scan already trusts, and every byte
-                // in it decoded as int3/nop.
                 var lastSiteEnd = 0UL;
-                var tailGapStart = functionEnd;
-                for (var index = decoded.Count - 1; index >= 0; index--)
-                {
-                    var candidate = decoded[index].Instruction;
-                    if (candidate.Mnemonic is not (Mnemonic.Int3 or Mnemonic.Nop))
-                    {
-                        break;
-                    }
-
-                    tailGapStart = candidate.IP;
-                }
 
                 for (var instructionIndex = 0; instructionIndex < decoded.Count; instructionIndex++)
                 {
@@ -316,13 +223,6 @@ internal static class GuestRedZonePatcher
                     if ((!usesRedZone && !(splitVectorStores && RosettaVectorStorePatch.RequiresStoreSplit(instruction))) ||
                         !IsFaultableGuestMemoryInstruction(instruction))
                     {
-                        if (traced && HasMemoryOperand(instruction))
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][REDZONE]   0x{instruction.IP:X16} {instruction.Mnemonic} not-a-candidate " +
-                                $"(stack_dependent={TouchesStackPointer(instruction)})");
-                        }
-
                         continue;
                     }
 
@@ -341,39 +241,10 @@ internal static class GuestRedZonePatcher
                     if ((!backward && refusal != SpanRefusal.None) || span.Address < lastSiteEnd)
                     {
                         // Refused spans never enter the site list, so they are
-                        // invisible in FailedSites. Count them separately, and
-                        // record whether a two-byte short jump into the tail
-                        // padding would have reached a five-byte relay.
+                        // invisible in FailedSites. Count them separately.
                         unrelocatableSites++;
                         refusalCounts[(int)refusal]++;
-
-                        var rel8Ok = IsShortJumpReachable(
-                            instruction.IP, instruction.Length, tailGapStart, functionEnd);
-                        if (rel8Ok)
-                        {
-                            rel8Recoverable++;
-                        }
-
-                        siteReport?.Add(
-                            $"0x{instruction.IP:X16},{refusal},{instruction.Mnemonic},{instruction.Length}," +
-                            $"rel8={rel8Ok},function=0x{functionStart:X16}-0x{functionEnd:X16}," +
-                            $"tail_gap=0x{tailGapStart:X16}-0x{functionEnd:X16}");
-
-                        if (traced)
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][REDZONE]   0x{instruction.IP:X16} {instruction.Mnemonic} " +
-                                $"UNPROTECTED: {refusal} (len={instruction.Length} rel8_possible={rel8Ok} " +
-                                $"tail_gap=0x{tailGapStart:X16}-0x{functionEnd:X16})");
-                        }
-
                         continue;
-                    }
-
-                    if (traced)
-                    {
-                        Console.Error.WriteLine(
-                            $"[LOADER][REDZONE]   0x{instruction.IP:X16} {instruction.Mnemonic} site bytes={span.ByteLength}");
                     }
 
                     sites.Add(span);
@@ -393,32 +264,6 @@ internal static class GuestRedZonePatcher
             }
         }
 
-        // Each loaded module runs its own pass, so an address only missing here
-        // may still be covered by another module. Name the module instead of
-        // claiming the address is uncovered outright.
-        foreach (var address in TraceAddresses)
-        {
-            if (!tracedSeen.Contains(address))
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][REDZONE] 0x{address:X16} is in no scanned function of the module at " +
-                    $"0x{imageBase:X16}.");
-            }
-        }
-
-        if (siteReport is { Count: > 0 } && UnprotectedSitesFile is not null)
-        {
-            try
-            {
-                File.AppendAllLines(UnprotectedSitesFile, siteReport);
-            }
-            catch (Exception error)
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] could not write {UnprotectedSitesFile}: {error.Message}");
-            }
-        }
-
         result = new PatchResult
         {
             Functions = functionCount,
@@ -431,7 +276,6 @@ internal static class GuestRedZonePatcher
             BranchTargetRefusals = refusalCounts[(int)SpanRefusal.BranchTargetAfter],
             StackRefusals = refusalCounts[(int)SpanRefusal.StackAfter],
             TooShortRefusals = refusalCounts[(int)SpanRefusal.TooShort],
-            ShortJumpRecoverable = rel8Recoverable,
         };
         return sites;
     }
@@ -645,26 +489,6 @@ internal static class GuestRedZonePatcher
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// Whether a two-byte <c>jmp rel8</c> placed at <paramref name="siteAddress"/>
-    /// can reach a five-byte relay somewhere inside [gapStart, gapEnd).
-    /// </summary>
-    private static bool IsShortJumpReachable(ulong siteAddress, int siteLength, ulong gapStart, ulong gapEnd)
-    {
-        if (siteLength < 2 || gapEnd < gapStart + MinimumJumpBytes)
-        {
-            return false;
-        }
-
-        // rel8 is measured from the end of the two-byte jump.
-        var origin = siteAddress + 2;
-        var lowest = origin >= 128 ? origin - 128 : 0;
-        var highest = origin + 127;
-        var firstRelay = gapStart > lowest ? gapStart : lowest;
-        var lastRelayStart = gapEnd - MinimumJumpBytes;
-        return firstRelay <= lastRelayStart && firstRelay <= highest;
     }
 
     private static bool TryBuildPatchSpan(
@@ -1062,12 +886,6 @@ internal static class GuestRedZonePatcher
         public int StackRefusals { get; init; }
 
         public int TooShortRefusals { get; init; }
-
-        /// <summary>
-        /// Unrelocatable sites a two-byte short jump into the function's own
-        /// trailing padding could still reach.
-        /// </summary>
-        public int ShortJumpRecoverable { get; init; }
 
         public ulong TrampolineBytes { get; init; }
     }

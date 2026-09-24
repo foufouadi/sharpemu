@@ -93,7 +93,6 @@ public static class ResourceMaterializer
 
         if (!BuildSpecialization(plan, materialized, out var nextSnapshot, out var nextSpecialization, out failure, captureIndirectImageFailure))
         {
-            Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at BuildSpecialization failure={failure}");
             return false;
         }
 
@@ -156,7 +155,6 @@ public static class ResourceMaterializer
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, directCandidates.Select(candidate => candidate.Source).ToArray(),
                         cleanInputs, [], evaluateTable: false, out var descriptors, out _))
                     {
-                        Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at directCandidates image={imageIndex}");
                         return false;
                     }
                     var directTable = new IndirectImageTable { Resource = (uint)imageIndex };
@@ -211,14 +209,12 @@ public static class ResourceMaterializer
                 }
                 if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _))
                 {
-                    Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at material/heap source image={imageIndex}");
                     return false;
                 }
 
                 if (!MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs,
                     captureSelectorDiagnostic, out var indirectTable, out failure))
                 {
-                    Console.Error.WriteLine($"[LOADER][WARN] materialize_snapshot_probe failed at MaterializeIndirectImage image={imageIndex} failure={failure}");
                     return false;
                 }
 
@@ -762,7 +758,6 @@ public static class ResourceMaterializer
             offsets.Add(0);
         }
 
-        IndirectImageTrace.WriteWaveTable(baseAddress, activeMask, keys, probed);
         return FinishIndirectImage(probed, offsets, out result, out failure);
     }
 

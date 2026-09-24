@@ -11,16 +11,8 @@ public sealed partial class ResourceTracker
     private bool TryMakeDenseIndirectImage(ScalarValue handle, uint pc, out IndirectImagePlan plan)
     {
         plan = null!;
-        var diag = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1" &&
-            pc is 0x1a0c or 0x1eec;
-        bool Reject(string reason)
-        {
-            if (diag) Console.Error.WriteLine($"[DENSE-IMAGE-DIAG] pc=0x{pc:X} reject: {reason}");
-            return false;
-        }
-
         if (handle.Kind != ScalarValueKind.ImageHandle || handle.Operands.Length != 8)
-            return Reject($"handle.Kind={handle.Kind} operands={handle.Operands.Length}");
+            return false;
 
         var reads = new ScalarValue[8];
         var memoryIndices = new int[8];
@@ -34,11 +26,11 @@ public sealed partial class ResourceTracker
             var read = handle.Operands[dword];
             if (read.Kind != ScalarValueKind.ScalarAddressWord || read.MemoryIndex < 0 ||
                 read.MemoryIndex >= _plan.Memory.Count || !MemoryIndexBelongsTo(read.MemoryIndex, read))
-                return Reject($"dword={dword} read.Kind={read.Kind} memoryIndex={read.MemoryIndex}");
+                return false;
 
             var memory = _plan.Memory[read.MemoryIndex];
             if (memory.Kind != MemoryResourceKind.ScalarAddress || memory.DataBits != 32 || memory.DataDwords != 1)
-                return Reject($"dword={dword} memory.Kind={memory.Kind} bits={memory.DataBits} dwords={memory.DataDwords}");
+                return false;
 
             var offset = read.Operands[1];
             uint extra = 0;
@@ -49,7 +41,7 @@ public sealed partial class ResourceTracker
             else if (!_graph.Equivalent(offset, based))
             {
                 if (offset.Kind != ScalarValueKind.Operation || offset.Operation != ScalarOperation.IAdd32 || offset.Operands.Length != 2)
-                    return Reject($"dword={dword} offset.Kind={offset.Kind} op={offset.Operation}");
+                    return false;
 
                 ScalarValue inner;
                 if (offset.Operands[1].IsConstant)
@@ -64,26 +56,26 @@ public sealed partial class ResourceTracker
                 }
                 else
                 {
-                    return Reject($"dword={dword} offset has no constant addend");
+                    return false;
                 }
 
                 if (!_graph.Equivalent(inner, based))
-                    return Reject($"dword={dword} offset base differs");
+                    return false;
             }
 
             var componentOffset = checked((uint)dword * sizeof(uint));
             if ((ulong)extra + memory.Offset < componentOffset)
-                return Reject($"dword={dword} component offset underflow");
+                return false;
             var immediate = extra + memory.Offset - componentOffset;
             if (dword == 0)
                 tableImmediate = immediate;
             else if (immediate != tableImmediate)
-                return Reject($"dword={dword} table immediate differs ({immediate} != {tableImmediate})");
+                return false;
 
             var currentHandle = read.Operands[0];
             if (currentHandle.Kind != ScalarValueKind.AddressHandle ||
                 (heapHandle is not null && !_graph.Equivalent(currentHandle, heapHandle)))
-                return Reject($"dword={dword} heap handle mismatch/kind={currentHandle.Kind}");
+                return false;
 
             heapHandle = currentHandle;
             reads[dword] = read;
@@ -92,7 +84,7 @@ public sealed partial class ResourceTracker
         }
 
         if (based is null || heapHandle is null)
-            return Reject("missing base or heap handle");
+            return false;
 
         uint tableOffset = tableImmediate;
         var scaled = based;
@@ -110,29 +102,29 @@ public sealed partial class ResourceTracker
             }
             else
             {
-                return Reject("base add has no constant addend");
+                return false;
             }
         }
 
         if (scaled.Kind != ScalarValueKind.Operation || scaled.Operation != ScalarOperation.ShiftLeft32 ||
             scaled.Operands.Length != 2 || !scaled.Operands[1].IsConstant ||
             scaled.Operands[1].ConstantU32 != DenseIndirectImageShift)
-            return Reject($"scaled.Kind={scaled.Kind} op={scaled.Operation}");
+            return false;
 
         var key = scaled.Operands[0];
         var bound = DenseKeyBound(key);
         var waveIndexed = TryCreateWaveIndexedImageSelector(key, reads);
         if (bound == 0 && waveIndexed is null)
         {
-            return Reject("no finite key bound and no wave-indexed selector");
+            return false;
         }
 
         foreach (var read in reads)
             if (!UsesOnly(read, [handle]))
-                return Reject("descriptor read has another consumer");
+                return false;
 
         if (!MakeRuntimeAddressSource(heapHandle, pc, out var heapSourceIndex, out var heapSource))
-            return Reject("cannot materialize runtime address source");
+            return false;
 
         var imageDwords = Enumerable.Repeat(key, 8).ToArray();
         imageDwords[0] = heapSource.Dwords[0];
@@ -161,7 +153,6 @@ public sealed partial class ResourceTracker
             Memory = memoryIndices,
             Reads = reads,
         };
-        if (diag) Console.Error.WriteLine($"[DENSE-IMAGE-DIAG] pc=0x{pc:X} accepted table=0x{tableOffset:X} bound={bound} waveIndexed={waveIndexed is not null}");
         return true;
     }
 

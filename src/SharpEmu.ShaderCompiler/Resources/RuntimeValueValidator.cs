@@ -1,7 +1,6 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System;
 using System.Collections.Generic;
 
 namespace SharpEmu.ShaderCompiler.Resources;
@@ -53,8 +52,6 @@ public sealed class RuntimeValueValidator
         _ => false,
     };
 
-    private static readonly bool Diag = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_TRACKER_DIAG") == "1";
-
     public bool Validate(ScalarValue value)
     {
         if (value.IsConstant)
@@ -64,14 +61,12 @@ public sealed class RuntimeValueValidator
 
         if (!_visiting.Add(value))
         {
-            if (Diag) Console.Error.WriteLine($"[RV-DIAG] cycle revisiting Kind={value.Kind}");
             return false;
         }
 
         try
         {
             var result = ValidateNode(value);
-            if (Diag && !result) Console.Error.WriteLine($"[RV-DIAG] fail Kind={value.Kind} Op={value.Operation} Payload={value.Payload} Operands={value.Operands.Length}");
             return result;
         }
         finally

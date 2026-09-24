@@ -540,26 +540,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _ = BeginBatchedGuestCommands();
                 var imageIdentifier = _imageCache.FindImage(ref request);
                 var source = _imageCache.GetImage(imageIdentifier);
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] vk.flip_source_before_refresh " +
-                        $"addr=0x{displayBuffer.Address:X16} cached=0x{source.Description.Data.Address:X16} " +
-                        $"gpu_modified={source.IsGpuModified} buffer_modified={source.IsBufferModified} " +
-                        $"cpu_dirty={source.IsCpuDirty} render_target={source.Uses.RenderTarget} " +
-                        $"backing_exists={source.Backing.Exists}");
-                }
                 source.Uses.VideoOut = true;
                 _imageCache.RefreshImage(imageIdentifier);
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] vk.flip_source_after_refresh " +
-                        $"addr=0x{displayBuffer.Address:X16} cached=0x{source.Description.Data.Address:X16} " +
-                        $"gpu_modified={source.IsGpuModified} buffer_modified={source.IsBufferModified} " +
-                        $"cpu_dirty={source.IsCpuDirty} render_target={source.Uses.RenderTarget} " +
-                        $"backing_exists={source.Backing.Exists}");
-                }
                 // The refresh can end the tick; the copy records into the buffer that is current now.
                 var commandBuffer = BeginBatchedGuestCommands();
                 var extent = source.Backing.Extent;
