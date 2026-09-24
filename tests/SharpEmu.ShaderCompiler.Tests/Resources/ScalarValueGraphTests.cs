@@ -3,6 +3,7 @@
 
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
+using SharpEmu.ShaderCompiler.Vulkan;
 using Xunit;
 using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
@@ -451,7 +452,32 @@ public sealed class ScalarValueGraphTests
     }
 
     [Fact]
-    public void DivergentVectorValue_IsRejected()
+    public void WholeDwordSdwaCompare_HasDefinedScalarResult()
+    {
+        var compare = Vopc(4, "VCmpGtU32", Gen5Operand.Scalar(4), 0) with
+        {
+            Destinations = [Gen5Operand.Scalar(8)],
+            Control = new Gen5SdwaControl(6, 0, 6, 6, false, false, 0, 0, 0, false, 8),
+        };
+        var program = Program(
+            MoveVectorFromScalar(0, 0, 5),
+            compare,
+            MoveScalar(12, 9, 0),
+            MoveScalar(16, 10, 16),
+            MoveScalar(20, 11, 0),
+            BufferLoad(24, 8),
+            EndProgram(32));
+
+        var plan = Extract(program);
+        var source = plan.DescriptorSources[(int)plan.Info.Buffers[0].Source];
+        Assert.False(source.Dwords[0].IsUndefined);
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Buffers[0].Source,
+            Inputs([0, 0, 0, 0, 8, 3]), out var result));
+        Assert.Equal(1u, result.Dwords[0]);
+    }
+
+    [Fact]
+    public void ShaderProducedFirstLaneBufferHandle_UsesPhysicalAddress()
     {
         var perLane = Program(
             BufferLoad(0, 0, dwords: 1),
@@ -461,9 +487,12 @@ public sealed class ScalarValueGraphTests
             MoveScalar(20, 11, 0),
             BufferLoad(24, 8),
             EndProgram(32));
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(perLane));
-        Assert.Contains("not a valid runtime value", error.Message);
-        Assert.Contains("pc=0x00000018", error.Message);
+        var plan = Extract(perLane);
+        Assert.True(plan.Memory.TryGetIndex(24, 0, out var memoryIndex));
+        Assert.Equal(BufferDescriptorProvenance.Runtime, plan.Memory[memoryIndex].BufferDescriptor!.Provenance);
+        Assert.True(plan.Info.UsesDeviceAddresses);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(perLane), out var shader, out var error), error);
+        Assert.NotEmpty(shader.Spirv);
 
         var laneCount = Program(
             Vop2(0, "VMbcntLoU32B32", 1, Operand(0xFFFFFFFF), Gen5Operand.Vector(0)),
@@ -473,7 +502,8 @@ public sealed class ScalarValueGraphTests
             MoveScalar(20, 11, 0),
             BufferLoad(24, 8),
             EndProgram(32));
-        Assert.Throws<ResourcePlanException>(() => Extract(laneCount));
+        var laneCountPlan = Extract(laneCount);
+        Assert.True(laneCountPlan.Info.UsesDeviceAddresses);
     }
 
     [Fact]

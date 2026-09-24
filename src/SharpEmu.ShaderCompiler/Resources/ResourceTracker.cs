@@ -347,6 +347,36 @@ public sealed partial class ResourceTracker
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
         handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword));
 
+    // The value graph cannot evaluate a vector memory load on the host, but a
+    // V_READFIRSTLANE from a vector register written by this shader does have a
+    // concrete SGPR value when the subsequent buffer instruction executes.
+    private bool IsShaderProducedFirstLane(ScalarValue value)
+    {
+        if (value.Kind != ScalarValueKind.FirstLane || value.Operands.Length != 2)
+        {
+            return false;
+        }
+
+        var read = _graph.Program.Instructions.FirstOrDefault(instruction => instruction.Pc == value.Payload);
+        if (read is null || read.Opcode != "VReadfirstlaneB32" || read.Sources.Count == 0 ||
+            read.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+        {
+            return false;
+        }
+
+        var register = read.Sources[0].Value;
+        return _graph.Program.Instructions.Any(instruction =>
+            instruction.Pc < read.Pc &&
+            instruction.Destinations.Any(destination =>
+                destination.Kind == Gen5OperandKind.VectorRegister && destination.Value == register));
+    }
+
+    private bool IsShaderProducedBufferHandle(ScalarValue? handle) =>
+        handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
+        handle.Operands.Any(IsShaderProducedFirstLane) &&
+        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 &&
+            (_plan.ValidateRuntimeValue(dword) || IsShaderProducedFirstLane(dword)));
+
     private uint GetHandleSource(
         ScalarValue? handle,
         ScalarValueKind expected,
@@ -363,11 +393,6 @@ public sealed partial class ResourceTracker
         }
 
         var source = MakeSource(handle, width, sampler, sampleAdjust, pc);
-        if (expected == ScalarValueKind.ImageHandle && !IsContiguousScalarBufferRecord(source))
-        {
-            throw Failure(pc, $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} is not a valid runtime value");
-        }
-
         // Image descriptors loaded straight from a scalar buffer at a dynamically-uniform
         // offset (e.g. a bindless material heap entry read via S_BUFFER_LOAD, without going
         // through the explicit TryMakeIndirectImage/TryMakeDirectImage heap-record shapes)
@@ -384,31 +409,6 @@ public sealed partial class ResourceTracker
         }
 
         return InternSource(source);
-    }
-
-    // An image descriptor read from a scalar buffer must be one contiguous record.
-    private bool IsContiguousScalarBufferRecord(DescriptorSource source)
-    {
-        if (!source.Dwords.Any(dword => dword.Kind == ScalarValueKind.ScalarBufferWord))
-        {
-            return true;
-        }
-
-        var first = ScalarReadMemory(source.Dwords[0], out _);
-        for (var dword = 0; dword < source.Dwords.Length; dword++)
-        {
-            var read = source.Dwords[dword];
-            var memory = ScalarReadMemory(read, out _);
-            if (first is null || memory is null ||
-                memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
-                !_graph.Equivalent(read.Operands[0], source.Dwords[0].Operands[0]) ||
-                !_graph.Equivalent(read.Operands[1], source.Dwords[0].Operands[1]))
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     // A runtime V# is one whose four dwords cannot be resolved at plan time, but
@@ -703,6 +703,23 @@ public sealed partial class ResourceTracker
                     };
                     return;
                 }
+                memory.BufferDescriptor = new GuestBufferDescriptor
+                {
+                    Provenance = BufferDescriptorProvenance.Runtime,
+                };
+                _info.UsesDeviceAddresses = true;
+                return;
+            }
+
+            // An untyped vector buffer access can use the V# words currently held in
+            // its SGPRs. They may have been assembled from per-lane vector work and
+            // therefore have no host-evaluable value graph (V_READFIRSTLANE is one
+            // example). The physical-address path checks the descriptor's byte range
+            // and resolves the guest address through the mapped page table.
+            if (memory.Kind == MemoryResourceKind.Buffer && !memory.Typed && !memory.Formatted &&
+                memory.Access != MemoryAccess.Atomic &&
+                IsShaderProducedBufferHandle(access.Handle) && !IsHostBufferHandle(access.Handle))
+            {
                 memory.BufferDescriptor = new GuestBufferDescriptor
                 {
                     Provenance = BufferDescriptorProvenance.Runtime,

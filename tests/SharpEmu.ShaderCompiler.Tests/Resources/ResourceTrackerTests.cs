@@ -167,6 +167,26 @@ public sealed class ResourceTrackerTests
         Assert.Contains("pc=0x00000030", error.Message);
     }
 
+    [Fact]
+    public void ImageHandleCanCombineScalarBufferWordsAndUniformWords()
+    {
+        var program = Program(
+            ScalarBufferLoad(0, 4, destination: 16, count: 4, dynamicOffsetRegister: 8),
+            MoveScalar(8, 20, 0),
+            MoveScalar(12, 21, 0),
+            MoveScalar(16, 22, 0),
+            MoveScalar(20, 23, 0),
+            Image(24, "ImageLoad", 16),
+            EndProgram(32));
+
+        var plan = Extract(program);
+        var image = Assert.Single(plan.Info.Images);
+        var source = plan.DescriptorSources[(int)image.Source];
+        Assert.Equal(8u, source.DwordCount);
+        Assert.Equal(ScalarValueKind.ScalarBufferWord, source.Dwords[0].Kind);
+        Assert.True(plan.ValidateRuntimeValue(source.Dwords[0]));
+    }
+
     private static uint[] StorageDescriptorUserData(uint mipBase, uint mipLast) =>
     [
         0x1000, Format32x4Float << 20, 3 | (3 << 14), IdentitySwizzle | (mipBase << 12) | (mipLast << 16) | (ImageType2D << 28), 0, 3 << 4, 0, 0, 2,
@@ -422,10 +442,14 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
-    public void MalformedIndirectImage_IsRejected()
+    public void NonContiguousImageWordsKeepTheirActualSources()
     {
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(IndirectImageProgram(true)));
-        Assert.Contains("not a valid runtime value", error.Message);
+        var plan = Extract(IndirectImageProgram(true));
+        var image = Assert.Single(plan.Info.Images);
+        var source = plan.DescriptorSources[(int)image.Source];
+        Assert.Null(source.IndirectImage);
+        Assert.Equal(ScalarValueKind.ScalarBufferWord, source.Dwords[7].Kind);
+        Assert.Equal(32u, plan.Memory[source.Dwords[7].MemoryIndex].Offset);
     }
 
     [Fact]
@@ -544,19 +568,19 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
-    public void UnboundedRuntimeFormattedBufferLoad_UsesNullReadFallback()
+    public void UnboundedRuntimeFormattedBufferLoad_IsRejectedWithoutCandidateTable()
     {
         var program = Program(
-            ScalarLoad(0, 0, destination: 8, count: 4, dynamicOffsetRegister: 2),
-            ScalarBufferLoad(8, 8, destination: 12, count: 1),
+            ReadFirstLane(0, 2, 0),
+            ScalarLoad(8, 0, destination: 8, count: 4, dynamicOffsetRegister: 2),
             BufferLoad(16, 8, formatted: true),
-            EndProgram(20));
-        var plan = Extract(program);
+            EndProgram(24));
 
+        var plan = Extract(program);
         Assert.Empty(plan.BufferCandidateTables);
         var request = Request(program);
-        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
-        Assert.NotEmpty(shader.Spirv);
+        Assert.False(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error));
+        Assert.Contains("no candidate table", error);
     }
 
     [Fact]

@@ -1345,6 +1345,12 @@ public sealed partial class ScalarValueGraph
             var updatesExecutionMask = opcode.StartsWith("VCmpx", StringComparison.Ordinal);
             var suffix = opcode[(updatesExecutionMask ? "VCmpx".Length : "VCmp".Length)..];
 
+            if (instruction.Control is Gen5SdwaControl sdwa)
+            {
+                left = ApplySdwaSource(sdwa, 0, left);
+                right = ApplySdwaSource(sdwa, 1, right);
+            }
+
             // Integer 16-bit compares consume the low word of their operands. Signed forms
             // sign-extend it before comparison; floating-point F16 compares use their own path.
             if (suffix.EndsWith("16", StringComparison.Ordinal) && !suffix.EndsWith("F16", StringComparison.Ordinal))
@@ -1365,7 +1371,9 @@ public sealed partial class ScalarValueGraph
                 right = Narrow16(right);
             }
 
-            var result = instruction.Control is Gen5SdwaControl or Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 }
+            var result = instruction.Control is Gen5SdwaControl { AbsoluteMask: not 0 } or
+                Gen5SdwaControl { NegateMask: not 0 } or
+                Gen5Vop3Control { AbsoluteMask: not 0 } or Gen5Vop3Control { NegateMask: not 0 }
                 ? _graph.Undefined(ScalarValueType.Bool)
                 : suffix switch
                 {
