@@ -30,14 +30,17 @@ Niveau de preuve (colonne « Preuve ») :
 État SharpEmu : **OK** (déjà correct), **PARTIEL**, **INCORRECT**,
 **ARCHI** (architecture différente rendant le correctif inutile), **ABSENT**.
 
-Baseline tests (avant toute modification) : `SharpEmu.ShaderCompiler.Tests`
-757/757 ; `SharpEmu.Libs.Tests` 3476 tests, 37 échecs préexistants, tous dans
-des tests « device » exécutés sur lavapipe (llvmpipe, Vulkan CPU) :
-DataShareSwizzle/ThreadRead/ThreadWrite, WaveLaneTransfer, GlobalDataShare,
-`GpuBufferTests.IsInBounds_IsOverflowSafe`, `GpuRingBufferTests.Copy_*`,
-`GuestBufferCacheTests.*Backing*`. Les tests dont le nom contient
-`Multisample` font planter l'hôte de test sous lavapipe et sont exclus de la
-baseline comme des runs suivants.
+Baseline tests (avant toute modification, Linux x64, .NET 10.0.112, Vulkan
+via lavapipe/llvmpipe) : `SharpEmu.ShaderCompiler.Tests` 757/757 ;
+`SharpEmu.Libs.Tests` 3476 tests dont 37 échecs préexistants
+(DataShareSwizzle/ThreadRead/ThreadWrite, WaveLaneTransfer et GlobalDataShare
+sur device, `GpuBufferTests.IsInBounds_IsOverflowSafe`,
+`GpuRingBufferTests.Copy_ReturnsTheOffsetOfTheCommittedBytes`, trois
+`GuestBufferCacheTests` sur les trous de backing, deux `RenderHostDeviceTests`,
+`GpuTilerTests.TileAndDetile_PreserveRetainedStreamDataWhenTheRingIsFull`).
+Les tests dont le nom contient `Multisample` font planter l'hôte de test sous
+lavapipe ; ils sont exclus de tous les runs, baseline comprise, et n'ont donc
+pas été rejoués après les correctifs.
 
 ---
 
@@ -53,10 +56,10 @@ baseline comme des runs suivants.
 | C6 | `s_barrier` : ordonner aussi la mémoire buffer/image | #654 `375d8cc6` | PARTIEL | S + D | Implémenter |
 | C7 | Formats sRGB étroits (R8/R8G8 sRGB) : décodage à l'échantillonnage | #706 | INCORRECT | S + D | Implémenter |
 | C8 | Patch red-zone : protéger les instructions récupérées sur #UD | #720 (`redZonePatcher`) | INCORRECT | S | Implémenter |
-| C9 | Émulation `MOVNTSS`/`MOVNTSD`/`CLZERO`/`RDPRU` sur hôte sans ces extensions | #720 | ABSENT | D | Implémenter |
+| C9 | Émulation `RDPRU` (et `MOVNTSS`/`MOVNTSD`/`CLZERO`) sur hôte sans ces extensions | #720 | ABSENT | D | RDPRU implémenté ; stores reportés (voir fiche) |
 | C10 | Initialiser à zéro page table BDA, bitset de fautes, null buffer | #654 `3b1c0c08` | INCORRECT | S + D | Implémenter |
-| C11 | Âge GC des images compté en frames présentées, pas en soumissions | #654 `0653ab67` | INCORRECT | S | Implémenter si temps, NEEDS LOCAL VALIDATION |
-| C12 | Dispatch compute dépassant `maxComputeWorkGroupCount` | #654 `467089d6`, #512 `98f94985` | INCORRECT | S + D | Reporté (conception : découpage via `vkCmdDispatchBase`) |
+| C11 | Libération d'une image chevauchée : ancienneté en frames présentées, pas en soumissions | #654 `0653ab67` | INCORRECT | S + T | Implémenté |
+| C12 | Dispatch compute dépassant `maxComputeWorkGroupCount` | #654 `467089d6`, #512 `98f94985` | INCORRECT | S + D | Implémenté (découpage via `vkCmdDispatchBase`, pas de suppression) |
 | C13 | Variantes `IMAGE_GATHER4_*` manquantes (L, B, CL, O…) | #613 `b3338fa7`, #654 `924e0980`, `ba405e6e` | PARTIEL | S | Reporté (sémantique LOD à établir) |
 | C14 | Atomiques image 64 bits (DMASK=0x3) | #613 `f204e38a`, #654 `148cf1b8` | ABSENT | D | Reporté (dépend d'une extension, vue R64) |
 | C15 | `DS_PERMUTE_B32` | #654 `015187e6` | ABSENT | D | Reporté |
@@ -310,7 +313,7 @@ ou rejeté comme permissif.
 - **Difficulté** : moyenne. **Risque** : moyen (plus de sites patchés sur
   hôtes Intel). NEEDS LOCAL VALIDATION sur un hôte Intel Windows.
 
-### C9 — `MOVNTSS`/`MOVNTSD`, `CLZERO`, `RDPRU`
+### C9 — `RDPRU` (implémenté), `MOVNTSS`/`MOVNTSD`, `CLZERO` (reportés)
 
 - **PR** : #720 (`x64InstructionEmulator.cpp`).
 - **Problème** : ces instructions Zen2 lèvent #UD sur les hôtes qui ne les
@@ -323,8 +326,18 @@ ou rejeté comme permissif.
   `RDPRU` renvoie un compteur monotone de l'hôte pour les deux sélecteurs
   (le ratio APERF/MPERF vaut 1 — approximation explicite) ; tout autre sélecteur
   renvoie 0.
-- **Hypothèse** : la façon exacte dont `RDPRU` positionne `CF` pour un
-  sélecteur invalide n'est pas vérifiée ; elle n'est pas modélisée.
+- **Implémenté** : `RDPRU` seulement (registres uniquement : `EDX:EAX`, `CF`).
+  `CF=1` pour les sélecteurs 0/1, `CF=0` et zéro sinon, OF/SF/ZF/AF/PF
+  effacés : lecture de l'APM, **hypothèse** non vérifiée sur matériel. Le pont
+  de signaux POSIX ne recopie pas RFLAGS (limite préexistante, identique pour
+  BMI) : sous Linux/macOS seul `EDX:EAX` est rendu.
+- **Reporté** : `MOVNTSS`/`MOVNTSD` et `CLZERO` écrivent la mémoire invitée.
+  Émuler ce store depuis le gestionnaire d'exception peut refauter sur une
+  page gardée (GPU, commit paresseux) à l'intérieur du gestionnaire. Piste
+  plus sûre à étudier : `MOVNTSS m32,xmm` ≡ `MOVSS m32,xmm` (`F3 0F 2B /r` →
+  `F3 0F 11 /r`, même longueur) et `MOVNTSD` ≡ `MOVSD` : réécrire l'octet
+  d'opcode au chargement dans les fonctions déjà décodées par le patcher, pour
+  que le store s'exécute nativement.
 - **Tests** : unitaires sur les helpers (adresse de ligne `CLZERO`, stockage
   partiel `MOVNTSS`, sélection `RDPRU`).
 - **Difficulté** : moyenne. **Risque** : faible (n'intervient qu'après un
@@ -348,21 +361,46 @@ ou rejeté comme permissif.
   souvent la mémoire à zéro).
 - **Difficulté** : faible. **Risque** : faible.
 
-### C11 — Âge des images en frames
+### C11 — Ancienneté d'une image chevauchée en frames
 
-- **PR / commit** : #654 `0653ab67`.
-- **Problème** : `GuestImageCache.RunGarbageCollector` incrémente
-  `_collectionTick` à chaque appel ; il est appelé à la fin de **chaque
-  soumission** (`CommandStreamQueue`) et à chaque flip. L'âge 16/80/160 est
-  donc exprimé en soumissions. Avec `_collectionStartBytes = 0`, la collecte
-  tourne toujours, et une image GPU-modifiée non relisible
-  (`CanReadBack == false`) est supprimée sans pression mémoire.
-- **Solution** : l'horloge de récence n'avance qu'une fois par frame
-  présentée ; la collecte peut continuer à s'exécuter plus souvent.
-- **Tests** : unitaire sur l'âge (plusieurs collectes sans flip ne rendent
-  pas une image candidate).
-- **Difficulté** : faible. **Risque** : moyen (rétention mémoire plus longue).
-  NEEDS LOCAL VALIDATION.
+- **PR / commit** : #654 `0653ab67`. En lisant le diff réel, le commit ne
+  touche pas le GC mais la garde `safe_to_delete` de `ResolveOverlap`.
+- **Problème** : quand une recherche chevauche une image qu'elle ne peut pas
+  réutiliser (autre tiling, mémoire réallouée), `GuestImageCache.ResolveOverlap`
+  libère l'ancienne image si aucune recherche ne l'a renvoyée depuis
+  `TicksBeforeRemoval = 32` ticks du scheduler, soit 32 **soumissions**. La
+  fenêtre dépend donc du nombre de soumissions par frame du titre : une image
+  lue à chaque frame peut devenir libérable dans la frame qui la lit encore,
+  et son contenu GPU est perdu.
+- **Solution** : compteur de frames présentées dans le cache
+  (`AdvancePresentedFrame`, appelé à la capture de chaque flip), recherche qui
+  mémorise la frame, garde exprimée en 32 frames.
+- **Observation connexe non traitée** : le GC d'images compte aussi son âge en
+  appels (un par soumission terminée et par flip) avec
+  `_collectionStartBytes = 0` ; c'est un réglage à revoir séparément.
+- **Tests** : `OverlappedImage_AgesInPresentedFramesNotSubmissions` (64
+  soumissions sans frame : image conservée ; 33 frames : libérée). Le test
+  échoue avec l'ancienne unité.
+- **Difficulté** : faible. **Risque** : moyen (une image chevauchée peut vivre
+  plus longtemps, donc plus de mémoire). Effet titre NEEDS LOCAL VALIDATION.
+
+### C12 — Dispatch au-delà de `maxComputeWorkGroupCount`
+
+- **PR / commits** : #654 `467089d6`, #512 `98f94985`.
+- **Problème** : un dispatch invité peut compter jusqu'à 2^32 − 1 groupes par
+  axe ; `vkCmdDispatch` au-delà de `maxComputeWorkGroupCount` est un usage
+  invalide (VUID-vkCmdDispatch-groupCountX-00386 et suivantes). Rien ne le
+  vérifiait.
+- **Approche Kyty** : ignorer le dispatch et journaliser. Cela change le
+  résultat calculé par l'invité : rejeté.
+- **Solution SharpEmu** : découper la grille en tuiles conformes exécutées
+  par `vkCmdDispatchBase` (Vulkan 1.1) ; `WorkgroupId`, seul index de groupe
+  lu par les shaders traduits, inclut la base, donc chaque groupe garde son
+  index global. Pipelines compute invités créés avec `DISPATCH_BASE`. Les
+  limites viennent de `GpuDeviceInfo`.
+- **Hors périmètre** : dispatch indirect (comptes connus seulement côté GPU).
+- **Tests** : unitaires du découpeur (couverture exacte, pas de
+  recouvrement, limites). Pas de test device du chemin découpé.
 
 ---
 
@@ -482,8 +520,28 @@ convergence retenue : filtrage point des images entières (→ C4).
 
 ---
 
-## 4. Ordre d'implémentation
+## 4. État d'implémentation
 
-C1, C2, C3, C4, C5, C6, C7, C10, C8, C9, puis C11 si le temps le permet. Un
-commit par correctif, chacun avec son test de régression, en expliquant
-l'invariant corrigé et non le titre qui a motivé la recherche.
+Un commit par correctif sur `claude/quirky-keller-epbw0y`, chacun avec ses
+tests. Après la série : `SharpEmu.ShaderCompiler.Tests` 771/771,
+`SharpEmu.SourceGenerators.Tests` 36/36, `SharpEmu.Libs.Tests` 3539 tests
+dont exactement les 37 échecs de la baseline.
+
+| # | Commit | Preuve obtenue | Limites de la validation |
+|---|---|---|---|
+| C1 | `afadfdc` | T : longueur, interpréteur (NOP puis paquet, NOP en fin de buffer), `sceAgcCbNop(1)` | — |
+| C2 | `58fafbd` | T : SPIR-V (FMul/FAdd `NoContraction`, plus de `Fma`) ; device : résultat arrondi | lavapipe évalue `Fma` sans fusion (Vulkan l'autorise) : le test device ne distingue pas l'ancien code ; la preuve de régression est le test SPIR-V. Backend Metal inchangé |
+| C3 | `18d5ac3` | T : décodage, SPIR-V, device LDS et GDS | Le test device a révélé un second défaut : la comparaison du MAX était inversée ; corrigé dans le même commit |
+| C4 | `20c1631` | T : plan (Uint → sampler point séparé), mapping des border colors, cache par type de vue | Pas de test device lisant un texel de bord |
+| C5 | `dbc176f` | T : readback d'une image de 40 MiB ; reproduit le Fatal sans le correctif | — |
+| C6 | `c785d16` | T : constante de sémantique de la barrière | Effet mémoire observable seulement sur GPU réel |
+| C7 | `f1cb94f` | T : sélection de vue (support présent/absent, storage, 4 canaux), création réelle de la vue | lavapipe n'expose pas `R8_SRGB` : seul le repli UNORM a été exécuté sur device ; la vue sRGB n'est validée que par tests unitaires |
+| C8 | `121d15d` | T : extensions requises (décodage Iced), prédicat, span autour d'`EXTRQ` | Patch actif seulement sous Windows/macOS ; exécuté ici sous Linux via l'API interne |
+| C9 | `2bf69d8` | T : émulateur pur, gestionnaire SIGILL de bout en bout (trame simulée) | Flags non recopiés sous POSIX ; stores reportés |
+| C10 | `3f38264` | T : hook du scheduler (ordre, exécution unique) | Pas de test prouvant un contenu non nul avant correctif (lavapipe rend souvent de la mémoire à zéro) |
+| C11 | `dcd866a` | T : échoue avec l'ancienne unité, passe avec la nouvelle | — |
+| C12 | `962c953` | T : découpeur | Chemin `vkCmdDispatchBase` non exercé sur device |
+
+Aucun de ces correctifs n'a été exécuté dans Astro Bot, Silent Hill, Ghost of
+Yōtei, Beast of Reincarnation, Uncharted ou Demon's Souls. Leur effet sur ces
+titres est : NEEDS LOCAL VALIDATION.
