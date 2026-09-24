@@ -551,10 +551,18 @@ public static partial class Gen5SpirvTranslator
                         Bitcast(_floatType, fusedBits));
                     break;
                 }
+                // Only the FMA forms are fused; MAD/MAC round the product before the add.
                 case "VMadF32":
-                case "VFmaF32":
                 case "VMadMkF32":
                 case "VMadAkF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        EmitUnfusedMultiplyAdd(
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            GetFloatSource(instruction, 2)));
+                    break;
+                case "VFmaF32":
                 case "VFmaMkF32":
                 case "VFmaAkF32":
                     result = EmitFloatResult(
@@ -567,6 +575,13 @@ public static partial class Gen5SpirvTranslator
                             GetFloatSource(instruction, 2)));
                     break;
                 case "VMacF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        EmitUnfusedMultiplyAdd(
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            Bitcast(_floatType, LoadV(destination))));
+                    break;
                 case "VFmacF32":
                 {
                     var addend = Bitcast(_floatType, LoadV(destination));
@@ -1794,6 +1809,11 @@ public static partial class Gen5SpirvTranslator
             _module.AddDecoration(value, SpirvDecoration.NoContraction);
             return value;
         }
+
+        // a * b + c with the product rounded, as V_MAD_F32 and V_MAC_F32 compute it.
+        // NoContraction keeps the driver from fusing the pair back into an fma.
+        private uint EmitUnfusedMultiplyAdd(uint left, uint right, uint addend) =>
+            EmitPreciseFloat(SpirvOp.FAdd, EmitPreciseFloat(SpirvOp.FMul, left, right), addend);
 
         // Reads source `index`, selects the half feeding this lane (op_sel / op_sel_hi),
         // widens it exactly to f32 and applies the lane's negate modifier (neg_lo / neg_hi).
