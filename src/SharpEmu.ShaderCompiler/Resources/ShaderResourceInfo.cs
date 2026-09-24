@@ -94,6 +94,8 @@ public sealed class SamplerResource
 {
     public uint Source { get; set; }
     public uint FirstUsePc { get; set; }
+    // Every image paired with this sampler is read through an integer view: the host sampler
+    // filters with point sampling and takes an integer border color.
     public bool ForcePointFiltering { get; set; }
     public bool DepthCompare { get; set; }
 

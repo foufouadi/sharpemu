@@ -531,10 +531,10 @@ internal static unsafe partial class VulkanVideoPresenter
             };
         }
 
-        private Sampler ResolveSampler(in GuestSampler sampler)
+        private Sampler ResolveSampler(in GuestSampler sampler, Format viewFormat)
         {
             Span<uint> words = stackalloc uint[4] { sampler.Word0, sampler.Word1, sampler.Word2, sampler.Word3 };
-            return _samplerStore.GetSampler(new SamplerDescriptorWords(words));
+            return _samplerStore.GetSampler(new SamplerDescriptorWords(words), ViewFormatRules.IsIntegerFormat(viewFormat));
         }
 
         // Views for every cached binding after the targets are bound; a stale image is found again first.
@@ -588,7 +588,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 binding.Image = image.Backing.Handle;
                 if (!binding.IsStorage)
                 {
-                    binding.Sampler = ResolveSampler(binding.SamplerState);
+                    binding.Sampler = ResolveSampler(binding.SamplerState, binding.Request.View.Format);
                 }
             }
         }

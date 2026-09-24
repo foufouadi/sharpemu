@@ -818,8 +818,12 @@ public static class ResourceMaterializer
     private static uint ImageConversionFormat(uint format) =>
         GuestImageFormat.Remap(format) != format ? format : GuestImageFormat.Invalid;
 
-    private static bool RequiresPointSampler(ImageNumericClass numericClass, uint conversionFormat) =>
-        numericClass == ImageNumericClass.Sint || conversionFormat != GuestImageFormat.Invalid;
+    // Signed and unsigned integer images, and packed formats the shader converts from a
+    // raw integer view, are sampled through an integer host view. Vulkan filters no integer
+    // format linearly and gives it an integer border color, so such a sampler cannot be shared
+    // with a floating-point view.
+    private static bool SamplesThroughIntegerView(ImageNumericClass numericClass, uint conversionFormat) =>
+        numericClass is ImageNumericClass.Sint or ImageNumericClass.Uint || conversionFormat != GuestImageFormat.Invalid;
 
     // The depth compare function (sampler word 0, bits 12..14) of the sampler paired
     // with an image; an image sampled with comparison always has one.
@@ -1272,7 +1276,7 @@ public static class ResourceMaterializer
             }
 
             var image = images[(int)pair.Image];
-            usage[pair.Sampler] |= RequiresPointSampler(image.NumericClass, image.ConversionFormat) ? (byte)2 : (byte)1;
+            usage[pair.Sampler] |= SamplesThroughIntegerView(image.NumericClass, image.ConversionFormat) ? (byte)2 : (byte)1;
         }
 
         for (var index = 0; index < info.Samplers.Count; index++)
@@ -1416,7 +1420,7 @@ public static class ResourceMaterializer
         foreach (var pair in info.SampledPairs)
         {
             var image = info.Images[(int)pair.Image];
-            if (RequiresPointSampler(image.NumericClass, image.ConversionFormat))
+            if (SamplesThroughIntegerView(image.NumericClass, image.ConversionFormat))
             {
                 pair.Sampler = samplerPlan.PointSampler[pair.Sampler];
             }
@@ -1484,7 +1488,7 @@ public static class ResourceMaterializer
             }
 
             var sampler = memory.Sampler;
-            if (RequiresPointSampler(image.NumericClass, image.ConversionFormat))
+            if (SamplesThroughIntegerView(image.NumericClass, image.ConversionFormat))
             {
                 sampler = samplerPlan.PointSampler[sampler];
             }

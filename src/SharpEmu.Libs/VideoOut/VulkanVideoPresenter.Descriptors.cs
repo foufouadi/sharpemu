@@ -165,7 +165,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"user_data=[{string.Join(",", stage.Resources.UserData.Select(word => $"{word:X8}"))}]");
             }
 
-            return _samplerStore.GetSampler(descriptor);
+            return _samplerStore.GetSampler(descriptor, integerView: sampler.ForcePointFiltering);
         }
 
         // The guest textures the movie path matches; built only while a decoded frame is active.

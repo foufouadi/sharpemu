@@ -88,6 +88,20 @@ public sealed class ViewFormatRulesTests
         Assert.Contains(fatal.Messages, message => message.Contains("sampled depth view is not supported"));
     }
 
+    [Theory]
+    [InlineData(Format.R32Uint, true)]
+    [InlineData(Format.R8G8B8A8Sint, true)]
+    [InlineData(Format.A2B10G10R10UintPack32, true)]
+    [InlineData(Format.S8Uint, true)]
+    [InlineData(Format.R32Sfloat, false)]
+    [InlineData(Format.R8G8B8A8Unorm, false)]
+    [InlineData(Format.R8G8B8A8Srgb, false)]
+    [InlineData(Format.R8Uscaled, false)]
+    [InlineData(Format.D32Sfloat, false)]
+    [InlineData(Format.BC7UnormBlock, false)]
+    public void IntegerFormats_AreTheUintAndSintOnes(Format format, bool integer) =>
+        Assert.Equal(integer, ViewFormatRules.IsIntegerFormat(format));
+
     [Fact]
     public void ViewDescriptions_CompareEveryField()
     {

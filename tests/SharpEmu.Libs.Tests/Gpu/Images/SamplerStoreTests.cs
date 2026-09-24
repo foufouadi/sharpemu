@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
+using Silk.NET.Vulkan;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Gpu.Images;
@@ -28,6 +29,29 @@ public sealed class SamplerStoreTests : IClassFixture<HeadlessVulkanFixture>
         Assert.Equal((0x123u, 0xABCu), (words.MinLod, words.MaxLod));
         Assert.Equal((0x1FFFu, 3u, 2u, 1u), (words.LodBias, words.MagnifyFilter, words.MinifyFilter, words.MipFilter));
         Assert.Equal((7u, 2u), (words.BorderColorIndex, words.BorderColorType));
+    }
+
+    [Theory]
+    [InlineData(SamplerBorderColor.TransparentBlack, false, BorderColor.FloatTransparentBlack)]
+    [InlineData(SamplerBorderColor.OpaqueBlack, false, BorderColor.FloatOpaqueBlack)]
+    [InlineData(SamplerBorderColor.OpaqueWhite, false, BorderColor.FloatOpaqueWhite)]
+    [InlineData(SamplerBorderColor.TransparentBlack, true, BorderColor.IntTransparentBlack)]
+    [InlineData(SamplerBorderColor.OpaqueBlack, true, BorderColor.IntOpaqueBlack)]
+    [InlineData(SamplerBorderColor.OpaqueWhite, true, BorderColor.IntOpaqueWhite)]
+    public void HostBorderColor_MatchesTheViewNumericType(SamplerBorderColor color, bool integerView, BorderColor expected) =>
+        Assert.Equal(expected, SamplerStore.HostBorderColor(color, integerView));
+
+    [Fact]
+    public void GetSampler_KeepsIntegerAndFloatBordersApart()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var store = new SamplerStore(_vulkan.DeviceInfo);
+        var clampToWhiteBorder = Words(6 | (6u << 3), 0, 0, 2u << 30);
+        var floatSampler = store.GetSampler(clampToWhiteBorder);
+        Assert.Equal(floatSampler, store.GetSampler(clampToWhiteBorder, integerView: false));
+        Assert.NotEqual(floatSampler, store.GetSampler(clampToWhiteBorder, integerView: true));
+        Assert.Equal(2, store.Count);
+        _vulkan.AssertNoValidationMessages();
     }
 
     [Fact]

@@ -12,6 +12,7 @@ public sealed class ResourceMaterializerTests
 {
     private const uint Format32Float = 22;
     private const uint Format32Sint = 21;
+    private const uint Format32Uint = 20;
     private const uint Format11x2x10Uint = 34;
     private const uint Format8x2Uscaled = 16;
     private const uint ImageType2D = 9;
@@ -263,6 +264,37 @@ public sealed class ResourceMaterializerTests
         var applied = ResourceMaterializer.ApplyTo(plan, specialization);
         var image = Assert.Single(applied.Info.Images);
         Assert.Equal(ImageNumericClass.Float, image.NumericClass);
+    }
+
+    // Unsigned integer views cannot be filtered linearly or take a float border either, so a
+    // sampler shared with a float image splits exactly as it does for a signed one.
+    [Fact]
+    public void UnsignedImage_SplitsTheSharedSamplerIntoPointAndNativeVariants()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0;
+        instructions.AddRange(ImageWords(ref pc, 16, 0x1000, Format32Float));
+        instructions.AddRange(ImageWords(ref pc, 24, 0x2000, Format32Uint));
+        instructions.AddRange(SamplerWords(ref pc, 40, 0));
+        var floatPc = pc;
+        var unsignedPc = pc + 8;
+        instructions.Add(Image(floatPc, "ImageSample", 16, 40));
+        instructions.Add(Image(unsignedPc, "ImageSample", 24, 40));
+        instructions.Add(EndProgram(pc + 16));
+        var plan = Extract(Program([.. instructions]));
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs([]), ref snapshot, ref specialization));
+        var applied = ResourceMaterializer.ApplyTo(plan, specialization);
+        Assert.Equal(ImageNumericClass.Uint, applied.Info.Images[1].NumericClass);
+        Assert.Equal(2, applied.Info.Samplers.Count);
+        Assert.False(applied.Info.Samplers[0].ForcePointFiltering);
+        Assert.True(applied.Info.Samplers[1].ForcePointFiltering);
+        Assert.Equal(0u, applied.Info.SampledPairs[0].Sampler);
+        Assert.Equal(1u, applied.Info.SampledPairs[1].Sampler);
+        Assert.True(plan.Memory.TryGetIndex(unsignedPc, 0, out var unsignedIndex));
+        Assert.Equal(1u, applied.SamplerByMemoryIndex[unsignedIndex]);
     }
 
     // Three images share one sampler; the packed and signed ones need point filtering,
