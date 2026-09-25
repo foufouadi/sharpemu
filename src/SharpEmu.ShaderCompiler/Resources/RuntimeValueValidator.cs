@@ -87,6 +87,12 @@ public sealed class RuntimeValueValidator
                 return value.UserDataRegister >= _userDataBase && value.UserDataRegister - _userDataBase < _userDataCount;
             case ScalarValueKind.ShaderBase:
                 return true;
+            case ScalarValueKind.SystemRegister:
+                // Compute SGPRs are initialized by dispatch hardware. Their
+                // concrete value is supplied to the generated shader, so they
+                // are valid uniform leaves even though the plan cannot
+                // evaluate one at compile time.
+                return true;
             case ScalarValueKind.Phi:
             {
                 var invariant = _graph.ResolveInvariantPhi(value);

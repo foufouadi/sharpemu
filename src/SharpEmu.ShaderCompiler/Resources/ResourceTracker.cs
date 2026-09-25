@@ -502,6 +502,7 @@ public sealed partial class ResourceTracker
                 case ScalarValueKind.ResourceTableWord:
                 case ScalarValueKind.UserData:
                 case ScalarValueKind.ShaderBase:
+                case ScalarValueKind.SystemRegister:
                     return true;
                 case ScalarValueKind.ScalarAddressWord:
                 case ScalarValueKind.ScalarBufferWord:
