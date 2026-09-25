@@ -77,6 +77,16 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            // Resource planning can inspect a dynamic descriptor before the draw has
+            // supplied a valid guest address.  Do not pass an invalid range to the
+            // page tracker: it treats that as an emulator invariant violation and
+            // terminates the process.  A failed read lets the materializer reject or
+            // specialize the source normally.
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
             if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                 SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
             {
@@ -98,6 +108,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
             if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) ||
                 _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
                 _imageCache.HasGpuModifiedImageBytes(address, sizeof(uint)))

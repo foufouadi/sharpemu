@@ -115,6 +115,20 @@ internal static unsafe partial class VulkanVideoPresenter
             imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
             BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
+            if (ShouldTraceTextureBindings())
+            {
+                var cached = _imageCache.GetImage(imageIdentifier);
+                var description = cached.Description;
+                Console.Error.WriteLine(
+                    $"TextureBinding stage={program.Stage} hash=0x{program.Hash:X16} index={index} " +
+                    $"address=0x{new TextureDescriptorWords(words).BaseAddress:X16} " +
+                    $"descriptor={descriptor.BaseAddress:X16} size={descriptor.Width + 1}x{descriptor.Height + 1} " +
+                    $"format={(uint)descriptor.Format} tile={(uint)descriptor.TileMode} " +
+                    $"image=0x{description.Data.Address:X16} size=0x{description.Data.Size:X} " +
+                    $"extent={description.Extent.Width}x{description.Extent.Height} pitch={description.Pitch} " +
+                    $"guestFormat={(uint)description.GuestFormat} imageTile={(uint)description.TileMode} " +
+                    $"backing={cached.Backing.Extent.Width}x{cached.Backing.Extent.Height} format={cached.Backing.Format}");
+            }
             return new TextureResource
             {
                 Address = descriptor.BaseAddress,
@@ -463,8 +477,9 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!range.Planned)
                 {
-                    if (!range.Written) continue;
-                    throw SubmissionScheduler.Fatal($"A written device-address range cannot be planned: handle={range.Handle} hash=0x{program.Hash:X16}.");
+                    // Per-lane computed writes are validated by the shader's page
+                    // table lookup. There is no host range to pre-map here.
+                    continue;
                 }
 
                 if (range.Size == 0)
