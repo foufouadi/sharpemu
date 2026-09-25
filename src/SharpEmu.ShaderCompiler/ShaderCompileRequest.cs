@@ -91,11 +91,18 @@ public sealed class ShaderCompileRequest
         IndirectRootByMemoryIndex = plan.IndirectImages.ToDictionary(access => access.MemoryIndex, access => access.Key.MemoryIndex);
 
         var writtenSlots = new Dictionary<int, uint>();
+        var unplannableWritten = new HashSet<int>();
         foreach (var range in plan.DeviceAddressRanges)
         {
             if (!range.Written || !plan.WrittenRangeSlotByHandle.TryGetValue(range.Handle, out var slot))
             {
                 continue;
+            }
+
+            if (!range.Plannable)
+            {
+                foreach (var memoryIndex in range.MemoryIndices)
+                    unplannableWritten.Add(memoryIndex);
             }
 
             foreach (var memoryIndex in range.MemoryIndices)
@@ -105,6 +112,7 @@ public sealed class ShaderCompileRequest
         }
 
         WrittenRangeSlotByMemoryIndex = writtenSlots;
+        UnplannableWrittenMemoryIndices = unplannableWritten;
 
         var candidateTables = new Dictionary<int, BufferCandidateTableUse>();
         for (var index = 0; index < plan.BufferCandidateTables.Count && index < resources.Info.BufferCandidateTables.Count; index++)
@@ -155,6 +163,11 @@ public sealed class ShaderCompileRequest
 
     // Written device-address accesses: memory index → the flattened slot of their range.
     public IReadOnlyDictionary<int, uint> WrittenRangeSlotByMemoryIndex { get; }
+
+    // A run-time computed write address cannot be bounded by the host before the
+    // dispatch. The generated shader still validates its page-table mapping; it
+    // must not reject the write against the empty host range slot.
+    public IReadOnlySet<int> UnplannableWrittenMemoryIndices { get; }
 
     public uint WaveSize { get; init; } = 32;
     public uint ScratchDwords { get; init; }

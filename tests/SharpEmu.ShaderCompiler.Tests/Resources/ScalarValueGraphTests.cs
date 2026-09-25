@@ -324,6 +324,21 @@ public sealed class ScalarValueGraphTests
     }
 
     [Fact]
+    public void BitwiseMaskCanResolveUndefinedDescriptorBits()
+    {
+        var plan = Extract(Program(
+            Sop2(0, "SAndB32", 0, Gen5Operand.Scalar(20), Operand(0)),
+            MoveScalar(4, 1, 0),
+            MoveScalar(8, 2, 0),
+            MoveScalar(12, 3, 0),
+            BufferLoad(16, 0),
+            EndProgram(24)), userDataCount: 0);
+
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Buffers[0].Source, Inputs([]), out var descriptor));
+        Assert.Equal([0u, 0u, 0u, 0u], descriptor.Dwords);
+    }
+
+    [Fact]
     public void DirectExecutionMaskWriteKeepsBranchConditionDefined()
     {
         var program = Program(

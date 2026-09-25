@@ -395,10 +395,7 @@ public sealed partial class ResourceTracker
         }
 
         var source = MakeSource(handle, width, sampler, sampleAdjust, pc);
-        if (expected == ScalarValueKind.ImageHandle && !IsContiguousScalarBufferRecord(source))
-        {
-            throw Failure(pc, $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} is not a valid runtime value");
-        }
+        var nonContiguousImage = expected == ScalarValueKind.ImageHandle && !IsContiguousScalarBufferRecord(source);
 
         // Image descriptors loaded straight from a scalar buffer at a dynamically-uniform
         // offset (e.g. a bindless material heap entry read via S_BUFFER_LOAD, without going
@@ -407,7 +404,9 @@ public sealed partial class ResourceTracker
         // already handle ScalarBufferWord dwords generically (the same mechanism buffer
         // descriptors rely on via MaterializationSources), so let ValidateSource below be the
         // single source of truth instead of a narrower, ImageHandle-specific blanket ban.
-        if (!ValidateSource(source, out var badDword, out var controlDependent))
+        var badDword = 0u;
+        var controlDependent = false;
+        if (nonContiguousImage || !ValidateSource(source, out badDword, out controlDependent))
         {
             // A bindless image/sampler descriptor whose dwords resolve through a
             // control-dependent phi (e.g. a hash-table/linear-probe material lookup, as seen
@@ -418,8 +417,10 @@ public sealed partial class ResourceTracker
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
             // descriptor). Buffer/sampler-adjacent handles or any other validation failure
             // still hard-fail, since those aren't safe to silently zero.
-            if ((controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat")) &&
-                expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle)
+            var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
+                (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
+                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
+            if (dynamicImageFallback)
             {
                 source = new DescriptorSource
                 {
@@ -431,11 +432,39 @@ public sealed partial class ResourceTracker
                 throw Failure(
                     pc,
                     $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} dword {badDword} is not a valid runtime value" +
-                        DescribeUndefinedLeaves(source.Dwords[badDword]));
+                        DescribeUndefinedLeaves(source.Dwords[badDword]) +
+                        $" (value: {DescribeValueShape(source.Dwords[badDword])})");
             }
         }
 
         return InternSource(source);
+    }
+
+    private string DescribeValueShape(ScalarValue value, int depth = 0)
+    {
+        if (depth >= 4)
+        {
+            return $"{value.Kind}#{value.Id}";
+        }
+
+        if (value.IsConstant)
+        {
+            return value.Type == ScalarValueType.U64
+                ? $"0x{value.ConstantU64:X}"
+                : value.Type == ScalarValueType.Bool ? (value.ConstantBool ? "true" : "false") : $"0x{value.ConstantU32:X}";
+        }
+
+        if (value.Kind == ScalarValueKind.Operation)
+        {
+            return $"{value.Operation}#{value.Id}({string.Join(',', value.Operands.Select(operand => DescribeValueShape(operand, depth + 1)))})";
+        }
+
+        if (value.Kind == ScalarValueKind.Undefined && _graph.TryGetUndefinedOrigin(value, out var origin))
+        {
+            return $"Undefined#{value.Id}({origin.Opcode}@0x{origin.Pc:X})";
+        }
+
+        return $"{value.Kind}#{value.Id}";
     }
 
     // An image descriptor read from a scalar buffer must be one contiguous record.
@@ -469,7 +498,7 @@ public sealed partial class ResourceTracker
     // buffer at a dynamic offset, including the phi that merges an SRT read
     // across a loop. A handle that is fully resolvable (constants and flattened
     // table words only) is not a runtime descriptor and keeps the native binding.
-    private bool IsRuntimeDescriptorHandle(ScalarValue? handle)
+    private bool IsRuntimeDescriptorHandle(ScalarValue? handle, bool allowComputedWords = false)
     {
         if (handle is null || handle.Kind != ScalarValueKind.BufferHandle ||
             handle.Operands.Length != 4)
@@ -477,12 +506,51 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        if (!handle.Operands.All(operand => IsRuntimeDerivable(operand)))
+        // Descriptor words loaded by the shader can point at a memory entry that
+        // is intentionally omitted from the host-side table (for example a
+        // vertex-fetch record created after fixed-function lowering).  The
+        // device-address lowering does not need to evaluate that word on the
+        // host, so keep the descriptor runtime when the word is still a real
+        // scalar memory read.  Other values retain the stricter derivability
+        // check, which keeps divergent first-lane handles rejected.
+        if (!handle.Operands.All(IsRuntimeDescriptorDword))
         {
-            return false;
+            // Some vertex-fetch shaders combine one scalar address load with
+            // descriptor words produced in the vector path. Those words are
+            // not host-evaluable, but the shader still owns the complete
+            // descriptor in its registers. Once a scalar memory word is part
+            // of the handle, lower the whole descriptor through device
+            // addresses instead of trying to bind a partial host source.
+            return allowComputedWords && handle.Operands.Any(operand => HasRuntimeReadKind(operand, ScalarValueKind.ScalarAddressWord));
         }
 
         return handle.Operands.Any(operand => HasRuntimeRead(operand));
+    }
+
+    private bool IsRuntimeDescriptorDword(ScalarValue value) => IsRuntimeDescriptorDword(value, []);
+
+    private bool IsRuntimeDescriptorDword(ScalarValue value, HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return value.Kind == ScalarValueKind.Phi;
+        }
+
+        try
+        {
+            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
+            {
+                // The backend consumes this as a device-address word.  It may
+                // not have a corresponding host materialization record.
+                return value.MemoryIndex >= 0;
+            }
+
+            return IsRuntimeDerivable(value, visiting);
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
     }
 
     // True when a value is known at plan time (constant, user data, shader base,
@@ -528,6 +596,25 @@ public sealed partial class ResourceTracker
     }
 
     private static bool HasRuntimeRead(ScalarValue value) => HasRuntimeRead(value, []);
+
+    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind) => HasRuntimeReadKind(value, kind, []);
+
+    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visiting)
+    {
+        if (!visiting.Add(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visiting));
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
 
     private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visiting)
     {
@@ -723,6 +810,12 @@ public sealed partial class ResourceTracker
 
         if (access is null)
         {
+            if (HasIndirectPcTransferBefore(memory.Pc))
+            {
+                memory.PlanningOnly = true;
+                return;
+            }
+
             throw Failure(memory.Pc, "memory operation has no resource handle");
         }
 
@@ -733,12 +826,51 @@ public sealed partial class ResourceTracker
 
         if (isBuffer)
         {
+            // A front GS/HS shader can carry a second code object after
+            // S_SETPC_B64. Until AGC supplies its continuation descriptor,
+            // linear decoding sees that unreachable tail with undefined SGPRs.
+            // Do not turn that dead instruction into a descriptor failure; the
+            // live path has already transferred control through the PC pair.
+            if (access.Handle is { Kind: ScalarValueKind.BufferHandle } unreachableHandle &&
+                unreachableHandle.Operands.Any(value => value.IsUndefined) &&
+                HasIndirectPcTransferBefore(memory.Pc))
+            {
+                memory.PlanningOnly = true;
+                return;
+            }
+
+            // A buffer access can carry a descriptor assembled in vector lanes.  Its
+            // record count/stride is not a host-evaluable scalar (the A6FE Little
+            // Nightmares path is one example), but the Vulkan physical-storage-buffer
+            // lowering can read the four descriptor words directly from shader
+            // registers. Keep this narrow to vector-derived accesses; ordinary
+            // malformed handles must still fail validation below.
+            if (memory.Access is MemoryAccess.Read or MemoryAccess.Write &&
+                access.Handle is { Kind: ScalarValueKind.BufferHandle } writeHandle)
+            {
+                var writeSource = MakeSource(writeHandle, 4, false, false, memory.Pc);
+                if (writeSource.Dwords.Any(dword =>
+                    HasUndefinedOrigin(dword, "VAdd3U32") ||
+                    HasUndefinedOrigin(dword, "VCvtU32F32") ||
+                    HasUndefinedOrigin(dword, "VRcpIflagF32")))
+                {
+                    memory.BufferDescriptor = new GuestBufferDescriptor
+                    {
+                        Provenance = BufferDescriptorProvenance.Runtime,
+                    };
+                    _info.UsesDeviceAddresses = true;
+                    return;
+                }
+            }
+
             // A V# whose dwords are all read from a runtime scalar-memory address
             // (e.g. a descriptor-array entry indexed by a loop counter) cannot be
             // bound ahead of time. Record it as a runtime guest descriptor so the
             // backend can choose a lowering strategy for each access.
             // A vector access through a V# the draw can evaluate keeps the explicit binding.
-            if (IsRuntimeDescriptorHandle(access.Handle) &&
+            var allowComputedFormatDescriptor = memory.Formatted &&
+                memory.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal);
+            if (IsRuntimeDescriptorHandle(access.Handle, allowComputedFormatDescriptor) &&
                 (memory.Kind != MemoryResourceKind.Buffer ||
                  !ValidateSource(MakeSource(access.Handle!, 4, false, false, memory.Pc), out _)))
             {
@@ -814,6 +946,22 @@ public sealed partial class ResourceTracker
             }
 
             _info.UsesDeviceAddresses = true;
+            return;
+        }
+
+        // A fused shader resumes through S_SETPC_B64.  The continuation can
+        // legitimately consume the image descriptor carried in the incoming
+        // SGPR state, while the standalone resource graph only sees the first
+        // code object and therefore has no provenance for those dwords.  Do
+        // not reject the whole program for that cross-object bookkeeping gap;
+        // leave the access unplanned so the continuation path can supply its
+        // descriptor at runtime.
+        if (isImage &&
+            access.Handle is { Kind: ScalarValueKind.ImageHandle } continuationImage &&
+            continuationImage.Operands.Any(value => value.IsUndefined) &&
+            HasIndirectPcTransferBefore(memory.Pc))
+        {
+            memory.PlanningOnly = true;
             return;
         }
 
@@ -898,6 +1046,35 @@ public sealed partial class ResourceTracker
 
     private bool IsIndirectPlanningMemory(int index) =>
         _indirectImages.Any(plan => plan.SuppressMemoryReads && plan.Memory.Contains(index));
+
+    private bool HasIndirectPcTransferBefore(uint pc)
+    {
+        var previousEnd = 0u;
+        foreach (var instruction in _graph.Program.Instructions)
+        {
+            if (instruction.Pc >= pc)
+            {
+                break;
+            }
+
+            if (instruction.Opcode is "SSetpcB64" or "SRfeB64")
+            {
+                return true;
+            }
+
+            // Fused shaders replace the S_SETPC marker with a NOP and append
+            // the continuation at its real address.  The PC discontinuity is
+            // the remaining reliable boundary when the marker is gone.
+            if (previousEnd != 0 && instruction.Pc > previousEnd)
+            {
+                return true;
+            }
+
+            previousEnd = instruction.Pc + (uint)(instruction.Words.Count * sizeof(uint));
+        }
+
+        return false;
+    }
 
     private void PlanIndirectImages()
     {

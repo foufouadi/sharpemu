@@ -2410,6 +2410,15 @@ public static partial class Gen5SpirvTranslator
             if (_request.Memory.TryGetIndex(instruction.Pc, 0, out var accessMemoryIndex))
             {
                 var accessMemory = _request.Memory[accessMemoryIndex];
+                if (accessMemory.PlanningOnly)
+                {
+                    // The access belongs to the linearized tail of a fused
+                    // shader.  Its descriptor is supplied by the continuation
+                    // object and is intentionally absent from this plan; keep
+                    // the dead linear instruction side-effect free.
+                    return true;
+                }
+
                 var strategy = accessMemory.BufferDescriptor?.ChooseStrategy(
                         control.Typed,
                         accessMemory.Formatted,
@@ -6213,9 +6222,8 @@ public static partial class Gen5SpirvTranslator
             value = 0;
             var packedSource = exportInstruction.Sources[component >> 1];
             var tracePackedExport =
-                Environment.GetEnvironmentVariable(
-                    "SHARPEMU_TRACE_PACKED_EXPORT") == "1" &&
-                _request.Program.Address == 0x0000000500781200ul;
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PACKED_EXPORT") == "1" &&
+                TraceShaderAddressMatches("SHARPEMU_TRACE_PACKED_EXPORT_ADDRESS");
             if (tracePackedExport)
             {
                 Console.Error.WriteLine(
@@ -6329,6 +6337,28 @@ public static partial class Gen5SpirvTranslator
                     "[AGC][PACKED-EXPORT] rejected: no nearby writer");
             }
             return false;
+        }
+
+        private bool TraceShaderAddressMatches(string environmentVariable)
+        {
+            var filter = Environment.GetEnvironmentVariable(environmentVariable);
+            if (string.IsNullOrWhiteSpace(filter))
+            {
+                return true;
+            }
+
+            var span = filter.AsSpan();
+            if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                span = span[2..];
+            }
+
+            return ulong.TryParse(
+                       span,
+                       System.Globalization.NumberStyles.HexNumber,
+                       System.Globalization.CultureInfo.InvariantCulture,
+                       out var address) &&
+                   _request.Program.Address == address;
         }
 
         private uint GetPixelOutputType(Gen5PixelOutputKind kind) =>
@@ -6605,6 +6635,15 @@ public static partial class Gen5SpirvTranslator
                 _ulongType,
                 left,
                 BitwiseAnd64(right, _module.Constant64(_ulongType, 63)));
+
+        private uint ShiftRightArithmetic64(uint left, uint right) =>
+            Bitcast(
+                _ulongType,
+                _module.AddInstruction(
+                    SpirvOp.ShiftRightArithmetic,
+                    _longType,
+                    Bitcast(_longType, left),
+                    BitwiseAnd64(right, _module.Constant64(_ulongType, 63))));
 
         private uint BitwiseAnd(uint left, uint right) =>
             _module.AddInstruction(SpirvOp.BitwiseAnd, _uintType, left, right);

@@ -14,7 +14,7 @@ public sealed class Gen5ShaderDecoderBoundaryTests
     private const uint Export = 0xF8000000;
     private const uint Nop = 0xBF800000;
     private const uint EndPgm = 0xBF810000;
-    private const int MaximumInstructionCount = 16384;
+    private const int MaximumInstructionCount = 1024 * 1024 / sizeof(uint);
 
     [Fact]
     public void MissingAddress_IsRejectedWithoutReadingGuestMemory()
@@ -89,7 +89,7 @@ public sealed class Gen5ShaderDecoderBoundaryTests
 
         Assert.False(decoded);
         Assert.Empty(program.Instructions);
-        Assert.Equal("unterminated", error);
+        Assert.StartsWith("unterminated", error, StringComparison.Ordinal);
         Assert.Equal(MaximumInstructionCount, memory.Reads.Count);
         Assert.All(memory.Reads, read => Assert.True(read.Succeeded));
         Assert.Equal(

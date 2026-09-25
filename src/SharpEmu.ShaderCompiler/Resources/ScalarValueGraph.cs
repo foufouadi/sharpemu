@@ -149,11 +149,25 @@ public sealed partial class ScalarValueGraph
 
     internal ScalarValue Operation(ScalarOperation operation, ScalarValueType type, params ScalarValue[] operands)
     {
+        // Some ALU identities produce a deterministic value even when the other
+        // operand has no tracked provenance. This matters for descriptor setup code
+        // that masks an unused or hardware-defined register before using it. Keep
+        // these identities ahead of the general undefined propagation below.
+        if (TryFoldWithUndefined(operation, type, operands, out var undefinedFolded))
+        {
+            return undefinedFolded;
+        }
+
         foreach (var operand in operands)
         {
             if (operand.IsUndefined)
             {
-                return Undefined(type);
+                // Keep the operation shape when one input lacks provenance. The
+                // runtime validator will still reject the undefined leaf, but
+                // preserving the node lets later symbolic identities eliminate
+                // only the bits that are provably independent of that input and
+                // keeps diagnostics attached to the real instruction graph.
+                return Intern($"op:{operation}:{type}:{Ids(operands)}", () => ScalarValue.MakeOperation(operation, type, operands));
             }
         }
 
@@ -178,6 +192,53 @@ public sealed partial class ScalarValueGraph
         }
 
         return Intern($"op:{operation}:{type}:{Ids(operands)}", () => ScalarValue.MakeOperation(operation, type, operands));
+    }
+
+    private bool TryFoldWithUndefined(ScalarOperation operation, ScalarValueType type, ScalarValue[] operands, out ScalarValue folded)
+    {
+        folded = null!;
+
+        if (operands.Length != 2)
+        {
+            return false;
+        }
+
+        if (operation == ScalarOperation.And32 &&
+            operands.Any(operand => operand.IsConstant && operand.Type == ScalarValueType.U32 && operand.ConstantU32 == 0))
+        {
+            folded = Constant(0u);
+            return true;
+        }
+
+        if (operation == ScalarOperation.And64 &&
+            operands.Any(operand => operand.IsConstant && operand.Type == ScalarValueType.U64 && operand.ConstantU64 == 0))
+        {
+            folded = Constant(0ul);
+            return true;
+        }
+
+        if (operation == ScalarOperation.Or32 &&
+            operands.Any(operand => operand.IsConstant && operand.Type == ScalarValueType.U32 && operand.ConstantU32 == uint.MaxValue))
+        {
+            folded = Constant(uint.MaxValue);
+            return true;
+        }
+
+        if (operation == ScalarOperation.LogicalAnd &&
+            operands.Any(operand => operand.IsConstant && operand.Type == ScalarValueType.Bool && !operand.ConstantBool))
+        {
+            folded = Constant(false);
+            return true;
+        }
+
+        if (operation == ScalarOperation.LogicalOr &&
+            operands.Any(operand => operand.IsConstant && operand.Type == ScalarValueType.Bool && operand.ConstantBool))
+        {
+            folded = Constant(true);
+            return true;
+        }
+
+        return false;
     }
 
     private bool TryFold(ScalarOperation operation, ScalarValueType type, ScalarValue[] operands, out ScalarValue folded)

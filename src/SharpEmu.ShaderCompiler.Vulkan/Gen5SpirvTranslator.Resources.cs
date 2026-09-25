@@ -651,6 +651,13 @@ public static partial class Gen5SpirvTranslator
         // width <= size, address >= base, address - base <= size - width.
         private uint IsWrittenAccessAllowed(int memoryIndex, uint address64, uint widthBytes)
         {
+            if (_request.UnplannableWrittenMemoryIndices.Contains(memoryIndex))
+            {
+                // The address is computed per lane and cannot be evaluated by the
+                // host. ResolveDeviceAddress below remains the safety boundary.
+                return _module.ConstantBool(true);
+            }
+
             if (!_request.WrittenRangeSlotByMemoryIndex.TryGetValue(memoryIndex, out var slot))
             {
                 return _module.ConstantBool(false);
@@ -939,6 +946,10 @@ public static partial class Gen5SpirvTranslator
             var address = control.ScalarAddress < 125
                 ? LoadS(control.ScalarAddress)
                 : LoadV(control.VectorAddress);
+            if (control.DynamicOffsetRegister is { } dynamicOffsetRegister)
+            {
+                address = IAdd(address, LoadS(dynamicOffsetRegister));
+            }
             if (control.OffsetBytes != 0)
             {
                 address = IAdd(address, UInt(unchecked((uint)control.OffsetBytes)));
@@ -958,7 +969,9 @@ public static partial class Gen5SpirvTranslator
                     {
                         Store(
                             ScratchPointer(address, index * sizeof(uint)),
-                            LoadV(control.SourceVectorRegister + index));
+                            control.SourceIsScalar
+                                ? LoadS(control.SourceVectorRegister + index)
+                                : LoadV(control.SourceVectorRegister + index));
                     }
                 });
                 return true;
