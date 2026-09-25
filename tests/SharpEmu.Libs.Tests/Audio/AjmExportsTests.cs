@@ -52,6 +52,16 @@ public sealed class AjmExportsTests : IDisposable
     }
 
     [Fact]
+    public void Initialize_IgnoresDirtyUpperBitsOfReservedArgument()
+    {
+        _ctx[CpuRegister.Rdi] = 0x00000003_00000000UL;
+        _ctx[CpuRegister.Rsi] = ContextAddress;
+
+        Assert.Equal(0, AjmExports.AjmInitialize(_ctx));
+        Assert.NotEqual(0u, ReadUInt32(ContextAddress));
+    }
+
+    [Fact]
     public void InstanceCreate_UnregisteredCodecDoesNotWriteOutput()
     {
         var contextId = Initialize();

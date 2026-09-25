@@ -96,7 +96,11 @@ public static class AjmExports
 
     public static int AjmInitialize(CpuContext ctx)
     {
-        var reserved = ctx[CpuRegister.Rdi];
+        // sceAjmInitialize's first parameter is a 32-bit reserved field. A
+        // title can leave the upper half of the x64 argument register dirty;
+        // validating the full register incorrectly rejects an otherwise zero
+        // reserved value (for example 0x00000003_00000000).
+        var reserved = unchecked((uint)ctx[CpuRegister.Rdi]);
         var outputAddress = ctx[CpuRegister.Rsi];
         if (reserved != 0 || outputAddress == 0)
         {
@@ -115,7 +119,7 @@ public static class AjmExports
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AJM"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] ajm.initialize reserved={reserved} out=0x{outputAddress:X16} context={contextId}");
+                $"[LOADER][TRACE] ajm.initialize reserved=0x{reserved:X8} out=0x{outputAddress:X16} context={contextId}");
         }
 
         ctx[CpuRegister.Rax] = 0;

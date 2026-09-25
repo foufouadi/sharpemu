@@ -1835,7 +1835,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool IsHlePreferredNid(string nid)
 	{
-		return string.Equals(nid, "QrZZdJ8XsX0", StringComparison.Ordinal) ||
+		// The shipped libc memset body contains a PS5-specific int 45h path
+		// which is not a Windows host instruction. Use the bounds-aware HLE
+		// implementation instead of redirecting this import to LLE.
+		return string.Equals(nid, "8zTFvBIAIN8", StringComparison.Ordinal) ||
+			string.Equals(nid, "QrZZdJ8XsX0", StringComparison.Ordinal) ||
 			string.Equals(nid, "Q3VBxCXhUHs", StringComparison.Ordinal);
 	}
 
