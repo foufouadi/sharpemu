@@ -3527,6 +3527,13 @@ public static partial class Gen5SpirvTranslator
                 Gen5OperandKind.EncodedConstant when TryDecodeInlineConstant(
                     operand.Value,
                     out var inline) => UInt(inline),
+                // RDNA encodes the LDS and scratch aperture registers as
+                // scalar sources 235..238.  SharpEmu models LDS and scratch
+                // with dedicated SPIR-V storage, so their guest address base
+                // is zero in the flat-address space.  Returning the low word
+                // here also lets scalar ALU instructions consume the source
+                // without turning it into an unrelated inline constant.
+                Gen5OperandKind.EncodedConstant when IsApertureSource(operand.Value) => UInt(0),
                 _ => throw new InvalidOperationException($"unsupported source {operand}"),
             };
 
@@ -4045,9 +4052,21 @@ public static partial class Gen5SpirvTranslator
                 return _module.Constant64(_ulongType, unchecked((ulong)signed));
             }
 
+            // SHARED_BASE/LIMIT and PRIVATE_BASE/LIMIT are hardware aperture
+            // registers (src[235..238]), not literal constants.  LDS and
+            // scratch accesses are lowered to their own SPIR-V arrays, so
+            // both apertures use the zero guest base in this address model.
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                IsApertureSource(operand.Value))
+            {
+                return ULong(0);
+            }
+
             var low = GetRawSource(instruction, sourceIndex);
             return _module.AddInstruction(SpirvOp.UConvert, _ulongType, low);
         }
+
+        private static bool IsApertureSource(uint value) => value is >= 235 and <= 238;
 
         private uint LoadS64(uint register)
         {

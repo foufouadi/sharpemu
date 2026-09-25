@@ -109,6 +109,44 @@ public sealed class Gen5FlatMemoryTests
         Assert.Contains(41u, extendedOperations);
     }
 
+    [Fact]
+    public void ApertureScalarSourcesCompileAsDedicatedMemoryBases()
+    {
+        var program = new Gen5ShaderProgram(
+            ShaderAddress,
+            [
+                new Gen5ShaderInstruction(
+                    0,
+                    Gen5ShaderEncoding.Sop1,
+                    "SMovB64",
+                    [0u],
+                    [new Gen5Operand(Gen5OperandKind.EncodedConstant, 235)],
+                    [Gen5Operand.Scalar(0)],
+                    null),
+                new Gen5ShaderInstruction(
+                    4,
+                    Gen5ShaderEncoding.Sop1,
+                    "SMovB64",
+                    [0u],
+                    [new Gen5Operand(Gen5OperandKind.EncodedConstant, 237)],
+                    [Gen5Operand.Scalar(2)],
+                    null),
+                new Gen5ShaderInstruction(
+                    8,
+                    Gen5ShaderEncoding.Sopp,
+                    "SEndpgm",
+                    [0u],
+                    [],
+                    [],
+                    null),
+            ]);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error),
+            error);
+    }
+
     public static TheoryData<uint, string> F16CompareOpcodes => new()
     {
         { 0xC8, "VCmpFF16" },
