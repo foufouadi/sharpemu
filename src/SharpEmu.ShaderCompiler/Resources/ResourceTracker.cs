@@ -347,9 +347,61 @@ public sealed partial class ResourceTracker
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
         handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword));
 
-    // The value graph cannot evaluate a vector memory load on the host, but a
-    // V_READFIRSTLANE from a vector register written by this shader does have a
-    // concrete SGPR value when the subsequent buffer instruction executes.
+    // A descriptor assembled by the shader can carry a value through a loop phi
+    // or uniform arithmetic after V_READFIRSTLANE. The host cannot evaluate that
+    // graph, but the physical-address lowering reads the final SGPR descriptor at
+    // dispatch time. Keep the proof recursive so those legal dataflow shapes are
+    // accepted while an unrelated divergent value is still rejected.
+    private bool IsShaderProducedBufferHandle(ScalarValue? handle) =>
+        handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
+        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && IsShaderProducedValue(dword, [])) &&
+        handle.Operands.Any(value => ContainsShaderProducedFirstLane(value, []));
+
+    private bool IsShaderProducedValue(ScalarValue value, HashSet<ScalarValue> visiting)
+    {
+        if (_plan.ValidateRuntimeValue(value) || IsShaderProducedFirstLane(value))
+        {
+            return true;
+        }
+
+        if (!visiting.Add(value))
+        {
+            return value.Kind == ScalarValueKind.Phi;
+        }
+
+        try
+        {
+            return value.Kind is ScalarValueKind.Phi or ScalarValueKind.Operation or ScalarValueKind.Select &&
+                value.Operands.All(operand => IsShaderProducedValue(operand, visiting));
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
+
+    private static bool ContainsShaderProducedFirstLane(ScalarValue value, HashSet<ScalarValue> visiting)
+    {
+        if (value.Kind == ScalarValueKind.FirstLane)
+        {
+            return true;
+        }
+
+        if (!visiting.Add(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            return value.Operands.Any(operand => ContainsShaderProducedFirstLane(operand, visiting));
+        }
+        finally
+        {
+            visiting.Remove(value);
+        }
+    }
+
     private bool IsShaderProducedFirstLane(ScalarValue value)
     {
         if (value.Kind != ScalarValueKind.FirstLane || value.Operands.Length != 2)
@@ -370,12 +422,6 @@ public sealed partial class ResourceTracker
             instruction.Destinations.Any(destination =>
                 destination.Kind == Gen5OperandKind.VectorRegister && destination.Value == register));
     }
-
-    private bool IsShaderProducedBufferHandle(ScalarValue? handle) =>
-        handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
-        handle.Operands.Any(IsShaderProducedFirstLane) &&
-        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 &&
-            (_plan.ValidateRuntimeValue(dword) || IsShaderProducedFirstLane(dword)));
 
     private uint GetHandleSource(
         ScalarValue? handle,
@@ -711,11 +757,12 @@ public sealed partial class ResourceTracker
                 return;
             }
 
-            // An untyped vector buffer access can use the V# words currently held in
-            // its SGPRs. They may have been assembled from per-lane vector work and
-            // therefore have no host-evaluable value graph (V_READFIRSTLANE is one
-            // example). The physical-address path checks the descriptor's byte range
-            // and resolves the guest address through the mapped page table.
+            // An untyped vector buffer access uses the V# words currently held in
+            // its SGPRs. Those words may have been assembled from per-lane vector
+            // work and cannot always be evaluated by the host value graph. The
+            // physical-address path reads the actual shader registers, checks the
+            // descriptor's byte range, and resolves the guest address through the
+            // mapped page table. Host-resolvable descriptors keep native bindings.
             if (memory.Kind == MemoryResourceKind.Buffer && !memory.Typed && !memory.Formatted &&
                 memory.Access != MemoryAccess.Atomic &&
                 IsShaderProducedBufferHandle(access.Handle) && !IsHostBufferHandle(access.Handle))

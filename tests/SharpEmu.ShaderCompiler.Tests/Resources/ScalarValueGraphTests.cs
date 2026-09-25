@@ -507,6 +507,27 @@ public sealed class ScalarValueGraphTests
     }
 
     [Fact]
+    public void ShaderCalculatedBufferSize_UsesRuntimeDescriptor()
+    {
+        var program = Program(
+            Vop2(0, "VMbcntLoU32B32", 1, Operand(0xFFFFFFFF), Gen5Operand.Vector(0)),
+            ReadFirstLane(8, 10, 1),
+            Sop2(12, "SAddU32", 10, Gen5Operand.Scalar(10), Operand(1)),
+            MoveScalar(16, 8, 0x1000),
+            MoveScalar(20, 9, 0),
+            MoveScalar(24, 11, 0),
+            BufferLoad(28, 8),
+            EndProgram(36));
+
+        var plan = Extract(program);
+        Assert.True(plan.Memory.TryGetIndex(28, 0, out var memoryIndex));
+        Assert.Equal(BufferDescriptorProvenance.Runtime, plan.Memory[memoryIndex].BufferDescriptor!.Provenance);
+        Assert.True(plan.Info.UsesDeviceAddresses);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(program), out var shader, out var error), error);
+        Assert.NotEmpty(shader.Spirv);
+    }
+
+    [Fact]
     public void UserDataChangesBetweenDraws_ChangeTheDescriptorWithoutRebuildingThePlan()
     {
         var plan = Extract(Program(BufferLoad(0, 4), EndProgram(8)));
