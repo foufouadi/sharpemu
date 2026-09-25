@@ -41,8 +41,12 @@ public sealed partial class RenderExecutor
     // when the task/mesh front end has already folded the upper enable bits
     // away. Little Nightmares also emits 0x2030 for a primitive path with no
     // geometry shader; the remaining bits describe the fixed NGG setup.
+    // GS_W32_EN (bit 22) and VS_W32_EN (bit 23) only select the wave size;
+    // graphics stages always compile as wave32, so they do not change the path.
+    private const uint VgtShaderStagesWaveSizeBits = (1u << 22) | (1u << 23);
+
     private static bool IsPrimitiveShaderStageMask(uint stages) =>
-        stages is 0x02002000 or 0x00002000 or 0x00002030;
+        (stages & ~VgtShaderStagesWaveSizeBits) is 0x02002000 or 0x00002000 or 0x00002030;
     private const uint MaxOutputPerSubgroupLimit = 0x40;
     private static int _geometryWarningShown;
 

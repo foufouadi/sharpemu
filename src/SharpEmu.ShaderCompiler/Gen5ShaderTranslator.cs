@@ -343,7 +343,12 @@ public static partial class Gen5ShaderTranslator
             if (Gen5IrBranchResolver.Instance.TryGetBranchTarget(
                     instruction,
                     out var branchTargetPc) &&
-                branchTargetPc > instruction.Pc)
+                branchTargetPc > instruction.Pc &&
+                // S_CBRANCH_CDBG* only fire under an attached GPU debugger, and
+                // the translators emit them as never taken. Their targets are
+                // debugger stubs placed after S_ENDPGM that read devkit-only
+                // addresses, so they must not extend the decoded program.
+                !instruction.Opcode.StartsWith("SCbranchCdbg", StringComparison.Ordinal))
             {
                 furthestForwardBranchTarget = Math.Max(
                     furthestForwardBranchTarget,
@@ -351,7 +356,12 @@ public static partial class Gen5ShaderTranslator
             }
 
             pc += sizeDwords * sizeof(uint);
-            if (string.Equals(name, "SEndpgm", StringComparison.Ordinal) &&
+            // An unconditional backward S_BRANCH with no forward target
+            // pending is the last reachable instruction too: compilers place
+            // out-of-line loop blocks after S_ENDPGM, and the code object's
+            // metadata trailer follows them.
+            if ((string.Equals(name, "SEndpgm", StringComparison.Ordinal) ||
+                 string.Equals(name, "SBranch", StringComparison.Ordinal)) &&
                 pc > furthestForwardBranchTarget)
             {
                 program = new Gen5ShaderProgram(address, instructions);

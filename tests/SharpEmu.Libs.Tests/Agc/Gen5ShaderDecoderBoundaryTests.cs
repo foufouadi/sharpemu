@@ -117,6 +117,43 @@ public sealed class Gen5ShaderDecoderBoundaryTests
         Assert.Equal(words.Length, memory.Reads.Count);
     }
 
+    [Fact]
+    public void TrailingBackwardBranch_StopsBeforeMetadataTrailer()
+    {
+        // Astro Bot: an out-of-line loop block after S_ENDPGM ends with an
+        // S_BRANCH back into the loop, followed by the "sl00" metadata block.
+        const uint CBranchScc0OverEndPgm = 0xBF840001u;
+        const uint BranchBackToStart = 0xBF82FFFCu;
+        const uint MetadataWord = 0x5D000040u;
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            [CBranchScc0OverEndPgm, EndPgm, Nop, BranchBackToStart, MetadataWord]);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal(4, program.Instructions.Count);
+        Assert.Equal("SBranch", program.Instructions[^1].Opcode);
+    }
+
+    [Fact]
+    public void DebuggerBranchPastEndPgm_DoesNotDecodeDebuggerStub()
+    {
+        // Astro Bot: S_CBRANCH_CDBGSYS jumps to a debugger stub after
+        // S_ENDPGM that loads descriptors from a devkit-only address.
+        const uint CBranchCdbgsysOverEndPgm = 0xBF970001u;
+        const uint StubMove = 0xBE8003FFu;
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            [CBranchCdbgsysOverEndPgm, EndPgm, StubMove]);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal(2, program.Instructions.Count);
+        Assert.Equal("SEndpgm", program.Instructions[^1].Opcode);
+    }
+
     private static bool Decode(
         RecordingCpuMemory memory,
         ulong address,
