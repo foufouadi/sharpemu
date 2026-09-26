@@ -4196,6 +4196,12 @@ public static partial class Gen5SpirvTranslator
                     high);
             }
 
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                Gen5InlineConstants.IsAperture(operand.Value))
+            {
+                return _module.Constant64(_ulongType, Gen5InlineConstants.DecodeAperture64(operand.Value));
+            }
+
             // Scalar inline negative constants are signed immediates. B64
             // consumers sign-extend them, so -1 denotes a full 64-bit mask.
             if (operand.Kind == Gen5OperandKind.EncodedConstant &&

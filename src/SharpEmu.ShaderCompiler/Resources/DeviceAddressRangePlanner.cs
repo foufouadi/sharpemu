@@ -46,6 +46,17 @@ public static class DeviceAddressRangePlanner
                 continue;
             }
 
+            // A FLAT address built from an aperture base is an LDS or scratch
+            // pointer; the backend routes it per lane, so it owns no device range.
+            if (memory.Kind == MemoryResourceKind.Flat)
+            {
+                memory.AddressSpace = ClassifyFlatAddress(handle.Operands[1]);
+                if (memory.AddressSpace != FlatAddressSpace.Global)
+                {
+                    continue;
+                }
+            }
+
             var slot = handles.FindIndex(existing => plan.Graph.Equivalent(existing, handle));
             if (slot < 0)
             {
@@ -77,6 +88,46 @@ public static class DeviceAddressRangePlanner
         }
 
         return ranges;
+    }
+
+    // The hardware compares only bits 63:48 of a FLAT address with the apertures,
+    // and shaders commonly merge an aperture into the upper half of an otherwise
+    // computed high dword (SDWA WORD1). Any aperture reaching the high dword
+    // therefore marks the address as local.
+    private static FlatAddressSpace ClassifyFlatAddress(ScalarValue high)
+    {
+        var shared = false;
+        var @private = false;
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(high);
+        while (pending.TryPop(out var value))
+        {
+            if (!visited.Add(value))
+            {
+                continue;
+            }
+
+            if (value.Kind == ScalarValueKind.MemoryAperture)
+            {
+                if (Gen5InlineConstants.IsSharedAperture((uint)value.Payload))
+                    shared = true;
+                else
+                    @private = true;
+                continue;
+            }
+
+            foreach (var operand in value.Operands)
+                pending.Push(operand);
+        }
+
+        return (shared, @private) switch
+        {
+            (true, true) => FlatAddressSpace.SharedOrPrivate,
+            (true, false) => FlatAddressSpace.Shared,
+            (false, true) => FlatAddressSpace.Private,
+            _ => FlatAddressSpace.Global,
+        };
     }
 
     // An access is bounded when its only run-time term is the record's immediate offset:

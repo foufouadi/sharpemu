@@ -9,13 +9,40 @@ namespace SharpEmu.ShaderCompiler;
 /// </summary>
 public static class Gen5InlineConstants
 {
+    public const uint SharedBase = 235;
+    public const uint SharedLimit = 236;
+    public const uint PrivateBase = 237;
+    public const uint PrivateLimit = 238;
+
+    // A FLAT address selects LDS or scratch when its bits 63:48 match an aperture
+    // (SH_MEM_BASES); every other address is global. The emulator picks apertures
+    // no guest device address can reach (guest addresses fit in 40 bits).
+    public const uint SharedApertureHigh = 0x8000_0000;
+    public const uint PrivateApertureHigh = 0x4000_0000;
+
+    public static bool IsAperture(uint encoded) => encoded is >= SharedBase and <= PrivateLimit;
+
+    public static bool IsSharedAperture(uint encoded) => encoded is SharedBase or SharedLimit;
+
+    // The 64-bit aperture value: a base has a zero low dword, a limit spans the
+    // whole 32-bit offset range. A 32-bit read returns the high dword.
+    public static ulong DecodeAperture64(uint encoded)
+    {
+        var high = IsSharedAperture(encoded) ? SharedApertureHigh : PrivateApertureHigh;
+        var low = encoded is SharedLimit or PrivateLimit ? uint.MaxValue : 0u;
+        return ((ulong)high << 32) | low;
+    }
+
     public static bool TryDecode(uint encoded, out uint value)
     {
-        // GFX10 scalar sources 235..239 expose the LDS/private base and limit
-        // hardware registers.  The emulator's compute address space starts LDS
-        // at zero, so these control sources have a deterministic zero value until
-        // explicit LDS base modelling is needed.
-        if (encoded is >= 235 and <= 239)
+        if (IsAperture(encoded))
+        {
+            value = (uint)(DecodeAperture64(encoded) >> 32);
+            return true;
+        }
+
+        // POPS_EXITING_WAVE_ID: no primitive-ordered pixel shading is modeled.
+        if (encoded == 239)
         {
             value = 0;
             return true;

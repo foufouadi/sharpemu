@@ -885,6 +885,11 @@ public static partial class Gen5SpirvTranslator
 
             address = IAdd64(address, SignedOffset64(control.OffsetBytes));
             var entry = request.Memory[memoryIndex];
+            if (control.UsesFlatAddress && entry.AddressSpace != FlatAddressSpace.Global)
+            {
+                return TryEmitFlatLocalMemory(instruction, control, memoryOpcode, entry.AddressSpace, address, out error);
+            }
+
             var writes = entry.Access is MemoryAccess.Write or MemoryAccess.Atomic;
             var accessBytes = Math.Max((entry.DataBits + 7) / 8, 1u) * Math.Max(entry.DataDwords, 1u);
             var allowed = writes ? IsWrittenAccessAllowed(memoryIndex, address, accessBytes) : _module.ConstantBool(true);
@@ -963,6 +968,98 @@ public static partial class Gen5SpirvTranslator
                 }
             });
 
+            return true;
+        }
+
+        // Routes each lane of an aperture-derived FLAT access like the hardware: LDS or
+        // scratch at the low dword when the high dword is in an aperture, otherwise a
+        // global access through the page table.
+        private bool TryEmitFlatLocalMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5GlobalMemoryControl control,
+            string memoryOpcode,
+            FlatAddressSpace addressSpace,
+            uint address,
+            out string error)
+        {
+            error = string.Empty;
+            var store = memoryOpcode.StartsWith("GlobalStoreDword", StringComparison.Ordinal);
+            var load = memoryOpcode.StartsWith("GlobalLoadDword", StringComparison.Ordinal);
+            if (!store && !load)
+            {
+                error = $"{instruction.Opcode} through the {addressSpace} flat aperture is not implemented";
+                return false;
+            }
+
+            var canShare = addressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate;
+            var canPrivate = addressSpace is FlatAddressSpace.Private or FlatAddressSpace.SharedOrPrivate;
+            if (canShare && _lds == 0)
+            {
+                error = "a shared flat aperture access has no LDS storage";
+                return false;
+            }
+
+            if (canPrivate && (_scratch == 0 || _scratchDwordCount == 0))
+            {
+                error = "a private flat aperture access has no scratch storage";
+                return false;
+            }
+
+            var offset = _module.AddInstruction(SpirvOp.UConvert, _uintType, address);
+            var aperture = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(address, _module.Constant64(_ulongType, 48)));
+            var isShared = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture, UInt(Gen5InlineConstants.SharedApertureHigh >> 16));
+            var isPrivate = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture, UInt(Gen5InlineConstants.PrivateApertureHigh >> 16));
+
+            void Shared()
+            {
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var pointer = LdsPointer(offset, index * sizeof(uint));
+                    if (store)
+                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
+                }
+            }
+
+            void Private()
+            {
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var pointer = ScratchPointer(offset, index * sizeof(uint));
+                    if (store)
+                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
+                }
+            }
+
+            void Global()
+            {
+                var aligned = And64(address, ULong(~3ul));
+                for (uint index = 0; index < control.DwordCount; index++)
+                {
+                    var dwordAddress = index == 0 ? aligned : IAdd64(aligned, ULong((ulong)index * sizeof(uint)));
+                    if (store)
+                        StoreDeviceDword(dwordAddress, LoadV(control.SourceVectorRegister + index), _module.ConstantBool(true));
+                    else
+                        StoreV(control.DestinationVectorRegister + index, LoadDeviceDword(dwordAddress));
+                }
+            }
+
+            // Inactive lanes must not touch any of the three storages.
+            EmitExecConditional(() =>
+            {
+                if (canShare && canPrivate)
+                    EmitConditional(isShared, Shared, () => EmitConditional(isPrivate, Private, Global));
+                else if (canShare)
+                    EmitConditional(isShared, Shared, Global);
+                else
+                    EmitConditional(isPrivate, Private, Global);
+            });
             return true;
         }
 

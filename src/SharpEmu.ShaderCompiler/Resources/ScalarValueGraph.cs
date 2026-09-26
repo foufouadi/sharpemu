@@ -61,6 +61,8 @@ public sealed partial class ScalarValueGraph
     // constants fold, so revisiting a block reproduces its values exactly.
     internal ScalarValue Constant(uint value) => Intern($"c32:{value}", () => ScalarValue.ConstantOf(value));
 
+    internal ScalarValue MemoryAperture(uint operand) => Intern($"aperture:{operand}", () => ScalarValue.MemoryAperture(operand));
+
     internal ScalarValue Constant(ulong value) => Intern($"c64:{value}", () => ScalarValue.ConstantOf(value));
 
     internal ScalarValue Constant(bool value) => Intern($"c1:{value}", () => ScalarValue.ConstantOf(value));

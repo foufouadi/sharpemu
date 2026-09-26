@@ -1558,6 +1558,13 @@ public sealed partial class ScalarValueGraph
                             return _graph.Select(state.Scc, _graph.Constant(1u), _graph.Constant(0u));
                     }
 
+                    // An aperture keeps its identity: a FLAT address built from it
+                    // targets LDS or scratch, not the device-address page table.
+                    if (Gen5InlineConstants.IsAperture(operand.Value))
+                    {
+                        return _graph.MemoryAperture(operand.Value);
+                    }
+
                     return Gen5InlineConstants.TryDecode(operand.Value, out var value)
                         ? _graph.Constant(value)
                         : _graph.Undefined(ScalarValueType.U32);
@@ -1574,6 +1581,14 @@ public sealed partial class ScalarValueGraph
             if (operand.Kind == Gen5OperandKind.ScalarRegister)
             {
                 return (state.Read(operand.Value), state.Read(operand.Value + 1));
+            }
+
+            if (operand.Kind == Gen5OperandKind.EncodedConstant && Gen5InlineConstants.IsAperture(operand.Value))
+            {
+                // A 64-bit aperture read: the offset dword is a constant, the high
+                // dword carries the aperture.
+                return (_graph.Constant((uint)Gen5InlineConstants.DecodeAperture64(operand.Value)),
+                    _graph.MemoryAperture(operand.Value));
             }
 
             var low = Read(operand, state);

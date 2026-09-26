@@ -623,7 +623,9 @@ public static partial class Gen5SpirvTranslator
         private void DeclareScratch()
         {
             if (!_request.Program.Instructions.Any(static instruction =>
-                    instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal)))
+                    instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal)) &&
+                !_request.Memory.Entries.Any(static memory =>
+                    memory.AddressSpace is FlatAddressSpace.Private or FlatAddressSpace.SharedOrPrivate))
             {
                 return;
             }
@@ -7304,7 +7306,9 @@ public static partial class Gen5SpirvTranslator
 
         private bool UsesLds() =>
             _request.Program.Instructions.Any(instruction =>
-                instruction.Control is Gen5DataShareControl);
+                instruction.Control is Gen5DataShareControl) ||
+            _request.Memory.Entries.Any(static memory =>
+                memory.AddressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate);
 
         private bool UsesSubgroupShuffle() =>
             _request.Program.Instructions.Any(instruction =>

@@ -116,6 +116,9 @@ public sealed class RuntimeValueEvaluator
         {
             case ScalarValueKind.Undefined:
                 return false;
+            case ScalarValueKind.MemoryAperture:
+                result = Gen5InlineConstants.DecodeAperture64((uint)value.Payload) >> 32;
+                return true;
             case ScalarValueKind.UserData:
             {
                 var register = value.UserDataRegister;

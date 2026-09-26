@@ -90,6 +90,7 @@ public sealed class RuntimeValueValidator
             case ScalarValueKind.UserData:
                 return value.UserDataRegister >= _userDataBase && value.UserDataRegister - _userDataBase < _userDataCount;
             case ScalarValueKind.ShaderBase:
+            case ScalarValueKind.MemoryAperture:
                 return true;
             case ScalarValueKind.Phi:
             {
