@@ -14,11 +14,18 @@ public static class Gen5InlineConstants
     public const uint PrivateBase = 237;
     public const uint PrivateLimit = 238;
 
-    // A FLAT address selects LDS or scratch when its bits 63:48 match an aperture
-    // (SH_MEM_BASES); every other address is global. The emulator picks apertures
-    // no guest device address can reach (guest addresses fit in 40 bits).
-    public const uint SharedApertureHigh = 0x8000_0000;
-    public const uint PrivateApertureHigh = 0x4000_0000;
+    // The PS5 FLAT apertures, as title shaders hard-code them: a high dword of
+    // 0x7xxxxxxx selects LDS and 0x8xxxxxxx scratch. Guest device addresses fit in
+    // 40 bits and never reach them.
+    public const uint SharedApertureHigh = 0x7000_0000;
+    public const uint PrivateApertureHigh = 0x8000_0000;
+
+    // Each aperture is the window of high dwords sharing its top nibble.
+    public const int ApertureShift = 28;
+
+    public static bool IsSharedApertureHigh(uint high) => high >> ApertureShift == SharedApertureHigh >> ApertureShift;
+
+    public static bool IsPrivateApertureHigh(uint high) => high >> ApertureShift == PrivateApertureHigh >> ApertureShift;
 
     public static bool IsAperture(uint encoded) => encoded is >= SharedBase and <= PrivateLimit;
 

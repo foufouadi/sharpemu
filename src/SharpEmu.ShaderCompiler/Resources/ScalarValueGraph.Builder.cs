@@ -1202,6 +1202,15 @@ public sealed partial class ScalarValueGraph
                     return Binary(ScalarOperation.UMax32, Source(0), Source(1));
                 case "VMinI32":
                     return Binary(ScalarOperation.SMin32, Source(0), Source(1));
+                case "VMed3U32":
+                    // median(a, b, c) = max(min(a, b), min(max(a, b), c))
+                    return Binary(ScalarOperation.UMax32,
+                        Binary(ScalarOperation.UMin32, Source(0), Source(1)),
+                        Binary(ScalarOperation.UMin32, Binary(ScalarOperation.UMax32, Source(0), Source(1)), Source(2)));
+                case "VMed3I32":
+                    return Binary(ScalarOperation.SMax32,
+                        Binary(ScalarOperation.SMin32, Source(0), Source(1)),
+                        Binary(ScalarOperation.SMin32, Binary(ScalarOperation.SMax32, Source(0), Source(1)), Source(2)));
                 case "VMaxI32":
                     return Binary(ScalarOperation.SMax32, Source(0), Source(1));
                 case "VBfeU32":
@@ -1491,7 +1500,8 @@ public sealed partial class ScalarValueGraph
                         AddressHandleOf(global, state),
                         null,
                         null,
-                        global.UsesFlatAddress ? null : state.ReadVector(global.VectorAddress)),
+                        global.UsesFlatAddress ? null : state.ReadVector(global.VectorAddress),
+                        state.Exec),
                     _ => null,
                 };
 

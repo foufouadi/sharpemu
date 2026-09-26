@@ -1009,9 +1009,11 @@ public static partial class Gen5SpirvTranslator
             var aperture = _module.AddInstruction(
                 SpirvOp.UConvert,
                 _uintType,
-                ShiftRightLogical64(address, _module.Constant64(_ulongType, 48)));
-            var isShared = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture, UInt(Gen5InlineConstants.SharedApertureHigh >> 16));
-            var isPrivate = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture, UInt(Gen5InlineConstants.PrivateApertureHigh >> 16));
+                ShiftRightLogical64(address, _module.Constant64(_ulongType, 32 + Gen5InlineConstants.ApertureShift)));
+            var isShared = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture,
+                UInt(Gen5InlineConstants.SharedApertureHigh >> Gen5InlineConstants.ApertureShift));
+            var isPrivate = _module.AddInstruction(SpirvOp.IEqual, _boolType, aperture,
+                UInt(Gen5InlineConstants.PrivateApertureHigh >> Gen5InlineConstants.ApertureShift));
 
             void Shared()
             {

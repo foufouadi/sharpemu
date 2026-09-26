@@ -78,7 +78,8 @@ public sealed class ShaderResourcePlan
                 access.Handle is null ? null : Rewrite(access.Handle),
                 access.SamplerHandle is null ? null : Rewrite(access.SamplerHandle),
                 access.Read is null ? null : (reads.Replacements.ContainsKey(access.Read) ? RewriteRead(access.Read) : Rewrite(access.Read)),
-                access.Offset is null ? null : Rewrite(access.Offset));
+                access.Offset is null ? null : Rewrite(access.Offset),
+                access.Active is null ? null : Rewrite(access.Active));
         }
 
         // Diagnostics observe rewritten values before descriptor validation.

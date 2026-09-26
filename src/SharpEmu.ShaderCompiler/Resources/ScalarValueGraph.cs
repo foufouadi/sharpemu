@@ -8,7 +8,10 @@ namespace SharpEmu.ShaderCompiler.Resources;
 
 // The graph values one memory access reads its descriptor from: the handles, the read
 // node of a scalar load, and the uniform vector offset of a global access.
-public sealed record MemoryAccessBinding(ScalarValue? Handle, ScalarValue? SamplerHandle, ScalarValue? Read, ScalarValue? Offset = null);
+// Active is the EXEC mask the access runs under: a lane outside it performs no access,
+// so a lane-masked register write under the same mask contributes only its new value.
+public sealed record MemoryAccessBinding(ScalarValue? Handle, ScalarValue? SamplerHandle, ScalarValue? Read, ScalarValue? Offset = null,
+    ScalarValue? Active = null);
 
 // The uniform value graph of one program: every value a descriptor can be assembled
 // from, symbolic in user data and in the shader base.
