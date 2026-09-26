@@ -655,13 +655,6 @@ public static partial class Gen5SpirvTranslator
         // width <= size, address >= base, address - base <= size - width.
         private uint IsWrittenAccessAllowed(int memoryIndex, uint address64, uint widthBytes)
         {
-            if (_request.UnplannableWrittenMemoryIndices.Contains(memoryIndex))
-            {
-                // The address is computed per lane and cannot be evaluated by the
-                // host. ResolveDeviceAddress below remains the safety boundary.
-                return _module.ConstantBool(true);
-            }
-
             if (!_request.WrittenRangeSlotByMemoryIndex.TryGetValue(memoryIndex, out var slot))
             {
                 return _module.ConstantBool(false);

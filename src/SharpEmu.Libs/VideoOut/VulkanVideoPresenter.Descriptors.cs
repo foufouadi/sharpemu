@@ -477,9 +477,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!range.Planned)
                 {
-                    // Per-lane computed writes are validated by the shader's page
-                    // table lookup. There is no host range to pre-map here.
-                    continue;
+                    if (!range.Written) continue;
+                    throw SubmissionScheduler.Fatal($"A written device-address range cannot be planned: handle={range.Handle} hash=0x{program.Hash:X16}.");
                 }
 
                 if (range.Size == 0)
