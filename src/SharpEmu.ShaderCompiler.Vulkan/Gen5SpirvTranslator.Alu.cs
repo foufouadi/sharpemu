@@ -458,6 +458,39 @@ public static partial class Gen5SpirvTranslator
                         instruction,
                         Ext(32, _floatType, GetFloatSource(instruction, 0)));
                     break;
+                case "VRcpF16":
+                    result = EmitFloat16Result(instruction, destination, _module.AddInstruction(SpirvOp.FDiv, _floatType, Float(1), GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSqrtF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(31, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VLogF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(30, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VExpF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(29, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VFloorF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(8, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VCeilF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(9, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VTruncF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(3, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VRndneF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(2, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VFractF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(10, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSinF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(13, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
+                    break;
+                case "VCosF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(14, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
+                    break;
                 case "VRsqF16":
                     result = EmitFloat16Result(
                         instruction,
