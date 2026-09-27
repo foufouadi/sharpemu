@@ -79,6 +79,26 @@ public sealed class Gen5Float16ArithmeticTests
         Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
     }
 
+    [Theory]
+    [InlineData(0x351u, "VMin3F16")]
+    [InlineData(0x354u, "VMax3F16")]
+    [InlineData(0x357u, "VMed3F16")]
+    public void Vop3Float16ThreeOperandMinMaxDecodesAndCompiles(uint opcode, string name)
+    {
+        // Silent Hill's pixel shaders use v_min3_f16.
+        var program = Decode(
+        [
+            (0x35u << 26) | (opcode << 16) | 122u,
+            261u | (262u << 9) | (263u << 18),
+            SEndpgm,
+        ]);
+
+        Assert.Equal(name, program.Instructions[0].Opcode);
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.DoesNotContain((ushort)SpirvCapability.Float16, ReadCapabilities(shader.Spirv));
+    }
+
     [Fact]
     public void Vop3Float16FmaDecodesAndCompiles()
     {

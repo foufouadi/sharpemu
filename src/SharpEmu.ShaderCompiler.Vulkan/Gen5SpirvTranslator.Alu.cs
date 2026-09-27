@@ -657,6 +657,24 @@ public static partial class Gen5SpirvTranslator
                         Bitcast(_floatType, EmitClampToUnitInterval(Bitcast(_uintType, dot))));
                     break;
                 }
+                case "VMin3F16":
+                case "VMax3F16":
+                case "VMed3F16":
+                {
+                    // Every f16 value widens to f32 exactly, and min/max pick one
+                    // input, so the f32 result narrows back without rounding.
+                    var a = GetFloat16Source(instruction, 0);
+                    var b = GetFloat16Source(instruction, 1);
+                    var c = GetFloat16Source(instruction, 2);
+                    var value = instruction.Opcode switch
+                    {
+                        "VMin3F16" => Ext(37, _floatType, Ext(37, _floatType, a, b), c),
+                        "VMax3F16" => Ext(40, _floatType, Ext(40, _floatType, a, b), c),
+                        _ => Ext(40, _floatType, Ext(37, _floatType, a, b), Ext(37, _floatType, Ext(40, _floatType, a, b), c)),
+                    };
+                    result = EmitFloat16Result(instruction, destination, value);
+                    break;
+                }
                 case "VMin3F32":
                     result = EmitFloatTernaryExt(instruction, 37);
                     break;
