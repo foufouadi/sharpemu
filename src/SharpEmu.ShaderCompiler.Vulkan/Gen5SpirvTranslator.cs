@@ -1521,7 +1521,8 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Control is Gen5RayIntersectControl rayIntersect)
             {
-                EmitRayIntersectMiss(rayIntersect);
+                _deviceAddressInstructionPc = instruction.Pc;
+                EmitRayIntersect(rayIntersect, instruction.Opcode == "ImageBvh64IntersectRay");
                 return true;
             }
 
@@ -4213,48 +4214,12 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // BVH nodes are not traversed yet: every ray misses the node it is tested against.
-        // The node type sits in the low three bits of the node pointer. A box node (4-7)
-        // returns four invalid child pointers, a triangle node (0-3) returns t = +inf over
-        // a denominator of 1, so the guest's traversal loop ends with no hit.
-        private void EmitRayIntersectMiss(Gen5RayIntersectControl ray)
-        {
-            var nodeType = BitwiseAnd(LoadV(ray.GetAddressRegister(0)), UInt(7));
-            var isTriangle = _module.AddInstruction(SpirvOp.ULessThan, _boolType, nodeType, UInt(4));
-            uint[] triangleMiss = [0x7F800000u, 0x3F800000u, 0u, 0u];
-            for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
-            {
-                var value = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    isTriangle,
-                    UInt(triangleMiss[component]),
-                    UInt(0xFFFFFFFFu));
-                StoreV(ray.VectorData + component, value);
-            }
-        }
-
         private bool TryEmitImage(
             Gen5ShaderInstruction instruction,
             Gen5ImageControl image,
             out string error)
         {
             error = string.Empty;
-            if (instruction.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")
-            {
-                // The host path does not expose Vulkan ray-query or an
-                // acceleration-structure descriptor for GFX10's raw BVH
-                // texture. Return a deterministic miss instead of rejecting
-                // the complete compute shader. The instruction always writes
-                // four DWORD result registers.
-                for (uint component = 0; component < 4; component++)
-                {
-                    StoreV(image.VectorData + component, UInt(0));
-                }
-
-                return true;
-            }
-
             SpirvImageResource resource;
             uint imageObject;
             uint dstSelect;

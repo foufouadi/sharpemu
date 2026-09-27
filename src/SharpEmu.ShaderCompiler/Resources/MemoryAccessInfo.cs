@@ -295,9 +295,8 @@ public sealed class MemoryAccessTable
         var opcode = instruction.Opcode;
         if (opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")
         {
-            // The current backends return a deterministic miss for raw GFX10
-            // BVH traversal. Do not materialize its descriptor as a texture;
-            // BVH descriptors do not use the regular image descriptor layout.
+            // A BVH T# is not an image descriptor: the backend reads the nodes
+            // through device addresses, so nothing is materialized here.
             return new MemoryAccessInfo
             {
                 Pc = instruction.Pc,

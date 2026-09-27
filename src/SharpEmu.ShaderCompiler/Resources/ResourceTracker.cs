@@ -837,6 +837,14 @@ public sealed partial class ResourceTracker
         var isBuffer = memory.Kind is MemoryResourceKind.Buffer or MemoryResourceKind.ScalarBuffer;
         var isAddress = memory.Kind is MemoryResourceKind.ScalarAddress or MemoryResourceKind.Flat or MemoryResourceKind.Global or MemoryResourceKind.Scratch;
         var isImage = memory.Kind == MemoryResourceKind.Image;
+        if (memory.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")
+        {
+            // BVH nodes are read through the device-address page table: traversal
+            // reaches bottom-level trees whose bases only exist in guest memory.
+            _info.UsesDeviceAddresses = true;
+            return;
+        }
+
         if (!isBuffer && !isAddress && !isImage)
         {
             return;
