@@ -263,7 +263,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!ResolveTopology(userConfig, autoDraw: true, out var topology))
+        if (!ResolveTopology(userConfig, autoDraw: true, out var topology, arguments.VertexCount))
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
             _host.ResetBindings();
@@ -478,7 +478,9 @@ public sealed partial class RenderExecutor
         return mode is ColorModeEliminateFastClear or ColorModeFmaskDecompress or ColorModeDccDecompress;
     }
 
-    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology)
+    private static bool IsLegacyRectangleBatch(uint vertexCount) => vertexCount > 3 && vertexCount % 3 == 0;
+
+    public bool ResolveTopology(UserConfigRegisters userConfig, bool autoDraw, out PrimitiveTopology topology, uint vertexCount = 3)
     {
         topology = PrimitiveTopology.PointList;
         switch ((GuestPrimitiveType)userConfig.PrimitiveType)
@@ -513,7 +515,9 @@ public sealed partial class RenderExecutor
                     throw _host.Fatal($"The primitive type is unknown for an indexed draw: primitiveType={userConfig.PrimitiveType}.");
                 }
 
-                topology = PrimitiveTopology.TriangleStrip;
+                // Several rectangles take the rectangle-list path, which derives each
+                // fourth corner from three vertices like the hardware.
+                topology = IsLegacyRectangleBatch(vertexCount) ? PrimitiveTopology.PatchList : PrimitiveTopology.TriangleStrip;
                 break;
             case GuestPrimitiveType.QuadListLegacy:
                 topology = PrimitiveTopology.TriangleFan;
