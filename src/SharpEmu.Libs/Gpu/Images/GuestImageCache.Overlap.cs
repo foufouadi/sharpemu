@@ -349,6 +349,11 @@ public sealed partial class GuestImageCache
             case ImageRole.Texture:
                 recreate |= requested.IsDepth && !cachedInfo.IsDepth;
                 recreate |= rawD16Texture;
+                // A color texture that reads neither the depth nor the stencil plane
+                // reinterprets the memory as color, so its bytes move to a color image.
+                recreate |= cachedInfo.IsDepth && !requested.IsDepth &&
+                            !ViewFormatRules.IsDepthCompatible(requested.PixelFormat) &&
+                            !ViewFormatRules.IsStencilViewFormat(requested.PixelFormat);
                 break;
             case ImageRole.StorageImage:
             case ImageRole.ColorTarget:
