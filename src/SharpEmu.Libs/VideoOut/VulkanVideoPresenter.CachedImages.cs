@@ -289,49 +289,19 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var resolution = target.Resolution;
-            switch ((byte)metadataValue)
+            var code = (byte)metadataValue;
+            if (code == 0x20)
             {
-                case 0x00:
-                    break;
-                case 0x20:
-                    if (!resolution.MetadataClearSupported)
-                    {
-                        return false;
-                    }
-
-                    clearValue = resolution.ColorClearValue;
-                    break;
-                case 0x40:
-                    if (!resolution.MetadataFixedClearSupported)
-                    {
-                        return false;
-                    }
-
-                    clearValue.Float32_3 = 1f;
-                    break;
-                case 0x80:
-                    if (!resolution.MetadataFixedClearSupported)
-                    {
-                        return false;
-                    }
-
-                    clearValue.Float32_0 = 1f;
-                    clearValue.Float32_1 = 1f;
-                    clearValue.Float32_2 = 1f;
-                    break;
-                case 0xc0:
-                    if (!resolution.MetadataFixedClearSupported)
-                    {
-                        return false;
-                    }
-
-                    clearValue.Float32_0 = 1f;
-                    clearValue.Float32_1 = 1f;
-                    clearValue.Float32_2 = 1f;
-                    clearValue.Float32_3 = 1f;
-                    break;
-                default:
+                if (!resolution.MetadataClearSupported)
+                {
                     return false;
+                }
+
+                clearValue = resolution.ColorClearValue;
+            }
+            else if (code != 0x00 && (!resolution.MetadataFixedClearSupported || !ImageRequestBuilders.TryFixedDccClearValue(code, out clearValue)))
+            {
+                return false;
             }
 
             for (uint layer = 1; layer < view.LayerCount; layer++)

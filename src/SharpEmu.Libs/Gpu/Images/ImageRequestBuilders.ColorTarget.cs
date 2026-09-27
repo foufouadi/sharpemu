@@ -46,16 +46,40 @@ public static partial class ImageRequestBuilders
     {
         ClearColorValue value = default;
         var supported = hasDcc && PackedClearValue.TryDecodeColor(format, packedClear, out value);
-        var fixedSupported = hasDcc && format switch
+        return (supported, hasDcc && IsFixedDccClearFormat(format), supported ? value : default);
+    }
+
+    // Formats whose DCC encodes the fixed clear colors (0x00, 0x40, 0x80, 0xC0).
+    public static bool IsFixedDccClearFormat(Format format) => format switch
+    {
+        Format.R8Unorm or Format.R8G8Unorm or Format.R8G8B8A8Unorm or Format.R8G8B8A8Srgb or Format.B8G8R8A8Unorm or Format.B8G8R8A8Srgb or
+        Format.A2B10G10R10UnormPack32 or Format.A2R10G10B10UnormPack32 or Format.R5G6B5UnormPack16 or Format.A1R5G5B5UnormPack16 or
+        Format.R4G4B4A4UnormPack16 or Format.R16Unorm or Format.R16G16Unorm or Format.R16G16B16A16Unorm or Format.R16Sfloat or
+        Format.R16G16Sfloat or Format.R16G16B16A16Sfloat or Format.R32Sfloat or Format.R32G32Sfloat or Format.R32G32B32A32Sfloat or
+        Format.B10G11R11UfloatPack32 => true,
+        _ => false,
+    };
+
+    // The color a fixed DCC clear code decompresses to; the register code (0x20) is not fixed.
+    public static bool TryFixedDccClearValue(byte code, out ClearColorValue value)
+    {
+        value = default;
+        switch (code)
         {
-            Format.R8Unorm or Format.R8G8Unorm or Format.R8G8B8A8Unorm or Format.R8G8B8A8Srgb or Format.B8G8R8A8Unorm or Format.B8G8R8A8Srgb or
-            Format.A2B10G10R10UnormPack32 or Format.A2R10G10B10UnormPack32 or Format.R5G6B5UnormPack16 or Format.A1R5G5B5UnormPack16 or
-            Format.R4G4B4A4UnormPack16 or Format.R16Unorm or Format.R16G16Unorm or Format.R16G16B16A16Unorm or Format.R16Sfloat or
-            Format.R16G16Sfloat or Format.R16G16B16A16Sfloat or Format.R32Sfloat or Format.R32G32Sfloat or Format.R32G32B32A32Sfloat or
-            Format.B10G11R11UfloatPack32 => true,
-            _ => false,
-        };
-        return (supported, fixedSupported, supported ? value : default);
+            case 0x00:
+                return true;
+            case 0x40:
+                value.Float32_3 = 1f;
+                return true;
+            case 0x80:
+                value.Float32_0 = value.Float32_1 = value.Float32_2 = 1f;
+                return true;
+            case 0xc0:
+                value.Float32_0 = value.Float32_1 = value.Float32_2 = value.Float32_3 = 1f;
+                return true;
+            default:
+                return false;
+        }
     }
 
     // Builds the request for a bound color target. Null when the slot carries no target.

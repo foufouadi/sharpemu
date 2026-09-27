@@ -603,6 +603,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     binding.MipViews = [];
                 }
 
+                var descriptor = new TextureDescriptorWords(snapshot.Images[index]);
+                if (descriptor.MetadataCompress)
+                {
+                    _imageCache.ApplyPendingDccClear(binding.ImageIdentifier, descriptor.MetadataAddress << 8);
+                }
+
                 image.Uses.Storage |= binding.IsStorage;
                 image.Uses.Texture |= !binding.IsStorage;
                 binding.CachedImage = image;

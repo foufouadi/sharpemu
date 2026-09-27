@@ -351,5 +351,23 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(3, fatal.Messages.Count);
     }
 
+    [Theory]
+    [InlineData(0x00, 0f, 0f, 0f, 0f)]
+    [InlineData(0x40, 0f, 0f, 0f, 1f)]
+    [InlineData(0x80, 1f, 1f, 1f, 0f)]
+    [InlineData(0xc0, 1f, 1f, 1f, 1f)]
+    public void FixedDccClearCodes_DecompressToTheirColor(byte code, float r, float g, float b, float a)
+    {
+        Assert.True(ImageRequestBuilders.TryFixedDccClearValue(code, out var value));
+        Assert.Equal([r, g, b, a], [value.Float32_0, value.Float32_1, value.Float32_2, value.Float32_3]);
+    }
+
+    [Theory]
+    [InlineData(0x20)]
+    [InlineData(0x10)]
+    [InlineData(0xff)]
+    public void OtherDccCodes_AreNotFixedClears(byte code) =>
+        Assert.False(ImageRequestBuilders.TryFixedDccClearValue(code, out _));
+
     private readonly record struct GuestSpanCheck(ulong Address, ulong Size);
 }
