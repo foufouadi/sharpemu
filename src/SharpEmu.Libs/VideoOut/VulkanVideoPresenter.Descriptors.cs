@@ -440,7 +440,7 @@ internal static unsafe partial class VulkanVideoPresenter
             memoryOffset = (uint)adjustment;
             if (resource.Formatted && resource.Written)
             {
-                _imageCache.InvalidateMemoryForBoundWrite(address, size);
+                _imageCache.InvalidateMemoryFromGpu(address, size);
             }
 
             return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
