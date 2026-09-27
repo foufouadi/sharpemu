@@ -67,6 +67,7 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+        bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
 
