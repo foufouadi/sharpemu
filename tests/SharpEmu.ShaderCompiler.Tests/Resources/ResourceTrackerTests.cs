@@ -642,7 +642,7 @@ public sealed class ResourceTrackerTests
     }
 
     [Fact]
-    public void ResourceLimits_FailBeforeAnyTableIsWritten()
+    public void BuffersPastTheBindingBudget_ReadTheirDescriptorsOnTheDevice()
     {
         var instructions = new List<Gen5ShaderInstruction>();
         uint pc = 0;
@@ -659,8 +659,11 @@ public sealed class ResourceTrackerTests
         }
 
         instructions.Add(EndProgram(pc));
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(Program([.. instructions])));
-        Assert.Contains("buffer resource limit exceeded", error.Message);
+        var plan = Extract(Program([.. instructions]));
+
+        Assert.Equal(ShaderResourceInfo.MaxBuffers, plan.Info.Buffers.Count);
+        Assert.True(plan.Info.UsesDeviceAddresses);
+        Assert.Single(plan.Memory.Entries, memory => memory.DeviceDescriptor);
     }
 
     [Fact]

@@ -967,7 +967,18 @@ public sealed partial class ResourceTracker
             var resource = AddBuffer(source, memory, memory.Pc);
             if (resource == DescriptorConstants.NoIndex)
             {
-                throw Failure(memory.Pc, "buffer resource limit exceeded");
+                // Past the binding budget the access reads its V# from its SGPRs when it
+                // runs, as the hardware does, and goes through the device-address table.
+                // That path has no typed (tbuffer) or formatted store lowering.
+                if (memory.Opcode.StartsWith("TBuffer", StringComparison.Ordinal) ||
+                    (memory.Formatted && memory.Access != MemoryAccess.Read))
+                {
+                    throw Failure(memory.Pc, "buffer resource limit exceeded");
+                }
+
+                memory.DeviceDescriptor = true;
+                _info.UsesDeviceAddresses = true;
+                return;
             }
 
             memory.BufferDescriptor = new GuestBufferDescriptor
