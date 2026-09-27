@@ -19,6 +19,7 @@ public sealed partial class RenderExecutor
     private const uint DispatchInitiatorKnownMask = DispatchInitiatorBaseBits | DispatchInitiatorModifierBits;
     private const uint ImageClearDispatchInitiator = 0x61;
     private const uint ImageClearWaveSize = 64;
+    private const uint Format32UInt = 20;
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
@@ -78,6 +79,12 @@ public sealed partial class RenderExecutor
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeMetadataClear(input))
+        {
+            _host.ResetBindings();
+            return;
+        }
+
+        if (indirectArgumentsAddress == 0 && TryConsumeConstantFill(input, groupsX, groupsY, groupsZ))
         {
             _host.ResetBindings();
             return;
@@ -291,6 +298,46 @@ public sealed partial class RenderExecutor
         }
 
         return new ComputeImageClear(descriptor, clear, size);
+    }
+
+    // A constant fill that covers a whole image or DCC metadata becomes a clear. Anything
+    // else, including a fill of plain buffer memory, runs as the guest wrote it.
+    private bool TryConsumeConstantFill(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ)
+    {
+        var program = input.Stage.Program!;
+        if (program.ConstantFill is not { } fill || program.UserDataBase != 0)
+        {
+            return false;
+        }
+
+        var userData = input.Stage.Resources.UserData;
+        if (fill.GroupScalarRegister != (uint)input.WorkgroupRegister || !input.GroupIdX || input.GroupIdY || input.GroupIdZ ||
+            input.ThreadsX != ImageClearWaveSize || input.ThreadsY != 1 || input.ThreadsZ != 1 || groupsY != 1 || groupsZ != 1 ||
+            fill.DestinationScalarResource + 4 > userData.Length || fill.SourceScalarResource + 4 > userData.Length)
+        {
+            return false;
+        }
+
+        var destination = BufferDescriptorWords.From(userData.AsSpan((int)fill.DestinationScalarResource, 4).ToArray());
+        var source = BufferDescriptorWords.From(userData.AsSpan((int)fill.SourceScalarResource, 4).ToArray());
+        Span<byte> valueBytes = stackalloc byte[sizeof(uint)];
+        if (destination.Format != Format32UInt || destination.Stride != sizeof(uint) || destination.SwizzleEnabled || destination.AddThreadId ||
+            (ulong)groupsX * input.ThreadsX != destination.RecordCount || source.RecordCount == 0 ||
+            !_host.TryReadGuest(source.Address, valueBytes))
+        {
+            return false;
+        }
+
+        var value = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(valueBytes);
+        var size = (ulong)destination.RecordCount * sizeof(uint);
+        var consumed = _host.TryClearImageFromBuffer(destination.Address, size, value) ||
+                       _host.TryAbsorbDccFill(destination.Address, size, value);
+        if (RenderTrace.Enabled && RenderTrace.MetadataClear())
+        {
+            RenderTrace.Write($"Constant fill: shader=0x{program.Hash:X16} address=0x{destination.Address:X16} size=0x{size:X} value=0x{value:X8} consumed={consumed}");
+        }
+
+        return consumed;
     }
 
     private bool TryConsumeImageClear(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
