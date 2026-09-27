@@ -1493,8 +1493,11 @@ public static partial class Gen5SpirvTranslator
             {
                 if (_stage == Gen5SpirvStage.Compute)
                 {
+                    // s_waitcnt vmcnt(0) + s_barrier also publishes buffer and image
+                    // stores to the workgroup: AcquireRelease over uniform, workgroup
+                    // and image memory.
                     var workgroup = UInt(2);
-                    var semantics = UInt(0x108);
+                    var semantics = UInt(0x8 | 0x40 | 0x100 | 0x800);
                     _module.AddStatement(
                         SpirvOp.ControlBarrier,
                         workgroup,
