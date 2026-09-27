@@ -143,7 +143,31 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Compare bits stay only on depth-compare samplers; a forced point sampler drops its filters.
-        private Sampler ResolveSampler(SamplerResource sampler, uint[] words, ShaderProgramInfo program, int index, ShaderStageResources stage)
+        // A sampler takes the numeric class of the views it samples; integer only when every
+        // paired view is integer, since a float view needs a float border and filtering.
+        private static bool SamplesIntegerViews(ShaderResourceInfo info, TextureResource[] images, int sampler)
+        {
+            var paired = false;
+            foreach (var pair in info.SampledPairs)
+            {
+                if (pair.Sampler != sampler || pair.Image >= images.Length || images[pair.Image].IsHostMovie)
+                {
+                    continue;
+                }
+
+                if (!ViewFormatRules.IsIntegerFormat(images[pair.Image].Request.View.Format))
+                {
+                    return false;
+                }
+
+                paired = true;
+            }
+
+            return paired;
+        }
+
+        private Sampler ResolveSampler(SamplerResource sampler, uint[] words, ShaderProgramInfo program, int index, ShaderStageResources stage,
+            bool integerView)
         {
             if (words.Length < 4)
             {
@@ -179,7 +203,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"user_data=[{string.Join(",", stage.Resources.UserData.Select(word => $"{word:X8}"))}]");
             }
 
-            return _samplerStore.GetSampler(descriptor);
+            return _samplerStore.GetSampler(descriptor, integerView);
         }
 
         // The guest textures the movie path matches; built only while a decoded frame is active.
@@ -231,7 +255,8 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Samplers = new Sampler[info.Samplers.Count];
             for (var index = 0; index < info.Samplers.Count; index++)
             {
-                descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage);
+                descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
+                    SamplesIntegerViews(info, descriptors.Images, index));
             }
 
             var shaderData = new uint[layout.ShaderDataDwordCount];
