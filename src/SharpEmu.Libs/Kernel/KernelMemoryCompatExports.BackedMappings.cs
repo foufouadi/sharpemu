@@ -259,7 +259,9 @@ public static partial class KernelMemoryCompatExports
             {
                 if (requested >= 0x10_0000_0000UL && requested < 0xFC_0000_0000UL &&
                     Interlocked.Exchange(ref _prtMapWarning, 1) == 0)
-                    Console.Error.WriteLine("[LOADER][WARN] Shared mapping cannot replace the reserved aperture.");
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Shared mapping cannot replace the reserved aperture: address=0x{requested:X16} size=0x{length:X} flags=0x{flags:X} " +
+                        $"regions=[{string.Join(",", GetMappingSlices(requested, length).Select(region => $"0x{region.Address:X}+0x{region.Length:X}:{(region.IsReserved ? "reserved" : region.IsDirect ? "direct" : region.IsFlexible ? "flexible" : "other")}:backed={space.IsBackedView(region.Address)}"))}].");
                 return false;
             }
             address = requested;

@@ -442,6 +442,13 @@ public static partial class AgcExports
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
+            // Both halves share one user-data block, so the fused USER_SGPR count is
+            // the larger of the two.
+            if (!MergeFusedUserScalarCount(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
             for (var occurrence = 0; occurrence < 2; occurrence++)
             {
                 if (!TryFindShaderRegister(ctx, fusedRegistersAddress, registerCount, SpiShaderPgmChksumGs, occurrence, out var fusedEntry) ||
@@ -1235,6 +1242,27 @@ public static partial class AgcExports
     private static bool IsFusedShaderHalfPair(byte frontType, byte backType) =>
         (frontType == GsFrontShaderType && backType == GsBackShaderType) ||
         (frontType == HsFrontShaderType && backType == HsBackShaderType);
+
+    private static uint UserScalarCount(uint rsrc2) => ((rsrc2 >> 1) & 0x1Fu) | (((rsrc2 >> 27) & 1u) << 5);
+
+    private static bool MergeFusedUserScalarCount(CpuContext ctx, ulong frontRegisters, int frontCount, ulong fusedRegisters, int fusedCount)
+    {
+        if (!TryFindShaderRegister(ctx, frontRegisters, frontCount, SpiShaderPgmRsrc2Gs, 0, out var frontEntry) ||
+            !TryFindShaderRegister(ctx, fusedRegisters, fusedCount, SpiShaderPgmRsrc2Gs, 0, out var fusedEntry))
+        {
+            return true;
+        }
+
+        if (!TryReadUInt32(ctx, frontEntry + sizeof(uint), out var front) ||
+            !TryReadUInt32(ctx, fusedEntry + sizeof(uint), out var fused))
+        {
+            return false;
+        }
+
+        var count = Math.Max(UserScalarCount(front), UserScalarCount(fused));
+        var merged = (fused & ~((0x1Fu << 1) | (1u << 27))) | ((count & 0x1Fu) << 1) | ((count >> 5) << 27);
+        return merged == fused || TryWriteUInt32(ctx, fusedEntry + sizeof(uint), merged);
+    }
 
     private static bool TryFindShaderRegister(
         CpuContext ctx,
