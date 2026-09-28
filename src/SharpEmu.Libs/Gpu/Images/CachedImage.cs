@@ -51,6 +51,7 @@ public sealed class ImageBacking
     public ImageAccessState State = ImageAccessState.Initial;
     public List<ImageAccessState>? SubresourceStates;
     public DeviceMemory Memory;
+    public ImageMemory Placement;
     public ulong AllocationSize;
 
     public bool Exists => Handle.Handle != 0;
@@ -98,7 +99,12 @@ public sealed unsafe partial class CachedImage : IDisposable
 
         Backing.Format = Description.PixelFormat;
         Backing.ImageType = HostImageType(Description.Type);
-        Backing.Extent = Description.Extent;
+        Backing.Extent = Description.FirstLevel == 0
+            ? Description.Extent
+            : new Extent3D(
+                Math.Max(Description.Extent.Width >> (int)Description.FirstLevel, 1u),
+                Math.Max(Description.Extent.Height >> (int)Description.FirstLevel, 1u),
+                Description.Extent.Depth);
         Backing.GuestPitch = Description.Pitch;
         Backing.Layers = Description.IsVolume ? 1 : Description.Resources.Layers;
         Backing.MipLevels = Description.Resources.Levels;
@@ -138,11 +144,6 @@ public sealed unsafe partial class CachedImage : IDisposable
         }
 
         vk.GetImageMemoryRequirements(device.Device, Backing.Handle, out var requirements);
-        var allocateInfo = new MemoryAllocateInfo
-        {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = requirements.Size,
-        };
         var allocated = Result.ErrorOutOfDeviceMemory;
         for (uint index = 0; index < device.MemoryTypeCount; index++)
         {
@@ -152,8 +153,7 @@ public sealed unsafe partial class CachedImage : IDisposable
                 continue;
             }
 
-            allocateInfo.MemoryTypeIndex = index;
-            allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
+            allocated = device.ImageMemory.Allocate(requirements, index, out Backing.Placement);
             if (allocated == Result.Success)
             {
                 break;
@@ -163,19 +163,19 @@ public sealed unsafe partial class CachedImage : IDisposable
         if (allocated != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
-            device.FreeMemory(Backing.Memory);
             Backing.Handle = default;
-            Backing.Memory = default;
             throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
         }
 
-        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, 0);
+        Backing.Memory = Backing.Placement.Memory;
+        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, Backing.Placement.Offset);
         if (bindResult != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
-            device.FreeMemory(Backing.Memory);
+            device.ImageMemory.Free(Backing.Placement);
             Backing.Handle = default;
             Backing.Memory = default;
+            Backing.Placement = default;
             throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size);
         }
 
@@ -548,9 +548,10 @@ public sealed unsafe partial class CachedImage : IDisposable
         if (Backing.Exists)
         {
             _device.Vk.DestroyImage(_device.Device, Backing.Handle, null);
-            _device.FreeMemory(Backing.Memory);
+            _device.ImageMemory.Free(Backing.Placement);
             Backing.Handle = default;
             Backing.Memory = default;
+            Backing.Placement = default;
         }
     }
 }
