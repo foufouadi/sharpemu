@@ -154,7 +154,9 @@ public static partial class Gen5SpirvTranslator
             {
                 var isImage = ImageDescriptorBinding.ResourceClass(binding.Kind) != ImageResourceClass.None;
                 var number = layout.UsesBindlessImages && isImage
-                    ? BindingLayout.FirstImageBinding + ImageDescriptorBinding.ArrayIndex(binding.Kind)
+                    ? ImageDescriptorBinding.ResourceClass(binding.Kind) == ImageResourceClass.Sampled
+                        ? BindingLayout.BindlessSampledImageBinding
+                        : BindingLayout.BindlessStorageImageBinding
                     : BindingLayout.NativeBindingIndex(request.Stage, binding.Kind);
                 switch (binding.Kind)
                 {

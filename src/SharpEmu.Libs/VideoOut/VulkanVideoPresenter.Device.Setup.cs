@@ -600,6 +600,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _maxPushDescriptors = pushDescriptorProperties.MaxPushDescriptors;
             _maxPerStageSampledImages = properties.Limits.MaxPerStageDescriptorSampledImages;
             _maxPerStageStorageImages = properties.Limits.MaxPerStageDescriptorStorageImages;
+            _maxPerStageUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindSampledImages;
+            _maxPerStageUpdateAfterBindStorageImages = descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindStorageImages;
             _maxUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSampledImages;
             _maxUpdateAfterBindStorageImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindStorageImages;
             _maxUpdateAfterBindDescriptors = descriptorIndexingProperties.MaxUpdateAfterBindDescriptorsInAllPools;

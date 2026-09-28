@@ -59,6 +59,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _maxPushDescriptors;
         private uint _maxPerStageSampledImages = uint.MaxValue;
         private uint _maxPerStageStorageImages = uint.MaxValue;
+        private uint _maxPerStageUpdateAfterBindSampledImages = uint.MaxValue;
+        private uint _maxPerStageUpdateAfterBindStorageImages = uint.MaxValue;
         private uint _maxUpdateAfterBindSampledImages = uint.MaxValue;
         private uint _maxUpdateAfterBindStorageImages = uint.MaxValue;
         private uint _maxUpdateAfterBindDescriptors = uint.MaxValue;
@@ -387,34 +389,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var requested = new Dictionary<DescriptorBindingKind, uint>();
-            foreach (var program in programs)
-            {
-                if (program?.Bindings is not { UsesBindlessImages: true } layout)
-                {
-                    continue;
-                }
-
-                foreach (var binding in layout.Descriptors)
-                {
-                    if (ImageDescriptorBinding.ResourceClass(binding.Kind) == ShaderCompiler.Resources.ImageResourceClass.None)
-                    {
-                        continue;
-                    }
-
-                    requested[binding.Kind] = requested.GetValueOrDefault(binding.Kind) + (uint)binding.Resources.Count;
-                }
-            }
-
             _bindlessImageHeap = new BindlessImageHeap(
                 _deviceInfo,
-                _scheduler,
                 _maxPerStageSampledImages,
                 _maxPerStageStorageImages,
+                _maxPerStageUpdateAfterBindSampledImages,
+                _maxPerStageUpdateAfterBindStorageImages,
                 _maxUpdateAfterBindSampledImages,
                 _maxUpdateAfterBindStorageImages,
-                _maxUpdateAfterBindDescriptors,
-                requested);
+                _maxUpdateAfterBindDescriptors);
         }
 
         // The set is pushed when its descriptors fit the device limit, else it comes from the heap.

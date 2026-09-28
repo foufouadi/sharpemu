@@ -14,6 +14,8 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // shader permutation.
 public sealed unsafe class BindlessImageHeap : IDisposable
 {
+    private const uint BindingCount = 2;
+
     private sealed class SlotKey : IEquatable<SlotKey>
     {
         public readonly DescriptorBindingKind Kind;
@@ -45,82 +47,56 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     private readonly GpuDeviceInfo _device;
     private readonly DescriptorSet _set;
     private readonly Dictionary<SlotKey, uint> _slots = new();
-    private readonly uint[] _next = new uint[BindingLayout.ImageBindingCount];
-    private readonly uint[] _capacity = new uint[BindingLayout.ImageBindingCount];
+    private readonly uint[] _next = new uint[BindingCount];
+    private readonly uint[] _capacity = new uint[BindingCount];
     private readonly DescriptorSetLayout _layout;
 
     public BindlessImageHeap(
         GpuDeviceInfo device,
-        SubmissionScheduler scheduler,
-        uint maxSampledImages,
-        uint maxStorageImages,
+        uint maxPerStageSampledImages,
+        uint maxPerStageStorageImages,
+        uint maxPerStageUpdateAfterBindSampledImages,
+        uint maxPerStageUpdateAfterBindStorageImages,
         uint maxUpdateAfterBindSampledImages,
         uint maxUpdateAfterBindStorageImages,
-        uint maxUpdateAfterBindDescriptors,
-        IReadOnlyDictionary<DescriptorBindingKind, uint> requested)
+        uint maxUpdateAfterBindDescriptors)
     {
-        var sampledCount = 0u;
-        var storageCount = 0u;
-        for (var index = 0u; index < BindingLayout.ImageBindingCount; index++)
-        {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + index);
-            if (DescriptorWriter.DescriptorType(kind) == DescriptorType.SampledImage) sampledCount++;
-            else storageCount++;
-        }
-
-        var sampledRequested = new uint[sampledCount];
-        var storageRequested = new uint[storageCount];
-        for (var index = 0u; index < BindingLayout.ImageBindingCount; index++)
-        {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + index);
-            var count = Math.Max(requested.GetValueOrDefault(kind), 1u);
-            if (DescriptorWriter.DescriptorType(kind) == DescriptorType.SampledImage)
-                sampledRequested[SampledIndex(index)] = count;
-            else
-                storageRequested[StorageIndex(index)] = count;
-        }
-
-        var sampledLimit = Math.Min(maxSampledImages, maxUpdateAfterBindSampledImages);
-        var storageLimit = Math.Min(maxStorageImages, maxUpdateAfterBindStorageImages);
-        var sampledDemand = sampledRequested.Aggregate(0UL, static (sum, value) => sum + value);
-        var storageDemand = storageRequested.Aggregate(0UL, static (sum, value) => sum + value);
-        var totalDemand = sampledDemand + storageDemand;
-        if (totalDemand > maxUpdateAfterBindDescriptors)
+        var sampledLimit = Math.Min(Math.Min(maxPerStageSampledImages, maxPerStageUpdateAfterBindSampledImages), maxUpdateAfterBindSampledImages);
+        var storageLimit = Math.Min(Math.Min(maxPerStageStorageImages, maxPerStageUpdateAfterBindStorageImages), maxUpdateAfterBindStorageImages);
+        var totalLimit = Math.Min((ulong)maxUpdateAfterBindDescriptors, (ulong)sampledLimit + storageLimit);
+        var sampledCapacity = Math.Min((ulong)sampledLimit, totalLimit / 2);
+        var storageCapacity = Math.Min((ulong)storageLimit, totalLimit - sampledCapacity);
+        if (sampledCapacity == 0 || storageCapacity == 0)
         {
             throw SubmissionScheduler.Fatal(
-                $"The persistent image heap demand exceeds the update-after-bind limit: " +
-                $"requested={totalDemand} limit={maxUpdateAfterBindDescriptors}.");
+                $"The device has no usable persistent image heap capacity: sampled={sampledLimit} storage={storageLimit} total={maxUpdateAfterBindDescriptors}.");
         }
 
-        var totalLimit = Math.Min((ulong)maxUpdateAfterBindDescriptors, (ulong)sampledLimit + storageLimit);
-        var remainder = totalLimit - totalDemand;
-        var sampledBudget = sampledDemand + Math.Min(
-            (ulong)sampledLimit - sampledDemand,
-            totalDemand == 0 ? 0 : remainder * sampledDemand / totalDemand);
-        var storageBudget = totalLimit - sampledBudget;
-        if (storageBudget > storageLimit)
+        // If one type has a smaller limit, give the unused half to the other type.
+        var unassigned = totalLimit - sampledCapacity - storageCapacity;
+        if (unassigned != 0)
         {
-            var moved = storageBudget - storageLimit;
-            storageBudget = storageLimit;
-            sampledBudget = Math.Min((ulong)sampledLimit, sampledBudget + moved);
+            var sampledRoom = (ulong)sampledLimit - sampledCapacity;
+            var sampledExtra = Math.Min(unassigned, sampledRoom);
+            sampledCapacity += sampledExtra;
+            storageCapacity += Math.Min(unassigned - sampledExtra, (ulong)storageLimit - storageCapacity);
         }
 
-        AllocateCapacities(sampledRequested, (uint)sampledBudget, _capacity, DescriptorType.SampledImage);
-        AllocateCapacities(storageRequested, (uint)storageBudget, _capacity, DescriptorType.StorageImage);
+        _capacity[0] = (uint)sampledCapacity;
+        _capacity[1] = (uint)storageCapacity;
         _device = device;
         Console.Error.WriteLine(
-            $"[LOADER][INFO] Vulkan bindless heap sampled={sampledBudget}/{sampledLimit} " +
-            $"storage={storageBudget}/{storageLimit} requested={totalDemand}/{totalLimit}");
+            $"[LOADER][INFO] Vulkan bindless heap sampled={sampledCapacity}/{sampledLimit} " +
+            $"storage={storageCapacity}/{storageLimit} total={sampledCapacity + storageCapacity}/{totalLimit}");
 
-        var bindings = new DescriptorSetLayoutBinding[BindingLayout.ImageBindingCount];
+        var bindings = new DescriptorSetLayoutBinding[BindingCount];
         var flags = new DescriptorBindingFlags[bindings.Length];
-        for (var index = 0; index < bindings.Length; index++)
+        for (var index = 0u; index < bindings.Length; index++)
         {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + (uint)index);
             bindings[index] = new DescriptorSetLayoutBinding
             {
-                Binding = BindingLayout.FirstImageBinding + (uint)index,
-                DescriptorType = DescriptorWriter.DescriptorType(kind),
+                Binding = index,
+                DescriptorType = index == 0 ? DescriptorType.SampledImage : DescriptorType.StorageImage,
                 DescriptorCount = _capacity[index],
                 StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             };
@@ -148,15 +124,8 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         }
 
         var poolSizes = new List<DescriptorPoolSize>();
-        var sampled = 0u;
-        var storage = 0u;
-        for (var index = 0; index < _capacity.Length; index++)
-        {
-            if (bindings[index].DescriptorType == DescriptorType.SampledImage) sampled += _capacity[index];
-            else storage += _capacity[index];
-        }
-        poolSizes.Add(new DescriptorPoolSize(DescriptorType.SampledImage, sampled));
-        poolSizes.Add(new DescriptorPoolSize(DescriptorType.StorageImage, storage));
+        poolSizes.Add(new DescriptorPoolSize(DescriptorType.SampledImage, _capacity[0]));
+        poolSizes.Add(new DescriptorPoolSize(DescriptorType.StorageImage, _capacity[1]));
         fixed (DescriptorPoolSize* poolPointer = poolSizes.ToArray())
         {
             var poolInfo = new DescriptorPoolCreateInfo
@@ -184,59 +153,6 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         // an image to it unless the descriptor was rejected before residency.
     }
 
-    private static int SampledIndex(uint bindingIndex)
-    {
-        var count = 0;
-        for (var index = 0u; index < bindingIndex; index++)
-        {
-            if (DescriptorWriter.DescriptorType((DescriptorBindingKind)(BindingLayout.FirstImageBinding + index)) == DescriptorType.SampledImage) count++;
-        }
-        return count;
-    }
-
-    private static int StorageIndex(uint bindingIndex) => (int)bindingIndex - SampledIndex(bindingIndex);
-
-    private static void AllocateCapacities(uint[] requested, uint limit, uint[] destination, DescriptorType type)
-    {
-        var total = requested.Aggregate(0UL, static (sum, value) => sum + value);
-        if (total > limit)
-        {
-            throw SubmissionScheduler.Fatal($"The persistent image heap demand exceeds the device limit: type={type} requested={total} limit={limit}.");
-        }
-
-        var remainder = limit - (uint)total;
-        var weightTotal = requested.Aggregate(0UL, static (sum, value) => sum + Math.Max(value, 1u));
-        var cursor = 0;
-        for (var index = 0u; index < BindingLayout.ImageBindingCount; index++)
-        {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + index);
-            if (DescriptorWriter.DescriptorType(kind) != type) continue;
-            var weight = Math.Max(requested[cursor], 1u);
-            var extra = weightTotal == 0 ? 0u : (uint)(remainder * weight / weightTotal);
-            destination[index] = requested[cursor] + extra;
-            cursor++;
-        }
-
-        // Integer rounding leaves a small remainder. Give it to the first slots
-        // without exceeding the device limit.
-        var assigned = 0UL;
-        for (var index = 0u; index < BindingLayout.ImageBindingCount; index++)
-        {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + index);
-            if (DescriptorWriter.DescriptorType(kind) == type)
-            {
-                assigned += destination[index];
-            }
-        }
-        for (var index = 0u; index < BindingLayout.ImageBindingCount && assigned < limit; index++)
-        {
-            var kind = (DescriptorBindingKind)(BindingLayout.FirstImageBinding + index);
-            if (DescriptorWriter.DescriptorType(kind) != type) continue;
-            destination[index]++;
-            assigned++;
-        }
-    }
-
     private DescriptorPool _pool;
 
     public DescriptorSetLayout Layout => _layout;
@@ -244,7 +160,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
 
     public uint GetOrCreateSlot(DescriptorBindingKind kind, ReadOnlySpan<uint> words, ImageView view, ImageLayout layout)
     {
-        var index = ImageDescriptorBinding.ArrayIndex(kind);
+        var index = DescriptorWriter.DescriptorType(kind) == DescriptorType.SampledImage ? 0u : 1u;
         if (index >= _capacity.Length || view.Handle == 0)
         {
             throw SubmissionScheduler.Fatal($"The bindless image slot is invalid: kind={kind} view=0x{view.Handle:X}.");
@@ -269,7 +185,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             {
                 SType = StructureType.WriteDescriptorSet,
                 DstSet = _set,
-                DstBinding = BindingLayout.FirstImageBinding + index,
+                DstBinding = index,
                 DstArrayElement = slot,
                 DescriptorCount = 1,
                 DescriptorType = DescriptorWriter.DescriptorType(kind),

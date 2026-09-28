@@ -94,7 +94,8 @@ public sealed class SpirvBindingDeclarationTests
         var module = new SpirvModuleInspector(shader.Spirv);
         Assert.Contains((uint)SpirvCapability.RuntimeDescriptorArray, module.Capabilities);
         Assert.Contains((1u, BindingLayout.NativeBindingIndex(ShaderStage.Compute, DescriptorBindingKind.Buffers)), module.DescriptorBindings);
-        Assert.Contains((0u, BindingLayout.FirstImageBinding + 2u), module.DescriptorBindings);
+        Assert.Contains((0u, BindingLayout.BindlessSampledImageBinding), module.DescriptorBindings);
+        Assert.Contains((0u, BindingLayout.BindlessStorageImageBinding), module.DescriptorBindings);
     }
 
     [Fact]
@@ -105,8 +106,9 @@ public sealed class SpirvBindingDeclarationTests
 
         var module = new SpirvModuleInspector(shader.Spirv);
         Assert.Contains((1u, BindingLayout.NativeBindingIndex(ShaderStage.Pixel, DescriptorBindingKind.Buffers)), module.DescriptorBindings);
-        Assert.Contains((0u, BindingLayout.FirstImageBinding + 2u), module.DescriptorBindings);
-        Assert.DoesNotContain((0u, BindingLayout.NativeBindingIndex(ShaderStage.Pixel, (DescriptorBindingKind)(BindingLayout.FirstImageBinding + 2u))),
+        Assert.Contains((0u, BindingLayout.BindlessSampledImageBinding), module.DescriptorBindings);
+        Assert.Contains((0u, BindingLayout.BindlessStorageImageBinding), module.DescriptorBindings);
+        Assert.DoesNotContain((0u, BindingLayout.NativeBindingIndex(ShaderStage.Pixel, DescriptorBindingKind.Samplers)),
             module.DescriptorBindings);
     }
 

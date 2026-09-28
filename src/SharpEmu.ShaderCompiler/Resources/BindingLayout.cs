@@ -327,6 +327,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public const uint FirstImageBinding = 1;
     public const uint FirstStorageImageBinding = 22;
     public const uint ImageBindingCount = 45;
+    // A bindless shader aliases all sampled image classes through one descriptor
+    // binding and all storage classes through another. The local slot table still
+    // keeps the guest image classes distinct.
+    public const uint BindlessSampledImageBinding = 0;
+    public const uint BindlessStorageImageBinding = 1;
     public const uint NoShaderBase = uint.MaxValue;
     public const uint ShaderBaseDwordCount = 2;
     private const int ScalarRegisterCount = 256;
