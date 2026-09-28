@@ -598,6 +598,65 @@ public static class AjmExports
         return ctx.SetReturn(0);
     }
 
+    /// <summary>
+    /// Enqueues a control job (initialize/reset) on an instance. The sideband input
+    /// carries the codec configuration; the sideband output starts with the basic
+    /// result the guest polls after the batch completes.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "7FZsbyVRM4U",
+        ExportName = "sceAjmBatchJobControl",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobControl(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var flags = ctx[CpuRegister.Rdx];
+        var inputAddress = ctx[CpuRegister.Rcx];
+        var inputSize = ctx[CpuRegister.R8];
+        var outputAddress = ctx[CpuRegister.R9];
+        var outputSize = ReadStackArg64(ctx, 0);
+
+        if (!TryAppendBatchJob(ctx, infoAddress, AjmJobControlSize))
+        {
+            return ctx.SetReturn(OrbisAjmErrorJobCreation);
+        }
+
+        var status = Atrac9DecodeState.ResultInvalidParameter;
+        AjmInstanceState? instance = null;
+        if (TryGetInstance(instanceId, out instance))
+        {
+            status = 0;
+            if (instance.Atrac9 is not null)
+            {
+                instance.Atrac9.Reset();
+                // The initialize sideband carries the four ATRAC9 config bytes after an
+                // eight-byte header; the config starts with its 0xFE sync byte.
+                Span<byte> sideband = stackalloc byte[(int)Math.Min(inputSize, 16UL)];
+                if (inputAddress != 0 && sideband.Length >= 4 && ctx.Memory.TryRead(inputAddress, sideband))
+                {
+                    var configOffset = sideband.Length >= 12 && sideband[8] == 0xFE ? 8 : 0;
+                    if (sideband[configOffset] == 0xFE)
+                    {
+                        _ = instance.Atrac9.TryInitialize(sideband.Slice(configOffset, 4));
+                    }
+                }
+            }
+        }
+
+        if (outputSize >= 8)
+        {
+            WriteBasicResult(ctx, outputAddress, status);
+        }
+
+        Trace(
+            $"batch_job_control instance=0x{instanceId:X8} flags=0x{flags:X16} " +
+            $"in=0x{inputAddress:X16}+0x{inputSize:X} out=0x{outputAddress:X16}+0x{outputSize:X} status=0x{status:X8} " +
+            $"atrac9={(instance?.Atrac9 is null ? "none" : "yes")} input={TraceBytes(ctx, inputAddress, inputSize)}");
+        return ctx.SetReturn(0);
+    }
+
     [SysAbiExport(
         Nid = "3cAg7xN995U",
         ExportName = "sceAjmBatchJobGetStatistics",
@@ -1358,6 +1417,12 @@ public static class AjmExports
         _ = ctx.Memory.TryWrite(
             resultAddress,
             multipleFrames ? sideband : sideband[..24]);
+    }
+
+    private static string TraceBytes(CpuContext ctx, ulong address, ulong size)
+    {
+        Span<byte> bytes = stackalloc byte[(int)Math.Min(size, 32UL)];
+        return address != 0 && ctx.Memory.TryRead(address, bytes) ? Convert.ToHexString(bytes) : "-";
     }
 
     private static void WriteBasicResult(CpuContext ctx, ulong resultAddress, int status)
