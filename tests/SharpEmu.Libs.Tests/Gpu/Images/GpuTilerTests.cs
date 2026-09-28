@@ -264,7 +264,9 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
-    public void Detile_ReleasesTheScratchAfterTheTick()
+    // Detile writes into the upload ring, which lives as long as the tiler; other scratch
+    // is still released when its tick completes.
+    public void Detile_KeepsItsRingAndReleasesOtherScratchAfterTheTick()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new ImageTestHarness(_vulkan);
@@ -278,7 +280,7 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
             Assert.Equal(baseline + 2, harness.Device.LiveAllocations);
             harness.Scheduler.Finish();
         });
-        Assert.Equal(baseline, harness.Device.LiveAllocations);
+        Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
         harness.AssertNoValidationMessages();
     }
 
