@@ -8,6 +8,29 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Garbage collection by recency and memory pressure, and the scheduled readback flush.
 public sealed partial class GuestImageCache
 {
+    // Allocation-time pressure is deliberately separate from the periodic sweep:
+    // a visibility-buffer burst can create thousands of images before the next
+    // frame boundary. Destruction still goes through DeleteImage's completion
+    // action, so no image is freed while the current tick can reference it.
+    private void CollectForAllocation(ulong requiredBytes)
+    {
+        if (requiredBytes > _criticalMemoryBytes || _totalUsedMemory <= _criticalMemoryBytes - requiredBytes)
+        {
+            return;
+        }
+
+        var target = _criticalMemoryBytes - requiredBytes;
+        while (_totalUsedMemory > target)
+        {
+            var before = _totalUsedMemory;
+            Collect(_collectionTick, allowAggressive: true);
+            if (_totalUsedMemory == before)
+            {
+                break;
+            }
+        }
+    }
+
     public void RunGarbageCollector()
     {
         using var held = _lock.Hold();

@@ -465,6 +465,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
+        var requiredBytes = (description.Data.Size + 1023) & ~1023UL;
+        CollectForAllocation(requiredBytes);
         var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description));
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
