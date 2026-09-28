@@ -593,6 +593,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.GetPhysicalDeviceProperties2(_physicalDevice, &properties2);
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);
             _maxPushDescriptors = pushDescriptorProperties.MaxPushDescriptors;
+            _maxPerStageSampledImages = properties.Limits.MaxPerStageDescriptorSampledImages;
+            _maxPerStageStorageImages = properties.Limits.MaxPerStageDescriptorStorageImages;
             _noAttachmentSampleCounts = properties.Limits.FramebufferNoAttachmentsSampleCounts;
             _maxComputeWorkGroupCountX = properties.Limits.MaxComputeWorkGroupCount[0];
             _maxComputeWorkGroupCountY = properties.Limits.MaxComputeWorkGroupCount[1];
@@ -650,6 +652,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsFragmentShaderBarycentric;
         private bool _supportsPerVertexPixelInputs;
         private const string FragmentShaderBarycentricExtensionName = "VK_KHR_fragment_shader_barycentric";
+        private const string DeviceFaultExtensionName = "VK_EXT_device_fault";
 
         private void CreateDevice()
         {
@@ -804,10 +807,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
                 PNext = &addressFeatures,
             };
+            var descriptorIndexingQuery = new PhysicalDeviceDescriptorIndexingFeatures
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                PNext = &atomicInt64Features,
+            };
             var featuresQuery = new PhysicalDeviceFeatures2
             {
                 SType = StructureType.PhysicalDeviceFeatures2,
-                PNext = &atomicInt64Features,
+                PNext = &descriptorIndexingQuery,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
@@ -819,6 +827,15 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
+            var supportsNonUniformImageIndexing = descriptorIndexingQuery.ShaderSampledImageArrayNonUniformIndexing &&
+                descriptorIndexingQuery.ShaderStorageImageArrayNonUniformIndexing;
+            SetNonUniformImageIndexingCapability(supportsNonUniformImageIndexing);
+            var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                ShaderSampledImageArrayNonUniformIndexing = supportsNonUniformImageIndexing,
+                ShaderStorageImageArrayNonUniformIndexing = supportsNonUniformImageIndexing,
+            };
             if (!supportsSharedInt64Atomics)
             {
                 Console.Error.WriteLine(
@@ -862,9 +879,12 @@ internal static unsafe partial class VulkanVideoPresenter
             var depthClipEnableExtension = (byte*)SilkMarshal.StringToPtr(DepthClipEnableExtensionName);
             var barycentricExtension = (byte*)SilkMarshal.StringToPtr(FragmentShaderBarycentricExtensionName);
             var viewportIndexLayerExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_shader_viewport_index_layer");
+            var deviceFaultExtension = (byte*)SilkMarshal.StringToPtr(DeviceFaultExtensionName);
+            var supportsDeviceFault = IsDeviceExtensionAvailable(DeviceFaultExtensionName);
+            var deviceFaultFeatures = new PhysicalDeviceFaultFeaturesEXT { SType = StructureType.PhysicalDeviceFaultFeaturesExt };
             try
             {
-                var extensions = stackalloc byte*[12];
+                var extensions = stackalloc byte*[13];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -899,6 +919,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (supportsRobustness2)
                 {
                     extensions[extensionCount++] = robustness2Extension;
+                }
+
+                // Device-loss reports name the faulting address when the driver can.
+                if (supportsDeviceFault)
+                {
+                    extensions[extensionCount++] = deviceFaultExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -987,6 +1013,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &colorWriteEnableFeatures;
                 }
 
+                descriptorIndexingFeatures.PNext = renderingChain;
+                renderingChain = &descriptorIndexingFeatures;
+
+                if (supportsDeviceFault)
+                {
+                    deviceFaultFeatures.DeviceFault = true;
+                    deviceFaultFeatures.PNext = renderingChain;
+                    renderingChain = &deviceFaultFeatures;
+                }
+
                 vulkan13Features = new PhysicalDeviceVulkan13Features
                 {
                     SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -1024,6 +1060,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)pushDescriptorExtension);
                 SilkMarshal.Free((nint)barycentricExtension);
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
+                SilkMarshal.Free((nint)deviceFaultExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
