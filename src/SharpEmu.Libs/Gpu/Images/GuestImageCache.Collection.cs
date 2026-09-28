@@ -14,27 +14,40 @@ public sealed partial class GuestImageCache
     // action, so no image is freed while the current tick can reference it.
     private void CollectForAllocation(ulong requiredBytes)
     {
+        // A burst can contain only newly touched images. Once the recency walk finds
+        // no evictable image, retrying it for every allocation in the same tick is
+        // pure repeated work; the next tick will make older images eligible.
+        if (_allocationCollectionBlocked)
+        {
+            return;
+        }
+
         if (requiredBytes > _criticalMemoryBytes || _totalUsedMemory <= _criticalMemoryBytes - requiredBytes)
         {
             return;
         }
 
         var target = _criticalMemoryBytes - requiredBytes;
+        var blocked = false;
         while (_totalUsedMemory > target)
         {
             var before = _totalUsedMemory;
             Collect(_collectionTick, allowAggressive: true);
             if (_totalUsedMemory == before)
             {
+                blocked = true;
                 break;
             }
         }
+
+        _allocationCollectionBlocked = blocked;
     }
 
     public void RunGarbageCollector()
     {
         using var held = _lock.Hold();
         var tick = _collectionTick++;
+        _allocationCollectionBlocked = false;
         if (_totalUsedMemory < _collectionStartBytes)
         {
             return;

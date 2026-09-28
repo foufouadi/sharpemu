@@ -37,6 +37,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _memoryPressureBytes = 1536 * MiB;
     private ulong _criticalMemoryBytes = 3072 * MiB;
     private ulong _collectionTick;
+    private bool _allocationCollectionBlocked;
     private uint _queryEpoch;
     private bool _readbackLinearImages;
     private bool _disposed;
