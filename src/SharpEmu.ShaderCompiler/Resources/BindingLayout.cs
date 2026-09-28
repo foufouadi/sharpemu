@@ -643,7 +643,10 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
-            UsesBindlessImages = usesBindlessImages && info.Images.Count != 0,
+            // The set split is a pipeline-wide ABI. A stage without images must
+            // still place its buffers on set 1 when another stage uses set 0 for
+            // the persistent image heap.
+            UsesBindlessImages = usesBindlessImages,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };

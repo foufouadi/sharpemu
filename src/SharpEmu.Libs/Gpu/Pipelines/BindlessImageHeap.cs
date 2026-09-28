@@ -15,6 +15,10 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 public sealed unsafe class BindlessImageHeap : IDisposable
 {
     private const uint BindingCount = 2;
+    // NVIDIA reports maxUpdateAfterBindDescriptorsInAllPools as UINT_MAX. Keep
+    // the persistent layout bounded even when that device-wide limit is not
+    // useful, while retaining the full capacity on devices with lower limits.
+    private const uint StableCapacityPerBinding = 128u * 1024u;
 
     private sealed class SlotKey : IEquatable<SlotKey>
     {
@@ -61,8 +65,12 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         uint maxUpdateAfterBindStorageImages,
         uint maxUpdateAfterBindDescriptors)
     {
-        var sampledLimit = Math.Min(Math.Min(maxPerStageSampledImages, maxPerStageUpdateAfterBindSampledImages), maxUpdateAfterBindSampledImages);
-        var storageLimit = Math.Min(Math.Min(maxPerStageStorageImages, maxPerStageUpdateAfterBindStorageImages), maxUpdateAfterBindStorageImages);
+        var sampledLimit = Math.Min(
+            Math.Min(Math.Min(maxPerStageSampledImages, maxPerStageUpdateAfterBindSampledImages), maxUpdateAfterBindSampledImages),
+            StableCapacityPerBinding);
+        var storageLimit = Math.Min(
+            Math.Min(Math.Min(maxPerStageStorageImages, maxPerStageUpdateAfterBindStorageImages), maxUpdateAfterBindStorageImages),
+            StableCapacityPerBinding);
         var totalLimit = Math.Min((ulong)maxUpdateAfterBindDescriptors, (ulong)sampledLimit + storageLimit);
         var sampledCapacity = Math.Min((ulong)sampledLimit, totalLimit / 2);
         var storageCapacity = Math.Min((ulong)storageLimit, totalLimit - sampledCapacity);
