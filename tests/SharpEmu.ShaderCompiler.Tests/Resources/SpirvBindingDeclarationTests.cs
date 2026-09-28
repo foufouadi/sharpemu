@@ -98,6 +98,19 @@ public sealed class SpirvBindingDeclarationTests
     }
 
     [Fact]
+    public void BindlessPixelImagesKeepTheGlobalBindingNumbers()
+    {
+        var request = Request(EveryKindProgram(), ShaderStage.Pixel, usesBindlessImages: true);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        var module = new SpirvModuleInspector(shader.Spirv);
+        Assert.Contains((1u, BindingLayout.NativeBindingIndex(ShaderStage.Pixel, DescriptorBindingKind.Buffers)), module.DescriptorBindings);
+        Assert.Contains((0u, BindingLayout.FirstImageBinding + 2u), module.DescriptorBindings);
+        Assert.DoesNotContain((0u, BindingLayout.NativeBindingIndex(ShaderStage.Pixel, (DescriptorBindingKind)(BindingLayout.FirstImageBinding + 2u))),
+            module.DescriptorBindings);
+    }
+
+    [Fact]
     public void PixelStage_OffsetsEveryBindingByTheStageCount()
     {
         var program = Program(BufferLoad(0, 4), EndProgram(8));

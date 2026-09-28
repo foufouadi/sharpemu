@@ -152,7 +152,10 @@ public static partial class Gen5SpirvTranslator
             _storageUlongPointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, _ulongType);
             foreach (var binding in layout.Descriptors)
             {
-                var number = BindingLayout.NativeBindingIndex(request.Stage, binding.Kind);
+                var isImage = ImageDescriptorBinding.ResourceClass(binding.Kind) != ImageResourceClass.None;
+                var number = layout.UsesBindlessImages && isImage
+                    ? BindingLayout.FirstImageBinding + ImageDescriptorBinding.ArrayIndex(binding.Kind)
+                    : BindingLayout.NativeBindingIndex(request.Stage, binding.Kind);
                 switch (binding.Kind)
                 {
                     case DescriptorBindingKind.Buffers:
