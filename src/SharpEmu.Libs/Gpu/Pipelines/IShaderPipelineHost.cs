@@ -41,6 +41,8 @@ internal interface IShaderPipelineHost
     // The device supports shaderSharedInt64Atomics, so LDS 64-bit atomics can be
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
+
+    bool NonUniformImageIndexingEnabled => false;
     bool PerVertexPixelInputsSupported => true;
 
     RenderHostLimits Limits { get; }

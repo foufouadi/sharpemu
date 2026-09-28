@@ -211,7 +211,10 @@ public enum SpirvCapability : uint
     ShaderLayer = 5253,
     ShaderViewportIndex = 5254,
     ShaderViewportIndexLayerExt = 5254,
+    ShaderNonUniform = 5301,
     RuntimeDescriptorArray = 5302,
+    SampledImageArrayNonUniformIndexing = 5307,
+    StorageImageArrayNonUniformIndexing = 5309,
     PhysicalStorageBufferAddresses = 5347,
 }
 
@@ -246,6 +249,7 @@ public enum SpirvExecutionMode : uint
 
 public enum SpirvDecoration : uint
 {
+    NonUniform = 5300,
     Block = 2,
     ArrayStride = 6,
     BuiltIn = 11,

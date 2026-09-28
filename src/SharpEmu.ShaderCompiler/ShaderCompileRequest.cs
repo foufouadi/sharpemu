@@ -165,6 +165,10 @@ public sealed class ShaderCompileRequest
     // 64-bit atomics are emitted as real 64-bit atomics instead of a pair of
     // 32-bit ones, which is not atomic as a pair.
     public bool SupportsSharedInt64Atomics { get; init; }
+
+    // Descriptor indexing with a per-invocation index (shader*ArrayNonUniformIndexing): an
+    // indirect image table is then read by index instead of one case per candidate.
+    public bool SupportsNonUniformImageIndexing { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];

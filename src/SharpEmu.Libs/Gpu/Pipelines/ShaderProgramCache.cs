@@ -536,6 +536,7 @@ internal sealed class ShaderProgramCache
     {
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
+        var nonUniformImageIndexing = _host.NonUniformImageIndexingEnabled;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -548,6 +549,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
@@ -574,6 +576,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
@@ -592,6 +595,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
