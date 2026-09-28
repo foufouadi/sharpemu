@@ -20,16 +20,23 @@ public sealed unsafe partial class GuestImageCache
     {
         fillValue = 0;
         using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc || slice >= 32)
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc)
         {
             return false;
         }
 
         fillValue = found.FillValue;
-        return (found.ClearMask & (1u << (int)slice)) != 0;
+        return found.IsSliceCleared(slice);
     }
 
     public bool IsMetadataCleared(ulong address, uint slice) => IsMetadataCleared(address, slice, out _);
+
+    private static SurfaceMetadata CreateMetadata(SurfaceMetadataKind kind, uint clearMask, uint fillValue = 0xffffffff, ulong fillSize = 0)
+    {
+        var metadata = new SurfaceMetadata { Kind = kind, FillValue = fillValue, FillSize = fillSize };
+        metadata.SetFromMask(clearMask);
+        return metadata;
+    }
 
     // A broad clear applies to CMask, FMask and HTile; DCC needs a validated fill value.
     public bool ClearMetadata(ulong address)
@@ -40,7 +47,7 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
-        found.ClearMask = uint.MaxValue;
+        found.SetFromMask(uint.MaxValue);
         return true;
     }
 
@@ -63,13 +70,13 @@ public sealed unsafe partial class GuestImageCache
         if (!_surfaceMetadata.TryGetValue(address, out var found))
         {
             // The fill may precede color-target discovery; a pending entry stays invisible until then.
-            _surfaceMetadata.Add(address, new SurfaceMetadata { Kind = SurfaceMetadataKind.PendingDcc, ClearMask = dccClearMask, FillValue = fillValue, FillSize = size });
+            _surfaceMetadata.Add(address, CreateMetadata(SurfaceMetadataKind.PendingDcc, dccClearMask, fillValue, size));
             return false;
         }
 
         if (found.Kind == SurfaceMetadataKind.PendingDcc)
         {
-            found.ClearMask = dccClearMask;
+            found.SetFromMask(dccClearMask);
             found.FillValue = fillValue;
             found.FillSize = size;
             return false;
@@ -77,7 +84,7 @@ public sealed unsafe partial class GuestImageCache
 
         if (found.Kind == SurfaceMetadataKind.Dcc)
         {
-            found.ClearMask = dccClearMask;
+            found.SetFromMask(dccClearMask);
             found.FillValue = fillValue;
             found.FillSize = size;
             return true;
@@ -147,20 +154,7 @@ public sealed unsafe partial class GuestImageCache
     public bool SetMetadataSlice(ulong address, uint slice, bool isClear)
     {
         using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc || slice >= 32)
-        {
-            return false;
-        }
-
-        if (isClear)
-        {
-            found.ClearMask |= 1u << (int)slice;
-        }
-        else
-        {
-            found.ClearMask &= ~(1u << (int)slice);
-        }
-
-        return true;
+        return _surfaceMetadata.TryGetValue(address, out var found) && found.Kind != SurfaceMetadataKind.PendingDcc &&
+            found.SetSlice(slice, isClear);
     }
 }
