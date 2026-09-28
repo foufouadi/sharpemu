@@ -82,11 +82,17 @@ internal static unsafe partial class VulkanVideoPresenter
     private static int _nativeSubgroupShaderStages;
     private static int _sharedInt64AtomicsSupported;
     private static int _nonUniformImageIndexingSupported;
+    private static int _bindlessImageHeapSupported;
 
     internal static bool NonUniformImageIndexingEnabled => Volatile.Read(ref _nonUniformImageIndexingSupported) != 0;
 
+    internal static bool BindlessImageHeapEnabled => Volatile.Read(ref _bindlessImageHeapSupported) != 0;
+
     private static void SetNonUniformImageIndexingCapability(bool supported) =>
         Volatile.Write(ref _nonUniformImageIndexingSupported, supported ? 1 : 0);
+
+    private static void SetBindlessImageHeapCapability(bool supported) =>
+        Volatile.Write(ref _bindlessImageHeapSupported, supported ? 1 : 0);
 
     // True when the device supports shaderSharedInt64Atomics, so LDS 64-bit
     // atomics can be emitted as real 64-bit atomics.

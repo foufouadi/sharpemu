@@ -337,12 +337,28 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetDword { get; init; }
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
+    // Vulkan can put image arrays in one persistent descriptor set. The per-draw
+    // flattened table then starts with the local-image -> heap-slot mapping.
+    public bool UsesBindlessImages { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 
     public uint DispatchThreadLimitsDword => MemoryOffsetDword + (MemoryOffsetCount + 3) / 4;
 
     public uint ShaderDataDwordCount => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+
+    public static uint ImageSlotTableDwordCount(ShaderResourceInfo info)
+    {
+        var count = 0u;
+        foreach (var image in info.Images)
+        {
+            _ = ImageDescriptorBinding.ForImage(image) ?? throw new ResourcePlanException(
+                "image slot table cannot classify an image without a descriptor binding");
+            count += image.MipMode == ImageMipMode.DynamicStorage ? image.MipCount : 1u;
+        }
+
+        return count;
+    }
 
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
@@ -537,7 +553,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesFlattenedTable,
         bool usesShaderBase,
         uint pushDataStartDword = 0,
-        bool usesDispatchThreadLimits = false)
+        bool usesDispatchThreadLimits = false,
+        bool usesBindlessImages = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
@@ -601,7 +618,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.FaultBuffer, []));
         }
 
-        var flattened = usesFlattenedTable || info.Images.Any(image => image.IndirectSearchIterations != 0);
+        var flattened = usesFlattenedTable || info.Images.Any(image => image.IndirectSearchIterations != 0) ||
+                        (usesBindlessImages && info.Images.Count != 0);
         if (flattened)
         {
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.FlattenedResourceTable, []));
@@ -620,6 +638,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
+            UsesBindlessImages = usesBindlessImages && info.Images.Count != 0,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -633,6 +652,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         MemoryOffsetDword == other.MemoryOffsetDword &&
         MemoryOffsetCount == other.MemoryOffsetCount &&
         UsesDispatchThreadLimits == other.UsesDispatchThreadLimits &&
+        UsesBindlessImages == other.UsesBindlessImages &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
@@ -661,7 +681,7 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesBindlessImages);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

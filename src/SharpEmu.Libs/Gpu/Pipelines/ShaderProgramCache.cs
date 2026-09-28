@@ -474,7 +474,8 @@ internal sealed class ShaderProgramCache
                 ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
                 BindingLayout.ReadsShaderBase(program),
                 pushDataCursor,
-                usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions);
+                usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
+                usesBindlessImages: _host.UsesBindlessImages);
         }
         catch (ResourcePlanException exception)
         {

@@ -69,6 +69,7 @@ public static partial class Gen5SpirvTranslator
         private uint _pushData;
         private uint _shaderData;
         private uint _flattenedTable;
+        private uint _imageSlotTableDwordCount;
         private uint _pageTable;
         private uint _faultBuffer;
         private uint _globalDataShare;
@@ -95,7 +96,8 @@ public static partial class Gen5SpirvTranslator
             bool Cube,
             bool Multisampled,
             SpirvImageDim Dimension,
-            IReadOnlyList<uint> Resources);
+            IReadOnlyList<uint> Resources,
+            uint SlotOffset);
 
         public CompilationContext(ShaderCompileRequest request)
         {
@@ -154,25 +156,25 @@ public static partial class Gen5SpirvTranslator
                 switch (binding.Kind)
                 {
                     case DescriptorBindingKind.Buffers:
-                        DeclareBufferArray((uint)binding.Resources.Count, number);
+                        DeclareBufferArray((uint)binding.Resources.Count, number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.Samplers:
-                        DeclareSamplerArray((uint)binding.Resources.Count, number);
+                        DeclareSamplerArray((uint)binding.Resources.Count, number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.GlobalDataShare:
-                        _globalDataShare = DeclareWordBlock("globalDataShare", number);
+                        _globalDataShare = DeclareWordBlock("globalDataShare", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.DeviceAddressPageTable:
-                        _pageTable = DeclareDeviceAddressPageTable(number);
+                        _pageTable = DeclareDeviceAddressPageTable(number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.FaultBuffer:
-                        _faultBuffer = DeclareWordBlock("faultBuffer", number);
+                        _faultBuffer = DeclareWordBlock("faultBuffer", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.FlattenedResourceTable:
-                        _flattenedTable = DeclareWordBlock("flattenedResourceTable", number);
+                        _flattenedTable = DeclareWordBlock("flattenedResourceTable", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.ShaderData:
-                        _shaderData = DeclareWordBlock("shaderData", number);
+                        _shaderData = DeclareWordBlock("shaderData", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     default:
                         DeclareImageClass(binding, number);
@@ -255,7 +257,7 @@ public static partial class Gen5SpirvTranslator
             return _addressRuntimeArray;
         }
 
-        private void DeclareBufferArray(uint count, uint bindingNumber)
+        private void DeclareBufferArray(uint count, uint bindingNumber, uint descriptorSet)
         {
             var runtimeArray = WordRuntimeArray();
             var block = _module.TypeStruct(runtimeArray);
@@ -266,26 +268,26 @@ public static partial class Gen5SpirvTranslator
             _storageBlockPointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, block);
             _globalBuffers = _module.AddGlobalVariable(descriptorsPointer, SpirvStorageClass.StorageBuffer);
             _module.AddName(_globalBuffers, "guestBuffers");
-            _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, descriptorSet);
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(_globalBuffers);
         }
 
         // One storage block holding a runtime array of dwords.
-        private uint DeclareWordBlock(string name, uint bindingNumber)
+        private uint DeclareWordBlock(string name, uint bindingNumber, uint descriptorSet)
         {
             var block = _module.TypeStruct(WordRuntimeArray());
             _module.AddDecoration(block, SpirvDecoration.Block);
             _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.StorageBuffer, block), SpirvStorageClass.StorageBuffer);
             _module.AddName(variable, name);
-            _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, descriptorSet);
             _module.AddDecoration(variable, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(variable);
             return variable;
         }
 
-        private uint DeclareDeviceAddressPageTable(uint bindingNumber)
+        private uint DeclareDeviceAddressPageTable(uint bindingNumber, uint descriptorSet)
         {
             var block = _module.TypeStruct(AddressRuntimeArray());
             _module.AddDecoration(block, SpirvDecoration.Block);
@@ -293,20 +295,20 @@ public static partial class Gen5SpirvTranslator
             _module.AddMemberDecoration(block, 0, SpirvDecoration.NonWritable);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.StorageBuffer, block), SpirvStorageClass.StorageBuffer);
             _module.AddName(variable, "deviceAddressPageTable");
-            _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, descriptorSet);
             _module.AddDecoration(variable, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(variable);
             return variable;
         }
 
-        private void DeclareSamplerArray(uint count, uint bindingNumber)
+        private void DeclareSamplerArray(uint count, uint bindingNumber, uint descriptorSet)
         {
             _samplerType = _module.TypeSampler();
             var arrayType = _module.TypeArray(_samplerType, count);
             _samplerPointer = _module.TypePointer(SpirvStorageClass.UniformConstant, _samplerType);
             _samplerArray = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.UniformConstant, arrayType), SpirvStorageClass.UniformConstant);
             _module.AddName(_samplerArray, "samplers");
-            _module.AddDecoration(_samplerArray, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(_samplerArray, SpirvDecoration.DescriptorSet, descriptorSet);
             _module.AddDecoration(_samplerArray, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(_samplerArray);
         }
@@ -366,14 +368,22 @@ public static partial class Gen5SpirvTranslator
             }
 
             var imageType = _module.TypeImage(componentType, spirvDimension, depth: false, arrayed, multisampled, sampled: isStorage ? 2u : 1u, format);
-            var arrayType = _module.TypeArray(imageType, (uint)binding.Resources.Count);
+            var slotOffset = _imageSlotTableDwordCount;
+            _imageSlotTableDwordCount += (uint)binding.Resources.Count;
+            var arrayType = _request.Bindings.UsesBindlessImages
+                ? _module.TypeRuntimeArray(imageType)
+                : _module.TypeArray(imageType, (uint)binding.Resources.Count);
+            if (_request.Bindings.UsesBindlessImages)
+            {
+                _module.AddCapability(SpirvCapability.RuntimeDescriptorArray);
+            }
             var elementPointer = _module.TypePointer(SpirvStorageClass.UniformConstant, imageType);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.UniformConstant, arrayType), SpirvStorageClass.UniformConstant);
             _module.AddName(variable, $"{binding.Kind}");
             _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(variable, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(variable);
-            _imageClasses[binding.Kind] = new LayoutImageClass(variable, imageType, elementPointer, componentType, kind, isStorage, arrayed, cube, multisampled, spirvDimension, binding.Resources);
+            _imageClasses[binding.Kind] = new LayoutImageClass(variable, imageType, elementPointer, componentType, kind, isStorage, arrayed, cube, multisampled, spirvDimension, binding.Resources, slotOffset);
         }
 
         // ---- initial state ----
@@ -434,7 +444,21 @@ public static partial class Gen5SpirvTranslator
                 dwordIndex,
                 _module.AddInstruction(SpirvOp.ArrayLength, _uintType, block, 0));
 
-        private uint LoadFlattenedWord(uint slot) => LoadBlockWord(_flattenedTable, slot);
+        private uint LoadFlattenedWord(uint slot)
+        {
+            if (_request.Bindings.UsesBindlessImages)
+            {
+                slot = IAdd(UInt(BindingLayout.ImageSlotTableDwordCount(_request.Resources.Info)), slot);
+            }
+
+            return LoadBlockWord(_flattenedTable, slot);
+        }
+
+        private uint LoadImageSlot(LayoutImageClass imageClass, uint element)
+        {
+            var slot = IAdd(UInt(imageClass.SlotOffset), element);
+            return LoadBlockWord(_flattenedTable, slot);
+        }
 
         // The shader base the host pushes for this draw, as two dwords.
         private (uint Low, uint High) LoadShaderBase()
@@ -1535,7 +1559,10 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var elementIndex = dynamicElement != 0 ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
+            var localElementIndex = dynamicElement != 0 ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
+            var elementIndex = request.Bindings.UsesBindlessImages
+                ? LoadImageSlot(imageClass, localElementIndex)
+                : localElementIndex;
             var elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
             var imageValue = Load(imageClass.ImageType, elementPointer);
             if (dynamicElement != 0)

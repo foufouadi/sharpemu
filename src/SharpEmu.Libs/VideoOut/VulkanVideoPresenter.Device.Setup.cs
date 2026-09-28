@@ -575,10 +575,15 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SType = StructureType.PhysicalDevicePushDescriptorPropertiesKhr,
             };
+            var descriptorIndexingProperties = new PhysicalDeviceDescriptorIndexingProperties
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingProperties,
+                PNext = &pushDescriptorProperties,
+            };
             var subgroupSizeControl = new PhysicalDeviceSubgroupSizeControlProperties
             {
                 SType = StructureType.PhysicalDeviceSubgroupSizeControlProperties,
-                PNext = &pushDescriptorProperties,
+                PNext = &descriptorIndexingProperties,
             };
             var subgroup = new PhysicalDeviceSubgroupProperties
             {
@@ -595,6 +600,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _maxPushDescriptors = pushDescriptorProperties.MaxPushDescriptors;
             _maxPerStageSampledImages = properties.Limits.MaxPerStageDescriptorSampledImages;
             _maxPerStageStorageImages = properties.Limits.MaxPerStageDescriptorStorageImages;
+            _maxUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSampledImages;
+            _maxUpdateAfterBindStorageImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindStorageImages;
+            _maxUpdateAfterBindDescriptors = descriptorIndexingProperties.MaxUpdateAfterBindDescriptorsInAllPools;
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan bindless limits sampled={_maxUpdateAfterBindSampledImages} " +
+                $"storage={_maxUpdateAfterBindStorageImages} total={_maxUpdateAfterBindDescriptors}");
             _noAttachmentSampleCounts = properties.Limits.FramebufferNoAttachmentsSampleCounts;
             _maxComputeWorkGroupCountX = properties.Limits.MaxComputeWorkGroupCount[0];
             _maxComputeWorkGroupCountY = properties.Limits.MaxComputeWorkGroupCount[1];
@@ -830,11 +841,21 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsNonUniformImageIndexing = descriptorIndexingQuery.ShaderSampledImageArrayNonUniformIndexing &&
                 descriptorIndexingQuery.ShaderStorageImageArrayNonUniformIndexing;
             SetNonUniformImageIndexingCapability(supportsNonUniformImageIndexing);
+            var supportsBindlessImageHeap = supportsNonUniformImageIndexing &&
+                descriptorIndexingQuery.RuntimeDescriptorArray &&
+                descriptorIndexingQuery.DescriptorBindingPartiallyBound &&
+                descriptorIndexingQuery.DescriptorBindingSampledImageUpdateAfterBind &&
+                descriptorIndexingQuery.DescriptorBindingStorageImageUpdateAfterBind;
+            SetBindlessImageHeapCapability(supportsBindlessImageHeap);
             var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
             {
                 SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
                 ShaderSampledImageArrayNonUniformIndexing = supportsNonUniformImageIndexing,
                 ShaderStorageImageArrayNonUniformIndexing = supportsNonUniformImageIndexing,
+                RuntimeDescriptorArray = supportsBindlessImageHeap,
+                DescriptorBindingPartiallyBound = supportsBindlessImageHeap,
+                DescriptorBindingSampledImageUpdateAfterBind = supportsBindlessImageHeap,
+                DescriptorBindingStorageImageUpdateAfterBind = supportsBindlessImageHeap,
             };
             if (!supportsSharedInt64Atomics)
             {

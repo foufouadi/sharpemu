@@ -43,6 +43,7 @@ internal interface IShaderPipelineHost
     bool SharedInt64AtomicsEnabled { get; }
 
     bool NonUniformImageIndexingEnabled => false;
+    bool UsesBindlessImages => false;
     bool PerVertexPixelInputsSupported => true;
 
     RenderHostLimits Limits { get; }

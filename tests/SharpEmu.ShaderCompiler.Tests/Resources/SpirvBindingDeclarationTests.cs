@@ -81,6 +81,23 @@ public sealed class SpirvBindingDeclarationTests
     }
 
     [Fact]
+    public void BindlessImagesUseRuntimeArraysAndASeparateResourceSet()
+    {
+        var request = Request(EveryKindProgram(), usesBindlessImages: true);
+        Assert.True(request.Bindings.UsesBindlessImages);
+        Assert.Equal(BindingLayout.ImageSlotTableDwordCount(request.Resources.Info),
+            (uint)request.Bindings.Descriptors
+                .Where(binding => ImageDescriptorBinding.ResourceClass(binding.Kind) != ImageResourceClass.None)
+                .Sum(binding => binding.Resources.Count));
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        var module = new SpirvModuleInspector(shader.Spirv);
+        Assert.Contains((uint)SpirvCapability.RuntimeDescriptorArray, module.Capabilities);
+        Assert.Contains((1u, BindingLayout.NativeBindingIndex(ShaderStage.Compute, DescriptorBindingKind.Buffers)), module.DescriptorBindings);
+        Assert.Contains((0u, BindingLayout.FirstImageBinding + 2u), module.DescriptorBindings);
+    }
+
+    [Fact]
     public void PixelStage_OffsetsEveryBindingByTheStageCount()
     {
         var program = Program(BufferLoad(0, 4), EndProgram(8));

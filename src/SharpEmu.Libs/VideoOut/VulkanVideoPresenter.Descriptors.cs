@@ -400,6 +400,7 @@ internal static unsafe partial class VulkanVideoPresenter
             BindBuffers(stage);
             ObtainDeviceAddressRanges(stage);
             BindImages(stage);
+            BindFlattenedResourceTable(stage);
         }
 
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
@@ -485,15 +486,58 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             prepared.Descriptors.Buffers = views;
-            if (layout.Find(DescriptorBindingKind.FlattenedResourceTable) is not null)
-            {
-                prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program);
-            }
-
             if (layout.Find(DescriptorBindingKind.ShaderData) is not null)
             {
                 prepared.Descriptors.ShaderData = UploadDwords(shaderData, "shader data", program);
             }
+        }
+
+        private void BindFlattenedResourceTable(PreparedStageBindings prepared)
+        {
+            var layout = prepared.Layout;
+            if (layout.Find(DescriptorBindingKind.FlattenedResourceTable) is null)
+            {
+                return;
+            }
+
+            var program = prepared.Program;
+            var snapshot = prepared.Stage.Resources;
+            if (!layout.UsesBindlessImages)
+            {
+                prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program);
+                return;
+            }
+
+            var slotCount = (int)BindingLayout.ImageSlotTableDwordCount(prepared.Resources.Info);
+            var table = new uint[checked(slotCount + snapshot.FlattenedResourceTable.Length)];
+            var slot = 0;
+            foreach (var binding in layout.Descriptors)
+            {
+                if (ImageDescriptorBinding.ResourceClass(binding.Kind) == ShaderCompiler.Resources.ImageResourceClass.None)
+                {
+                    continue;
+                }
+
+                var occurrences = new uint[prepared.Descriptors.Images.Length];
+                foreach (var resource in binding.Resources)
+                {
+                    var texture = prepared.Descriptors.Images[resource];
+                    var occurrence = occurrences[resource]++;
+                    var view = texture.MipViews.Length == 0
+                        ? texture.View
+                        : occurrence < (uint)texture.MipViews.Length ? texture.MipViews[occurrence] : default;
+                    if (view.Handle == 0)
+                    {
+                        throw SubmissionScheduler.Fatal($"A bindless image has no view: image={resource} hash=0x{program.Hash:X16}.");
+                    }
+
+                    table[slot++] = _bindlessImageHeap!.GetOrCreateSlot(
+                        binding.Kind, prepared.Stage.Resources.Images[(int)resource], view, texture.Layout);
+                }
+            }
+
+            snapshot.FlattenedResourceTable.AsSpan().CopyTo(table.AsSpan(slotCount));
+            prepared.Descriptors.FlattenedTable = UploadDwords(table, "bindless image slot table", program);
         }
 
         // Device-address reads need persistent page-table entries before the shader runs.
@@ -651,6 +695,11 @@ internal static unsafe partial class VulkanVideoPresenter
             var entry = RequirePipelineEntry(in pipeline);
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
+            if (entry.UsesBindlessImages)
+            {
+                var globalSet = _bindlessImageHeap!.Set;
+                _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, 0, 1, &globalSet, 0, null);
+            }
             var writeCount = 0;
             var bufferCount = 0;
             var imageCount = 0;
@@ -667,6 +716,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 foreach (var binding in stage.Layout.Descriptors)
                 {
+                    if (stage.Layout.UsesBindlessImages && ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None)
+                    {
+                        continue;
+                    }
+
                     writeCount++;
                     var count = (int)DescriptorWriter.DescriptorCount(binding);
                     if (ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None || binding.Kind == DescriptorBindingKind.Samplers)
@@ -750,6 +804,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     var occurrences = new uint[descriptors.Images.Length];
                     foreach (var binding in stage.Layout.Descriptors)
                     {
+                        if (stage.Layout.UsesBindlessImages && ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None)
+                        {
+                            continue;
+                        }
+
                         var write = new WriteDescriptorSet
                         {
                             SType = StructureType.WriteDescriptorSet,
@@ -841,7 +900,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         writes[writeIndex++] = write;
                     }
 
-                    for (var index = 0; index < descriptors.Images.Length; index++)
+                    for (var index = 0; index < descriptors.Images.Length && !stage.Layout.UsesBindlessImages; index++)
                     {
                         var expected = descriptors.Images[index].MipViews.Length == 0 ? 1u : (uint)descriptors.Images[index].MipViews.Length;
                         if (occurrences[index] != expected)
@@ -878,7 +937,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         if (entry.UsesPushDescriptors)
                         {
-                            _pushDescriptorApi.CmdPushDescriptorSet(command, bindPoint, entry.Layout, 0, (uint)writeIndex, writePointer);
+                            _pushDescriptorApi.CmdPushDescriptorSet(command, bindPoint, entry.Layout, entry.UsesBindlessImages ? 1u : 0u, (uint)writeIndex, writePointer);
                             ShaderCacheCounters.CountPushSet();
                         }
                         else
@@ -890,7 +949,8 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
 
                             _vk.UpdateDescriptorSets(_device, (uint)writeIndex, writePointer, 0, null);
-                            _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, 0, 1, &set, 0, null);
+                            var setIndex = entry.UsesBindlessImages ? 1u : 0u;
+                            _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, setIndex, 1, &set, 0, null);
                             ShaderCacheCounters.CountHeapSet();
                         }
                     }
