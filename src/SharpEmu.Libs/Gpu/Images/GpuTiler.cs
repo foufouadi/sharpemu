@@ -170,6 +170,15 @@ public sealed unsafe class GpuTiler : IDisposable
 
     private ulong StorageAlignment => Math.Max(_device.MinStorageBufferOffsetAlignment, 4);
 
+    // Scratch still waiting on its tick. A burst of uploads in one tick (a bindless title
+    // materializing thousands of textures) would otherwise keep every scratch alive at once.
+    private const ulong OutstandingScratchBudget = 256UL << 20;
+    private ulong _outstandingScratch;
+
+    // The owner ends the tick at its next safe point (before a draw or dispatch binds state)
+    // so completed scratch is released; a tick cannot end in the middle of an upload.
+    public bool ScratchOverBudget => Interlocked.Read(ref _outstandingScratch) > OutstandingScratchBudget;
+
     // The scratch stays alive through the current tick; a completion action frees it.
     private GpuBuffer AllocateScratch(ulong size)
     {
@@ -180,7 +189,12 @@ public sealed unsafe class GpuTiler : IDisposable
 
         var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, size);
-        _scheduler.QueueCompletionAction(buffer.Dispose);
+        Interlocked.Add(ref _outstandingScratch, size);
+        _scheduler.QueueCompletionAction(() =>
+        {
+            buffer.Dispose();
+            Interlocked.Add(ref _outstandingScratch, unchecked(0UL - size));
+        });
         return buffer;
     }
 

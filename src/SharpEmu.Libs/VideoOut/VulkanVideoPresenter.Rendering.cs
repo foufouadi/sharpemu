@@ -173,7 +173,16 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        public void RunPendingOperations() => RunPendingCommands();
+        public void RunPendingOperations()
+        {
+            // Start of a draw or dispatch: nothing is bound yet, so the tick can end here.
+            if (_imageCache.ScratchOverBudget && !_scheduler.InsideTickCallback)
+            {
+                _scheduler.Finish();
+            }
+
+            RunPendingCommands();
+        }
 
         public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
             _scheduler.Current.SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);

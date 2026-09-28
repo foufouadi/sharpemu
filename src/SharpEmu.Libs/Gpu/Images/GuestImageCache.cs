@@ -55,6 +55,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ulong TotalUsedMemory => _totalUsedMemory;
 
+    public bool ScratchOverBudget => _tiler.ScratchOverBudget;
+
     public int ImageCount => _slots.Count;
 
     // Finishes GPU work, removes every image from the index and its watches, then frees the images.
@@ -353,13 +355,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             var address = request.Description.Metadata.Range.Address;
             if (!_surfaceMetadata.TryGetValue(address, out var metadata))
             {
-                _surfaceMetadata.Add(address, new SurfaceMetadata { Kind = SurfaceMetadataKind.HTile, ClearMask = image.Description.HtileClearMask });
+                _surfaceMetadata.Add(address, CreateMetadata(SurfaceMetadataKind.HTile, image.Description.HtileClearMask));
             }
             else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
             {
                 // A pending DCC fill uses the DCC encoding; it must not become HTile state.
                 metadata.Kind = SurfaceMetadataKind.HTile;
-                metadata.ClearMask = image.Description.HtileClearMask;
+                metadata.SetFromMask(image.Description.HtileClearMask);
                 metadata.FillValue = 0xffffffff;
                 metadata.FillSize = 0;
             }
