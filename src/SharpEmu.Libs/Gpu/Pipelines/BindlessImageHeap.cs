@@ -24,16 +24,19 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     {
         public readonly DescriptorBindingKind Kind;
         public readonly ulong View;
+        public readonly ImageLayout Layout;
         public readonly uint[] Words;
 
-        public SlotKey(DescriptorBindingKind kind, ulong view, ReadOnlySpan<uint> words)
+        public SlotKey(DescriptorBindingKind kind, ulong view, ImageLayout layout, ReadOnlySpan<uint> words)
         {
             Kind = kind;
             View = view;
+            Layout = layout;
             Words = words.ToArray();
         }
 
         public bool Equals(SlotKey? other) => other is not null && Kind == other.Kind && View == other.View &&
+            Layout == other.Layout &&
             Words.AsSpan().SequenceEqual(other.Words);
 
         public override bool Equals(object? obj) => Equals(obj as SlotKey);
@@ -43,6 +46,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             var hash = new HashCode();
             hash.Add(Kind);
             hash.Add(View);
+            hash.Add(Layout);
             hash.AddBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(Words.AsSpan()));
             return hash.ToHashCode();
         }
@@ -174,7 +178,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             throw SubmissionScheduler.Fatal($"The bindless image slot is invalid: kind={kind} view=0x{view.Handle:X}.");
         }
 
-        var key = new SlotKey(kind, view.Handle, words);
+        var key = new SlotKey(kind, view.Handle, layout, words);
         if (_slots.TryGetValue(key, out var existing))
         {
             return existing;
