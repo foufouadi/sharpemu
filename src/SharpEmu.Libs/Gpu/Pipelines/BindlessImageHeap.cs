@@ -53,14 +53,17 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     }
 
     private readonly GpuDeviceInfo _device;
+    private readonly SubmissionScheduler _scheduler;
     private readonly DescriptorSet _set;
     private readonly Dictionary<SlotKey, uint> _slots = new();
+    private readonly List<uint>[] _free = [[], []];
     private readonly uint[] _next = new uint[BindingCount];
     private readonly uint[] _capacity = new uint[BindingCount];
     private readonly DescriptorSetLayout _layout;
 
     public BindlessImageHeap(
         GpuDeviceInfo device,
+        SubmissionScheduler scheduler,
         uint maxPerStageSampledImages,
         uint maxPerStageStorageImages,
         uint maxPerStageUpdateAfterBindSampledImages,
@@ -69,6 +72,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         uint maxUpdateAfterBindStorageImages,
         uint maxUpdateAfterBindDescriptors)
     {
+        _scheduler = scheduler;
         var sampledLimit = Math.Min(
             Math.Min(Math.Min(maxPerStageSampledImages, maxPerStageUpdateAfterBindSampledImages), maxUpdateAfterBindSampledImages),
             StableCapacityPerBinding);
@@ -184,10 +188,19 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             return existing;
         }
 
-        var slot = ++_next[index];
-        if (slot >= _capacity[index])
+        uint slot;
+        if (_free[index].Count != 0)
         {
-            throw SubmissionScheduler.Fatal($"The bindless image heap is full: kind={kind} capacity={_capacity[index]}.");
+            slot = _free[index][^1];
+            _free[index].RemoveAt(_free[index].Count - 1);
+        }
+        else
+        {
+            slot = ++_next[index];
+            if (slot >= _capacity[index])
+            {
+                throw SubmissionScheduler.Fatal($"The bindless image heap is full: kind={kind} capacity={_capacity[index]}.");
+            }
         }
 
         var info = new DescriptorImageInfo { ImageView = view, ImageLayout = layout };
@@ -207,6 +220,52 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         }
         _slots.Add(key, slot);
         return slot;
+    }
+
+    public void InvalidateViews(IReadOnlyList<ImageView> views)
+    {
+        if (views.Count == 0)
+        {
+            return;
+        }
+
+        var handles = views.Select(static view => view.Handle).ToHashSet();
+        var retired = new List<(uint Binding, uint Slot)>();
+        foreach (var pair in _slots.Where(pair => handles.Contains(pair.Key.View)).ToArray())
+        {
+            var binding = DescriptorWriter.DescriptorType(pair.Key.Kind) == DescriptorType.SampledImage ? 0u : 1u;
+            WriteNullDescriptor(binding, pair.Value);
+            _slots.Remove(pair.Key);
+            retired.Add((binding, pair.Value));
+        }
+
+        if (retired.Count != 0)
+        {
+            _scheduler.QueueCompletionAction(() =>
+            {
+                foreach (var (binding, slot) in retired)
+                {
+                    _free[binding].Add(slot);
+                }
+            });
+        }
+    }
+
+    private void WriteNullDescriptor(uint binding, uint slot)
+    {
+        var info = new DescriptorImageInfo { ImageLayout = ImageLayout.Undefined };
+        DescriptorImageInfo* infoPointer = &info;
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = _set,
+            DstBinding = binding,
+            DstArrayElement = slot,
+            DescriptorCount = 1,
+            DescriptorType = binding == 0 ? DescriptorType.SampledImage : DescriptorType.StorageImage,
+            PImageInfo = infoPointer,
+        };
+        _device.Vk.UpdateDescriptorSets(_device.Device, 1, &write, 0, null);
     }
 
     public void Dispose()

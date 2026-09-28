@@ -32,9 +32,13 @@ internal static unsafe partial class VulkanVideoPresenter
             DestroyFeedbackSnapshotPool();
             DestroyRenderPipelines();
             _descriptorHeap.Dispose();
+            if (_imageCache is not null)
+            {
+                _imageCache.BindlessImageInvalidator = null;
+            }
             _bindlessImageHeap?.Dispose();
             _bindlessImageHeap = null;
-            _imageCache.Dispose();
+            _imageCache?.Dispose();
             _samplerStore.Dispose();
             _bufferCache.Dispose();
             PerfOverlay.SetGuestCacheStatistics(0, 0, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);

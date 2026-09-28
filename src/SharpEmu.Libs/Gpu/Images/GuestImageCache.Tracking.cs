@@ -106,6 +106,11 @@ public sealed partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"A GPU-modified image cannot be deleted before its contents are resolved: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X}.");
         }
 
+        if (image.Views.Count != 0)
+        {
+            BindlessImageInvalidator?.Invoke(image.Views.Select(static view => view.View).ToArray());
+        }
+
         _scheduledReadbacks.Remove(imageIdentifier);
         if (image.Description.HasMetadata)
         {

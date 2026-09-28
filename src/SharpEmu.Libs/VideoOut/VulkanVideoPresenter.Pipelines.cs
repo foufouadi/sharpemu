@@ -392,6 +392,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _bindlessImageHeap = new BindlessImageHeap(
                 _deviceInfo,
+                _scheduler,
                 _maxPerStageSampledImages,
                 _maxPerStageStorageImages,
                 _maxPerStageUpdateAfterBindSampledImages,
@@ -399,6 +400,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _maxUpdateAfterBindSampledImages,
                 _maxUpdateAfterBindStorageImages,
                 _maxUpdateAfterBindDescriptors);
+            _imageCache.BindlessImageInvalidator = _bindlessImageHeap.InvalidateViews;
         }
 
         // The set is pushed when its descriptors fit the device limit, else it comes from the heap.

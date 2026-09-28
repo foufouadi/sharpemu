@@ -847,7 +847,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptorIndexingQuery.RuntimeDescriptorArray &&
                 descriptorIndexingQuery.DescriptorBindingPartiallyBound &&
                 descriptorIndexingQuery.DescriptorBindingSampledImageUpdateAfterBind &&
-                descriptorIndexingQuery.DescriptorBindingStorageImageUpdateAfterBind;
+                descriptorIndexingQuery.DescriptorBindingStorageImageUpdateAfterBind &&
+                supportsNullDescriptor;
             SetBindlessImageHeapCapability(supportsBindlessImageHeap);
             var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
             {

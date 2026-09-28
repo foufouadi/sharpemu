@@ -41,6 +41,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private bool _readbackLinearImages;
     private bool _disposed;
 
+    // The persistent Vulkan image heap must invalidate views before this cache
+    // destroys an evicted image. The callback is installed only when the device
+    // supports null descriptors and bindless images are active.
+    public Action<IReadOnlyList<ImageView>>? BindlessImageInvalidator { get; set; }
+
     public GuestImageCache(GpuDeviceInfo device, SubmissionScheduler scheduler, PageGuard pages, GuestBufferCache bufferCache, IGuestBackedSpace backing, bool readbackLinearImages)
     {
         _device = device;
