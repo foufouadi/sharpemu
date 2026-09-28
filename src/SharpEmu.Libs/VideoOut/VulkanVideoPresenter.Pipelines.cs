@@ -56,6 +56,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
         private KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
+        private uint _maxPerStageSampledImages = uint.MaxValue;
+        private uint _maxPerStageStorageImages = uint.MaxValue;
         private SampleCountFlags _noAttachmentSampleCounts;
         private DescriptorHeap _descriptorHeap = null!;
 
@@ -67,6 +69,8 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+
+        bool IShaderPipelineHost.NonUniformImageIndexingEnabled => NonUniformImageIndexingEnabled;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
@@ -114,9 +118,22 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
+            // A word a previous GPU pass wrote is read once that pass's bytes are back in guest
+            // memory, as the command processor would see them: an image's contents go through
+            // its buffer view first, then the buffer comes back to guest memory.
+            foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+            {
+                _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+            }
+
+            if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+            {
+                _ = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint));
+            }
+
             if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) ||
                 _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
-                _imageCache.HasGpuModifiedImageBytes(address, sizeof(uint)))
+                _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)).Count != 0)
             {
                 return false;
             }
@@ -135,6 +152,11 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
+            if (!_guestMemory.CanRead(address, size))
+            {
+                return false;
+            }
+
             if (_bufferCache.HasGpuDirtyPages(address, size) ||
                 (clean && (_bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
             {
@@ -143,6 +165,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             return _guestMemory.TryRead(address, destination);
         }
+
+        bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
+            TryReadResidentGuestBytes(address, destination, clean: true);
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
@@ -348,6 +373,15 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 descriptorCount += binding.DescriptorCount;
                 demand = demand.Add(DescriptorSetDemand.Of(binding.DescriptorType, binding.DescriptorCount));
+            }
+
+            // A zero limit is an unreported one.
+            if ((_maxPerStageSampledImages != 0 && demand.SampledImages > _maxPerStageSampledImages) ||
+                (_maxPerStageStorageImages != 0 && demand.StorageImages > _maxPerStageStorageImages))
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"The shader stage binds more images than the device allows: sampled={demand.SampledImages}/{_maxPerStageSampledImages} " +
+                    $"storage={demand.StorageImages}/{_maxPerStageStorageImages}.");
             }
 
             usesPushDescriptors = descriptorCount <= _maxPushDescriptors;

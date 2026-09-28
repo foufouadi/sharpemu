@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.ShaderCompiler.Vulkan;
@@ -13,6 +14,7 @@ public readonly record struct ComputeImageClear(BufferDescriptorWords Descriptor
 
 public sealed partial class RenderExecutor
 {
+
     private const uint DispatchInitiatorUseThreadDimensions = 1u << 5;
     private const uint DispatchInitiatorBaseBits = 0x41;
     private const uint DispatchInitiatorModifierBits = 0xA038;
@@ -51,6 +53,35 @@ public sealed partial class RenderExecutor
         }
 
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
+        // A zero dimension executes no work. Check before materializing shaders: an indirect
+        // buffer can be read here only when no pending GPU write can change its contents.
+        var zeroDispatch = false;
+        if (indirectArgumentsAddress == 0 || useThreadDimensions)
+        {
+            zeroDispatch = groupsX == 0 || groupsY == 0 || groupsZ == 0;
+        }
+        else
+        {
+            Span<byte> arguments = stackalloc byte[3 * sizeof(uint)];
+            if (_host.TryReadCleanGuestBytes(indirectArgumentsAddress, arguments))
+            {
+                zeroDispatch = BinaryPrimitives.ReadUInt32LittleEndian(arguments) == 0 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[sizeof(uint)..]) == 0 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[(2 * sizeof(uint))..]) == 0;
+            }
+        }
+
+        if (zeroDispatch)
+        {
+            if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
+            {
+                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} " +
+                    $"indirect=0x{indirectArgumentsAddress:X16} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
+            }
+
+            return;
+        }
+
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         if (computeProgram.Consumed)
         {
@@ -113,16 +144,6 @@ public sealed partial class RenderExecutor
                     $"Converted thread dimensions to groups: threads={threadsX}x{threadsY}x{threadsZ} " +
                     $"local={Math.Max(compute.ThreadsX, 1)}x{Math.Max(compute.ThreadsY, 1)}x{Math.Max(compute.ThreadsZ, 1)} groups={groupsX}x{groupsY}x{groupsZ}");
             }
-        }
-
-        if (indirectArgumentsAddress == 0 && (groupsX == 0 || groupsY == 0 || groupsZ == 0))
-        {
-            if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
-            {
-                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
-            }
-
-            return;
         }
 
         _host.EndRendering();
