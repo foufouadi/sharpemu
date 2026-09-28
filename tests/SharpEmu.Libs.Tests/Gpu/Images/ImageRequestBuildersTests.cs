@@ -196,10 +196,12 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 64, 64, baseLevel: 1, lastLevel: 2, maxMip: 2);
         var request = ImageRequestBuilders.Texture(words, Sampled2D).Request;
 
-        Assert.Equal(3u, request.Description.Resources.Levels);
+        // The image holds the descriptor's resident mips 1..2; the layout still spans the guest chain.
+        Assert.Equal(1u, request.Description.FirstLevel);
+        Assert.Equal(2u, request.Description.Resources.Levels);
         Assert.True(request.Description.MipLayout[2].Size > 0);
         Assert.NotEqual(request.Description.MipLayout[1].Offset, request.Description.MipLayout[2].Offset);
-        Assert.Equal(1u, request.View.BaseLevel);
+        Assert.Equal(0u, request.View.BaseLevel);
         Assert.Equal(2u, request.View.LevelCount);
     }
 

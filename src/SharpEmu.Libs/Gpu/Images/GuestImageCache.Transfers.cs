@@ -107,7 +107,8 @@ public sealed unsafe partial class GuestImageCache
             plan.SwapBgra16 = info.Bgra16;
         }
 
-        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, info.Resources.Levels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
+        var guestLevels = info.FirstLevel + info.Resources.Levels;
+        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {
@@ -121,13 +122,26 @@ public sealed unsafe partial class GuestImageCache
         plan.Tiled = plan.Layout.Surface.Description.TileMode != GuestTileMode.Linear;
         if (plan.Tiled)
         {
-            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, info.Resources.Levels, out var tiles))
+            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, guestLevels, out var tiles))
             {
                 return plan;
             }
 
             plan.Tiles = tiles;
             plan.LinearSize = LinearSizeOf(plan.Tiles);
+        }
+
+        // Only the resident mips have host levels: guest level L lands on host level L - FirstLevel.
+        var firstLevel = info.FirstLevel;
+        if (firstLevel != 0)
+        {
+            plan.Regions.RemoveAll(region => region.ImageSubresource.MipLevel < firstLevel);
+            for (var index = 0; index < plan.Regions.Count; index++)
+            {
+                var region = plan.Regions[index];
+                region.ImageSubresource.MipLevel -= firstLevel;
+                plan.Regions[index] = region;
+            }
         }
 
         plan.Valid = true;
@@ -142,7 +156,8 @@ public sealed unsafe partial class GuestImageCache
     {
         ref readonly var info = ref image.Description;
         var plan = new ImageDownloadPlan { Depth = info.IsDepth };
-        if (info.Samples != 1 || image.Backing.Samples != 1)
+        // A streamed texture holds only its resident mips; the guest chain is not all there.
+        if (info.Samples != 1 || image.Backing.Samples != 1 || info.FirstLevel != 0)
         {
             return plan;
         }

@@ -112,13 +112,15 @@ public static partial class ImageRequestBuilders
 
     // The view follows the compiled module: a volume, a layer window to the last layer, or one layer.
     private static ImageViewDescription TextureView(
-        in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint viewLevels, uint imageLayers)
+        in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint viewLevels, uint imageLayers,
+        uint firstLevel = 0)
     {
+        var baseLevel = descriptor.BaseLevel - firstLevel;
         var mapping = shape.Storage || shaderConversion ? default : ViewFormatRules.ComponentMapping(DestinationSwizzle(descriptor));
         var usage = shape.Storage ? ImageUsageFlags.StorageBit : ImageUsageFlags.SampledBit;
         if (shape.Volume)
         {
-            return new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, 0, 1, mapping, usage);
+            return new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, baseLevel, viewLevels, 0, 1, mapping, usage);
         }
 
         var baseLayer = descriptor.BaseArray;
@@ -131,7 +133,7 @@ public static partial class ImageRequestBuilders
         var type = shape.OneDimensional
             ? shape.Arrayed ? ImageViewType.Type1DArray : ImageViewType.Type1D
             : shape.Arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D;
-        return new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, descriptor.BaseLevel, viewLevels, baseLayer, layerCount, mapping, usage);
+        return new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, baseLevel, viewLevels, baseLayer, layerCount, mapping, usage);
     }
 
     public static uint DestinationSwizzle(in TextureDescriptorWords descriptor) =>
@@ -241,7 +243,11 @@ public static partial class ImageRequestBuilders
             pixelFormat = depthFormat.DepthAttachmentFormat;
         }
         // Atomic storage images are declared as UINT in SPIR-V, including float atomics.
-        var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
+        // Write-only SINT storage images are declared as UINT and use the same-size UINT view.
+        var storageViewFormat = !storage ? Format.Undefined
+            : shape.Atomic || format == GuestPixelFormat.Bits32SInt ? Format.R32Uint
+            : shape.NumericClass == TextureNumericClass.Uint && ViewFormatRules.UintStorageFormat(pixelFormat) is var uintView && uintView != Format.Undefined ? uintView
+            : ViewFormatRules.SrgbStorageFormat(pixelFormat);
         var viewFormat = storage && storageViewFormat != Format.Undefined ? storageViewFormat : pixelFormat;
         var blockBytes = GuestPixelFormats.BlockCompressedBytes(format);
         var description = ImageDescription.Create();
@@ -264,7 +270,16 @@ public static partial class ImageRequestBuilders
             PopulateTextureMipLayout(ref description);
         }
 
-        var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers);
+        // A sampled texture whose descriptor starts past mip 0 is a streamed texture with only
+        // those mips resident: the host image holds them alone instead of the whole chain.
+        var firstLevel = !storage && !volume && samples == 1 && baseLevel > 0 && baseLevel < levels ? baseLevel : 0u;
+        if (firstLevel != 0)
+        {
+            description.FirstLevel = firstLevel;
+            description.Resources = new SubresourceCount(levels - firstLevel, imageLayers);
+        }
+
+        var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers, firstLevel);
         var request = new ImageRequest(description, view, storage ? ImageRole.StorageImage : ImageRole.Texture);
         return new TextureRequestResolution(request, shaderConversion, pixelFormat, DestinationSwizzle(descriptor));
     }

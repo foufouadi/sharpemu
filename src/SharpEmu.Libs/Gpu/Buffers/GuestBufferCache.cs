@@ -241,6 +241,42 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return (buffer, buffer.Offset(guestAddress));
     }
 
+    // A texture streamed into its address range maps only its resident mips: the mip tail
+    // and small levels sit at the start of the chain and level 0 at its end. The GPU samples
+    // only resident levels, so the unmapped pages of a whole-chain upload read as zero.
+    private bool TryReadResidentImagePages(ulong guestAddress, Span<byte> destination)
+    {
+        const ulong page = 1UL << 12;
+        var size = (ulong)destination.Length;
+        if (size == 0 || !_backing.IsBackedRange(guestAddress, 1))
+        {
+            return false;
+        }
+
+        // Only a resident prefix qualifies: a hole between backed pages is not a mip chain.
+        var resident = true;
+        for (ulong offset = 0; offset < size;)
+        {
+            var chunk = Math.Min(page - ((guestAddress + offset) & (page - 1)), size - offset);
+            var target = destination.Slice((int)offset, (int)chunk);
+            var backed = _backing.IsBackedRange(guestAddress + offset, chunk);
+            if (backed && !resident)
+            {
+                return false;
+            }
+
+            resident = backed && _backing.TryReadBacking(guestAddress + offset, target);
+            if (!resident)
+            {
+                target.Clear();
+            }
+
+            offset += chunk;
+        }
+
+        return true;
+    }
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
     {
         if (!IsValidRange(guestAddress, size))
@@ -282,7 +318,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         if (!_backing.TryReadBacking(guestAddress, _staging.Mapped.Slice((int)stageOffset, (int)size)) &&
             !KernelMemoryCompatExports.TryReadPrtBacking(_backing, guestAddress,
-                _staging.Mapped.Slice((int)stageOffset, (int)size)))
+                _staging.Mapped.Slice((int)stageOffset, (int)size)) &&
+            !TryReadResidentImagePages(guestAddress, _staging.Mapped.Slice((int)stageOffset, (int)size)))
         {
             throw SubmissionScheduler.Fatal(
                 $"Could not read the mapped guest image backing: address=0x{guestAddress:X16} size=0x{size:X16} range_backed={_backing.IsBackedRange(guestAddress, size)} first_byte_backed={_backing.IsBackedRange(guestAddress, 1)} last_byte_backed={_backing.IsBackedRange(guestAddress + size - 1, 1)} tick={_scheduler.CurrentTick}.");
