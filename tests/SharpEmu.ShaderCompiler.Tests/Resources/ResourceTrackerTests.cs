@@ -553,8 +553,10 @@ public sealed class ResourceTrackerTests
             BufferLoad(32, 8),
             EndProgram(36));
 
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(program));
-        Assert.Contains("not a valid runtime value", error.Message);
+        // The control-dependent V# is read from its SGPRs when the access runs.
+        var plan = Extract(program);
+        Assert.Empty(plan.Info.Buffers);
+        Assert.True(plan.Info.UsesDeviceAddresses);
     }
 
     [Fact]

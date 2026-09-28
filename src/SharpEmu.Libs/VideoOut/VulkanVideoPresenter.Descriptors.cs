@@ -432,12 +432,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier);
             var alignedOffset = offset - offset % alignment;
             var adjustment = offset - alignedOffset;
-            if (adjustment % sizeof(uint) != 0 || adjustment >= MaxMemoryOffsetAdjustment || size > maxRange - adjustment)
+            // A buffer read only through byte-assembled accesses may start mid-dword.
+            if ((adjustment % sizeof(uint) != 0 && resource.DwordAddressed) || adjustment >= MaxMemoryOffsetAdjustment || size > maxRange - adjustment)
             {
                 throw SubmissionScheduler.Fatal($"A storage buffer offset adjustment is unsupported: buffer={slot} adjustment={adjustment} hash=0x{program.Hash:X16}.");
             }
 
             memoryOffset = (uint)adjustment;
+
             if (resource.Formatted && resource.Written)
             {
                 _imageCache.InvalidateMemoryFromGpu(address, size);
@@ -517,6 +519,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var size = ClampMappedSize(range.Base, range.Size);
+
                 if (range.Written)
                 {
                     _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);

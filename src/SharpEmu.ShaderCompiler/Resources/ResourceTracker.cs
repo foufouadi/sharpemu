@@ -318,7 +318,8 @@ public sealed partial class ResourceTracker
         for (var candidate = 0; candidate < _sources.Count; candidate++)
         {
             var current = _sources[candidate];
-            if (current.DwordCount != source.DwordCount || !Equals(current.IndirectImage, source.IndirectImage))
+            if (current.DwordCount != source.DwordCount || !Equals(current.IndirectImage, source.IndirectImage) ||
+                !Equals(current.PointerTable, source.PointerTable))
             {
                 continue;
             }
@@ -377,7 +378,8 @@ public sealed partial class ResourceTracker
 
     private bool IsHostBufferHandle(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
-        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword));
+        handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword) &&
+            !DependsOnLoopCarriedRead(dword));
 
     private bool IsDeviceLoadedBufferHandle(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
@@ -411,6 +413,56 @@ public sealed partial class ResourceTracker
 
         return false;
     }
+
+    // A value that a loop recomputes from memory it read on the previous iteration (a
+    // pointer walk) differs per iteration even when its phis look structurally invariant.
+    private bool DependsOnLoopCarriedRead(ScalarValue value)
+    {
+        var phis = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+                continue;
+            if (current.Kind == ScalarValueKind.Phi)
+                phis.Add(current);
+            foreach (var operand in Dependencies(current))
+                pending.Push(operand);
+        }
+
+        foreach (var phi in phis)
+        {
+            // Look for the phi again below a memory read reached from its own operands.
+            var stack = new Stack<(ScalarValue Value, bool ThroughRead)>();
+            var seen = new HashSet<(ScalarValue, bool)>();
+            foreach (var operand in phi.Operands)
+                stack.Push((operand, false));
+            while (stack.TryPop(out var entry))
+            {
+                if (!seen.Add(entry))
+                    continue;
+                if (ReferenceEquals(entry.Value, phi) && entry.ThroughRead)
+                    return true;
+                if (ReferenceEquals(entry.Value, phi))
+                    continue;
+                var throughRead = entry.ThroughRead ||
+                    entry.Value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord or
+                        ScalarValueKind.ResourceTableWord;
+                foreach (var operand in Dependencies(entry.Value))
+                    stack.Push((operand, throughRead));
+            }
+        }
+
+        return false;
+    }
+
+    // A resource-table word stands for the flattened read it names.
+    private IEnumerable<ScalarValue> Dependencies(ScalarValue value) =>
+        value.Kind == ScalarValueKind.ResourceTableWord && value.Payload < (ulong)_plan.TableReads.Count
+            ? [_plan.TableReads[(int)value.Payload].Value]
+            : value.Operands;
 
     private uint GetHandleSource(
         ScalarValue? handle,
@@ -633,43 +685,27 @@ public sealed partial class ResourceTracker
 
     private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind) => HasRuntimeReadKind(value, kind, []);
 
-    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visiting)
+    // Reachability: a node already explored cannot add a new answer, so the visited set is
+    // kept for the whole walk (removing it on return re-walks shared subgraphs exponentially).
+    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visited)
     {
-        if (!visiting.Add(value))
+        if (!visited.Add(value))
         {
             return false;
         }
 
-        try
-        {
-            return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visiting));
-        }
-        finally
-        {
-            visiting.Remove(value);
-        }
+        return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visited));
     }
 
-    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visiting)
+    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visited)
     {
-        if (!visiting.Add(value))
+        if (!visited.Add(value))
         {
             return false;
         }
 
-        try
-        {
-            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
-            {
-                return true;
-            }
-
-            return value.Operands.Any(operand => HasRuntimeRead(operand, visiting));
-        }
-        finally
-        {
-            visiting.Remove(value);
-        }
+        return value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord ||
+            value.Operands.Any(operand => HasRuntimeRead(operand, visited));
     }
 
     // ---- dense tables ----
@@ -715,6 +751,8 @@ public sealed partial class ResourceTracker
         resource.Atomic |= atomic;
         resource.Formatted |= memory.Formatted;
         resource.Scalar |= memory.Kind == MemoryResourceKind.ScalarBuffer;
+        resource.DwordAddressed |= atomic || memory.Kind == MemoryResourceKind.ScalarBuffer ||
+            (!memory.Formatted && !memory.Typed && memory.DataBits >= 32);
     }
 
     private uint AddImage(uint source, MemoryAccessInfo memory, uint pc)
@@ -957,6 +995,19 @@ public sealed partial class ResourceTracker
                 return;
             }
 
+            // A V# chosen by control flow (a phi over several descriptors) has no single source
+            // to bind. Its SGPRs hold the selected descriptor when the access runs, so the
+            // access reads it there, as the hardware does, through the device-address table.
+            if (memory.Kind == MemoryResourceKind.Buffer && access.Handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
+                !memory.Opcode.StartsWith("TBuffer", StringComparison.Ordinal) &&
+                ((!ValidateSource(MakeSource(access.Handle, 4, false, false, memory.Pc), out _, out var controlDependent) && controlDependent) ||
+                 access.Handle.Operands.Any(DependsOnLoopCarriedRead)))
+            {
+                memory.DeviceDescriptor = true;
+                _info.UsesDeviceAddresses = true;
+                return;
+            }
+
             var source = GetHandleSource(
                 access.Handle,
                 ScalarValueKind.BufferHandle,
@@ -1060,7 +1111,9 @@ public sealed partial class ResourceTracker
             }
 
             var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
-            var samplerSource = GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
+            var samplerSource = !sampleAdjust && TryMakePointerTableSampler(access.SamplerHandle, memory.Pc, out var pointerSampler)
+                ? pointerSampler
+                : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
             sampler = AddSampler(samplerSource, memory.Pc);
             if (sampler == DescriptorConstants.NoIndex)
             {
@@ -1153,6 +1206,8 @@ public sealed partial class ResourceTracker
 
             if (TryMakeIndirectImage(handle, memory.Pc, out var plan) ||
                 TryMakeDenseIndirectImage(handle, memory.Pc, out plan) ||
+                TryMakeBufferTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
+                TryMakePointerTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
                 TryMakeDirectImage(handle, out plan))
             {
                 _indirectImages.Add(plan);

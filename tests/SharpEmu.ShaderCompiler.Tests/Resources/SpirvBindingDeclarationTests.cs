@@ -374,23 +374,21 @@ public sealed class SpirvBindingDeclarationTests
         uint firstImageType,
         uint secondImageType)
     {
-        AssertMixedImageCandidatesAreRejected(firstImageType, secondImageType);
+        AssertMismatchedCandidateBindsNull(firstImageType, secondImageType);
     }
 
-    private static void AssertMixedImageCandidatesAreRejected(uint firstImageType, uint secondImageType)
+    // A cube descriptor is not addressable through a 2D declaration (or the reverse); the
+    // hardware would read garbage, so that candidate binds as null instead of failing the draw.
+    private static void AssertMismatchedCandidateBindsNull(uint firstImageType, uint secondImageType)
     {
         var plan = Extract(IndirectImageAfterPlainImageProgram(indirectDimension: 3));
         var (userData, memory) = IndirectImageAfterPlainImageInputs(
             64, false, firstImageType: firstImageType, secondImageType: secondImageType);
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
-        var previousSnapshot = snapshot;
-        var previousSpecialization = specialization;
-        Assert.False(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
-            ref snapshot, ref specialization, out var failure));
-        Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failure);
-        Assert.Same(previousSnapshot, snapshot);
-        Assert.Same(previousSpecialization, specialization);
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+            ref snapshot, ref specialization, out _));
+        Assert.Single(new[] { snapshot.Images[1], snapshot.Images[2] }, words => words.All(word => word == 0));
     }
 
     [Fact]
