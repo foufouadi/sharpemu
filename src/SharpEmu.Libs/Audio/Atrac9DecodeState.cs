@@ -543,48 +543,59 @@ internal sealed class Atrac9DecodeState
 
     private bool TryDecodeExtendedNoLock(Atrac9StreamInfo info)
     {
+        // Multichannel block ordering and consumed-byte traversal follow
+        // YoteiPC's at9_api.c (GPL-2.0), adapted to the stateful LibAtrac9 API.
         if (_extendedDecoders is null || _planarPcm is null || _compressed is null)
         {
             return false;
         }
 
-        var blockBytes = info.BytesPerFrame;
         var frames = info.FramesPerSuperframe;
         var position = 0;
-        var blockData = new byte[info.Channels][];
-        for (var channel = 0; channel < info.Channels; channel++)
-        {
-            blockData[channel] = new byte[blockBytes * frames];
-        }
 
         for (var frame = 0; frame < frames; frame++)
         {
             for (var channel = 0; channel < info.Channels; channel++)
             {
-                if (frame != 0)
-                {
-                    while (position < _compressed.Length && (_compressed[position] & 0x80) == 0)
-                    {
-                        position++;
-                    }
-                }
-
-                if (position > _compressed.Length - blockBytes)
+                if (!TryBeginExtendedBlock(_compressed, frame, ref position))
                 {
                     return false;
                 }
 
-                _compressed.AsSpan(position, blockBytes).CopyTo(blockData[channel].AsSpan(frame * blockBytes));
-                position += blockBytes;
+                var remaining = _compressed.AsSpan(position).ToArray();
+                var used = _extendedDecoders[channel].DecodeFrame(
+                    remaining,
+                    _planarPcm[channel..(channel + 1)],
+                    frame * info.FrameSamples,
+                    frame);
+                if (used <= 0 || used > remaining.Length)
+                {
+                    return false;
+                }
+
+                position += used;
             }
         }
 
-        for (var channel = 0; channel < info.Channels; channel++)
+        return true;
+    }
+
+    internal static bool TryBeginExtendedBlock(ReadOnlySpan<byte> compressed, int frame, ref int position)
+    {
+        if (frame < 0 || position < 0 || position > compressed.Length)
         {
-            _extendedDecoders[channel].Decode(blockData[channel], _planarPcm[channel..(channel + 1)]);
+            return false;
         }
 
-        return true;
+        if (frame != 0)
+        {
+            while (position < compressed.Length && (compressed[position] & 0x80) == 0)
+            {
+                position++;
+            }
+        }
+
+        return position < compressed.Length;
     }
 
     private static bool TryParseConfig(
@@ -643,9 +654,10 @@ internal sealed class Atrac9DecodeState
 
         var channelsExtended = ((c[1] & 0x0F) + 1) * 4;
         var frameBytesExtended = (((c[2] & 7) << 6) | (c[3] >> 2)) + 1;
-        var framesExtended = 1 << (c[3] & 3);
+        var sfIndex = c[3] & 3;
+        var framesExtended = 1 << sfIndex;
         var frameSamplesExtended = 1 << FrameSamplePowers[sampleRateIndex];
-        var field = ((frameBytesExtended - 1) << 5) | (framesExtended << 3);
+        var field = ((frameBytesExtended - 1) << 5) | (sfIndex << 3);
         extendedDecoderConfig =
         [
             0xFE,

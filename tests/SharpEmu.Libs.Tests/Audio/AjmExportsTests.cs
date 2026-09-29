@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Reflection;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Audio;
 using Xunit;
@@ -230,6 +231,50 @@ public sealed class AjmExportsTests : IDisposable
         Assert.Equal(12u, ReadUInt32(ConfigInfoAddress + 8));
         Assert.Equal(256u, ReadUInt32(ConfigInfoAddress + 12));
         Assert.Equal(17u, ReadUInt32(ConfigInfoAddress + 16));
+    }
+
+    [Fact]
+    public void ParseConfigData_UsesSuperframeIndexInMonoDecoderConfig()
+    {
+        var decoder = new Atrac9DecodeState();
+        Assert.True(decoder.TryInitialize([0x30, 0x62, 0xC0, 0x42]));
+
+        var configField = typeof(Atrac9DecodeState).GetField(
+            "_extendedDecoderConfig",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var monoConfig = Assert.IsType<byte[]>(configField?.GetValue(decoder));
+
+        // frameBytes=17 and sfIndex=2: the low config field is 16 << 5 | 2 << 3.
+        Assert.Equal(new byte[] { 0xFE, 0x00, 0x02, 0x10 }, monoConfig);
+    }
+
+    [Fact]
+    public void ExtendedBlocks_AdvanceByConsumedBytesAndSkipPadding()
+    {
+        // Two channels, two frames: the consumed block lengths differ and the
+        // second frame has low-bit padding before its second channel block.
+        ReadOnlySpan<byte> compressed =
+        [
+            0x80, 0x01,       // frame 0, channel 0: used = 2
+            0x80, 0x82,       // frame 0, channel 1: used = 2
+            0x80,             // frame 1, channel 0: used = 1
+            0x03, 0x04, 0x80, // padding before channel 1
+            0x80, 0x05,       // frame 1, channel 1: used = 2
+        ];
+        var usedBytes = new[] { 2, 2, 1, 2 };
+        var position = 0;
+        var usedIndex = 0;
+
+        for (var frame = 0; frame < 2; frame++)
+        {
+            for (var channel = 0; channel < 2; channel++)
+            {
+                Assert.True(Atrac9DecodeState.TryBeginExtendedBlock(compressed, frame, ref position));
+                position += usedBytes[usedIndex++];
+            }
+        }
+
+        Assert.Equal(9, position);
     }
 
     [Fact]
