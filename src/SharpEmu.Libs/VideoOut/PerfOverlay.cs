@@ -40,6 +40,7 @@ public static class PerfOverlay
     private static long _imagePoolAllocatedBytes;
     private static int _liveDeviceAllocations;
     private static int _peakDeviceAllocations;
+    private static long _lastImageMemoryLogTimestamp;
 
     // Refreshed once per second so per-frame fills never allocate.
     private static long _statsWindowStart = Stopwatch.GetTimestamp();
@@ -145,6 +146,20 @@ public static class PerfOverlay
         Interlocked.Exchange(ref _imagePoolAllocatedBytes, checked((long)imagePoolAllocatedBytes));
         Interlocked.Exchange(ref _liveDeviceAllocations, liveDeviceAllocations);
         Interlocked.Exchange(ref _peakDeviceAllocations, peakDeviceAllocations);
+        if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMAGE_MEMORY") == "1")
+        {
+            var now = Stopwatch.GetTimestamp();
+            var last = Volatile.Read(ref _lastImageMemoryLogTimestamp);
+            if (last == 0 || now - last >= Stopwatch.Frequency * 2)
+            {
+                if (Interlocked.CompareExchange(ref _lastImageMemoryLogTimestamp, now, last) == last)
+                {
+                    Console.Error.WriteLine(
+                        $"[PERF][IMAGE_MEMORY] placed={imageBytes} allocated={imagePoolAllocatedBytes} " +
+                        $"free={(imagePoolAllocatedBytes >= imageBytes ? imagePoolAllocatedBytes - imageBytes : 0)}");
+                }
+            }
+        }
     }
 
     /// <summary>
