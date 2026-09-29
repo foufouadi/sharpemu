@@ -4352,7 +4352,7 @@ public static partial class Gen5SpirvTranslator
             out uint dynamicElement,
             out (uint Resource, uint Element) representative)
         {
-            dynamicElement = 0;
+            dynamicElement = uint.MaxValue;
             representative = default;
             if (!_request.SupportsNonUniformImageIndexing || elements.Count < 3)
                 return false;

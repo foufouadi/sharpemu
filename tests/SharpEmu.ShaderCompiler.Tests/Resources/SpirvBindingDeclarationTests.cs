@@ -237,7 +237,7 @@ public sealed class SpirvBindingDeclarationTests
     }
 
     // The materialised indirect-image request of the tracker fixture: two heap descriptors, one root.
-    internal static ShaderCompileRequest IndirectImageRequest()
+    internal static ShaderCompileRequest IndirectImageRequest(bool usesBindlessImages = false)
     {
         var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));
         uint[] userData = [0x1000, 224 << 16, 2, 0, 0x2000, 16 << 16, 4, 0, 7];
@@ -257,7 +257,10 @@ public sealed class SpirvBindingDeclarationTests
             BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64),
             false,
             ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
-            false);
+            false,
+            0,
+            false,
+            usesBindlessImages);
         return new ShaderCompileRequest(plan, resources, layout);
     }
 
@@ -514,13 +517,15 @@ public sealed class SpirvBindingDeclarationTests
     [Fact]
     public void IndirectImage_CompilesWithoutTheHeapDescriptorRead()
     {
-        var request = IndirectImageRequest();
+        var request = IndirectImageRequest(usesBindlessImages: true);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
 
         var module = new SpirvModuleInspector(shader.Spirv);
         Assert.Contains((ushort)SpirvOp.Select, module.Opcodes);
         Assert.DoesNotContain((uint)SpirvCapability.SampledImageArrayDynamicIndexing, module.Capabilities);
         Assert.Contains(request.Bindings.Descriptors, descriptor => descriptor.Kind == DescriptorBindingKind.FlattenedResourceTable);
+        Assert.Contains(request.Bindings.Descriptors, descriptor => descriptor.Kind == DescriptorBindingKind.ResidencyFeedback);
+        Assert.Contains((ushort)SpirvOp.AtomicOr, module.Opcodes);
     }
 
     // The materialised request of the dynamic-mip program: the descriptor's two levels become two elements.

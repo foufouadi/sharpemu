@@ -37,8 +37,49 @@ internal static unsafe partial class VulkanVideoPresenter
             public Sampler[] Samplers = [];
             public BufferView GlobalDataShare;
             public BufferView FlattenedTable;
+            public BufferView ResidencyFeedback;
             public BufferView ShaderData;
         }
+
+        private sealed class ResidencyFeedbackCapture
+        {
+            public VkBuffer Buffer;
+            public DeviceMemory Memory;
+            public nint Mapped;
+            public uint WordCount;
+            public ResidencyKey?[] SlotKeys = [];
+            public bool[] SlotIndirect = [];
+        }
+
+        private sealed class ResidencyKey : IEquatable<ResidencyKey>
+        {
+            public readonly DescriptorBindingKind Kind;
+            public readonly uint[] Words;
+
+            public ResidencyKey(DescriptorBindingKind kind, ReadOnlySpan<uint> words)
+            {
+                Kind = kind;
+                Words = words.ToArray();
+            }
+
+            public bool Equals(ResidencyKey? other) => other is not null && Kind == other.Kind &&
+                Words.AsSpan().SequenceEqual(other.Words);
+
+            public override bool Equals(object? obj) => Equals(obj as ResidencyKey);
+
+            public override int GetHashCode()
+            {
+                var hash = new HashCode();
+                hash.Add(Kind);
+                hash.AddBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(Words.AsSpan()));
+                return hash.ToHashCode();
+            }
+        }
+
+        private readonly record struct ResidencyState(ulong LastObserved, int UnusedObservations);
+
+        private readonly Dictionary<ResidencyKey, ResidencyState> _bindlessResidency = [];
+        private ulong _bindlessFeedbackEpoch;
 
         private sealed class PreparedStageBindings(ShaderStageResources stage, ShaderProgramInfo program) : IPreparedBindings
         {
@@ -57,6 +98,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public uint[] ShaderData { get; set; } = [];
 
             public TextureResource[] Textures => Descriptors.Images;
+
+            public ResidencyFeedbackCapture? ResidencyFeedback { get; set; }
         }
 
         private static ShaderStage StageOf(ShaderProgramInfo program) => program.Stage switch
@@ -98,7 +141,92 @@ internal static unsafe partial class VulkanVideoPresenter
             DepthCompare: image.DepthCompare,
             Atomic: image.Atomic);
 
-        private static bool[] FindResidentBindlessImages(ShaderResourceInfo info, uint[] flattenedTable)
+        private bool ShouldMaterializeBindlessImage(ShaderResourceInfo info, int index, uint[] words)
+        {
+            if (!_imageCache.IsUnderMemoryPressure || (uint)index >= (uint)info.Images.Count ||
+                info.Images[index].IndirectRoot == DescriptorConstants.NoIndex)
+            {
+                return true;
+            }
+
+            var kind = ImageDescriptorBinding.ForImage(info.Images[index]);
+            if (kind is not { } imageKind)
+            {
+                return true;
+            }
+
+            var key = new ResidencyKey(imageKind, words);
+            return !_bindlessResidency.TryGetValue(key, out var state) || state.UnusedObservations < 2;
+        }
+
+        private ResidencyFeedbackCapture CreateResidencyFeedback(BindingLayout layout, ShaderResourceInfo info, uint[][] imageWords)
+        {
+            var wordCount = BindingLayout.ResidencyFeedbackDwordCount(info);
+            var bytes = checked((int)Math.Max((ulong)sizeof(uint), (ulong)wordCount * sizeof(uint)));
+            var buffer = CreateHostBuffer(new byte[bytes], BufferUsageFlags.StorageBufferBit, out var memory, out var mapped);
+            var slotCount = (int)BindingLayout.ImageSlotTableDwordCount(info);
+            var slotKeys = new ResidencyKey?[slotCount];
+            var slotIndirect = new bool[slotCount];
+            var slot = 0;
+            foreach (var binding in layout.Descriptors)
+            {
+                if (ImageDescriptorBinding.ResourceClass(binding.Kind) == ShaderCompiler.Resources.ImageResourceClass.None)
+                {
+                    continue;
+                }
+
+                foreach (var resource in binding.Resources)
+                {
+                    var index = checked(slot++);
+                    slotKeys[index] = new ResidencyKey(binding.Kind, imageWords[resource]);
+                    slotIndirect[index] = info.Images[(int)resource].IndirectRoot != DescriptorConstants.NoIndex;
+                }
+            }
+
+            return new ResidencyFeedbackCapture
+            {
+                Buffer = buffer,
+                Memory = memory,
+                Mapped = mapped,
+                WordCount = wordCount,
+                SlotKeys = slotKeys,
+                SlotIndirect = slotIndirect,
+            };
+        }
+
+        private void ConsumeResidencyFeedback(ResidencyFeedbackCapture capture)
+        {
+            if (capture.Mapped == 0 || capture.WordCount == 0)
+            {
+                return;
+            }
+
+            var words = new ReadOnlySpan<uint>((void*)capture.Mapped, checked((int)capture.WordCount));
+            var epoch = ++_bindlessFeedbackEpoch;
+            for (var index = 0; index < capture.SlotKeys.Length; index++)
+            {
+                if (!capture.SlotIndirect[index] || capture.SlotKeys[index] is not { } key)
+                {
+                    continue;
+                }
+
+                var used = (words[index >> 5] & (1u << (index & 31))) != 0;
+                if (used)
+                {
+                    _bindlessResidency[key] = new ResidencyState(epoch, 0);
+                }
+                else if (_bindlessResidency.TryGetValue(key, out var state))
+                {
+                    _bindlessResidency[key] = state with { UnusedObservations = Math.Min(state.UnusedObservations + 1, 3) };
+                }
+                else
+                {
+                    _bindlessResidency[key] = new ResidencyState(epoch, 1);
+                }
+            }
+        }
+
+        private bool[] FindResidentBindlessImages(ShaderResourceInfo info, uint[][] imageWords, uint[] flattenedTable)
         {
             var resident = new bool[info.Images.Count];
             for (var index = 0; index < info.Images.Count; index++)
@@ -125,7 +253,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     // descriptor: preserve the old eager behavior for this table.
                     foreach (var candidate in candidates)
                     {
-                        if (candidate < resident.Length)
+                        if (candidate < resident.Length && ShouldMaterializeBindlessImage(info, (int)candidate, imageWords[(int)candidate]))
                         {
                             resident[(int)candidate] = true;
                         }
@@ -144,7 +272,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     foreach (var candidate in candidates)
                     {
-                        if (candidate < resident.Length)
+                        if (candidate < resident.Length && ShouldMaterializeBindlessImage(info, (int)candidate, imageWords[(int)candidate]))
                         {
                             resident[(int)candidate] = true;
                         }
@@ -159,7 +287,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (candidate < candidates.Count)
                     {
                         var resource = candidates[(int)candidate];
-                        if (resource < resident.Length)
+                        if (resource < resident.Length && ShouldMaterializeBindlessImage(info, (int)resource, imageWords[(int)resource]))
                         {
                             resident[(int)resource] = true;
                         }
@@ -329,7 +457,7 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Images = new TextureResource[info.Images.Count];
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
-            var residentImages = layout.UsesBindlessImages ? FindResidentBindlessImages(info, snapshot.FlattenedResourceTable) : null;
+            var residentImages = layout.UsesBindlessImages ? FindResidentBindlessImages(info, snapshot.Images, snapshot.FlattenedResourceTable) : null;
             for (var index = 0; index < info.Images.Count; index++)
             {
                 descriptors.Images[index] = index == hostMovie.Luma
@@ -346,6 +474,15 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
                     SamplesIntegerViews(info, descriptors.Images, index));
+            }
+
+            if (layout.Find(DescriptorBindingKind.ResidencyFeedback) is not null)
+            {
+                prepared.ResidencyFeedback = CreateResidencyFeedback(layout, info, snapshot.Images);
+                descriptors.ResidencyFeedback = new BufferView(
+                    prepared.ResidencyFeedback.Buffer,
+                    0,
+                    (ulong)Math.Max(sizeof(uint), checked((int)prepared.ResidencyFeedback.WordCount * sizeof(uint))));
             }
 
             var shaderData = new uint[layout.ShaderDataDwordCount];
@@ -767,6 +904,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     RecycleHostBuffer(texture.StagingBuffer, texture.StagingMemory);
                 }
             }
+
+            if (stage.ResidencyFeedback is { } feedback)
+            {
+                RecycleHostBuffer(feedback.Buffer, feedback.Memory);
+                stage.ResidencyFeedback = null;
+            }
         }
 
         private static DescriptorImageInfo ImageInfo(TextureResource texture, uint element, ShaderProgramInfo program, int index)
@@ -946,12 +1089,14 @@ internal static unsafe partial class VulkanVideoPresenter
                                 }
 
                                 case DescriptorBindingKind.FlattenedResourceTable:
+                                case DescriptorBindingKind.ResidencyFeedback:
                                 case DescriptorBindingKind.ShaderData:
                                 case DescriptorBindingKind.GlobalDataShare:
                                 {
                                     var view = binding.Kind switch
                                     {
                                         DescriptorBindingKind.FlattenedResourceTable => descriptors.FlattenedTable,
+                                        DescriptorBindingKind.ResidencyFeedback => descriptors.ResidencyFeedback,
                                         DescriptorBindingKind.ShaderData => descriptors.ShaderData,
                                         _ => descriptors.GlobalDataShare,
                                     };
@@ -1057,6 +1202,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 DebugName = bindPoint == PipelineBindPoint.Compute ? "SharpEmu dispatch" : "SharpEmu draw",
                 Textures = textures,
                 FeedbackSnapshots = preparation.FeedbackSnapshots?.ToArray() ?? [],
+                ResidencyFeedback = stages
+                    .ToArray()
+                    .Select(static stage => ((PreparedStageBindings)stage).ResidencyFeedback)
+                    .Where(static feedback => feedback is not null)
+                    .Select(static feedback => feedback!)
+                    .ToArray(),
                 OverflowBuffers = preparation.OverflowBuffers.Count == 0 ? null : preparation.OverflowBuffers.ToArray(),
             });
             preparation.OverflowBuffers.Clear();

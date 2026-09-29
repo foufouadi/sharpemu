@@ -18,6 +18,7 @@ public enum DescriptorBindingKind : uint
     FaultBuffer,
     FlattenedResourceTable,
     ShaderData,
+    ResidencyFeedback,
     Count,
 }
 
@@ -365,6 +366,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         return count;
     }
 
+    public static uint ResidencyFeedbackDwordCount(ShaderResourceInfo info) =>
+        (ImageSlotTableDwordCount(info) + 31) / 32;
+
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
     public bool UsesShaderBase => ShaderBaseDword != NoShaderBase;
@@ -628,6 +632,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         if (flattened)
         {
             descriptors.Add(new DescriptorBinding(DescriptorBindingKind.FlattenedResourceTable, []));
+        }
+
+        if (usesBindlessImages && info.Images.Any(image => image.IndirectRoot != DescriptorConstants.NoIndex))
+        {
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.ResidencyFeedback, []));
         }
 
         if (shaderDataDwords != 0 && pushStart == PushData.NoStart)
