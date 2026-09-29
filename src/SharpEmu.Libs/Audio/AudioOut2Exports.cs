@@ -70,6 +70,7 @@ public static class AudioOut2Exports
     private sealed class ContextState
     {
         private readonly object _paceGate = new();
+        private IHostAudioStream? _backend;
         private long _nextAdvanceTimestamp;
 
         public ContextState(ulong handle, uint frequency, uint grainSamples, uint queueDepth, IHostAudioStream? backend)
@@ -78,14 +79,16 @@ public static class AudioOut2Exports
             Frequency = frequency == 0 ? 48000 : frequency;
             GrainSamples = grainSamples == 0 ? 256 : grainSamples;
             QueueDepth = queueDepth == 0 ? 4 : queueDepth;
-            Backend = backend;
+            _backend = backend;
         }
 
         public ulong Handle { get; }
         public uint Frequency { get; }
         public uint GrainSamples { get; }
         public uint QueueDepth { get; }
-        public IHostAudioStream? Backend { get; }
+        public IHostAudioStream? Backend => Volatile.Read(ref _backend);
+
+        public void AttachBackend(IHostAudioStream? backend) => Volatile.Write(ref _backend, backend);
 
         public uint QueuedGrains
         {
@@ -893,6 +896,7 @@ public static class AudioOut2Exports
                 }
 
                 backendName = PrimaryBackendName;
+                context.AttachBackend(PrimaryBackend);
                 return PrimaryBackend;
             }
 
@@ -915,6 +919,7 @@ public static class AudioOut2Exports
             }
 
             backendName = SecondaryBackendName;
+            context.AttachBackend(SecondaryBackend);
             return SecondaryBackend;
         }
     }
