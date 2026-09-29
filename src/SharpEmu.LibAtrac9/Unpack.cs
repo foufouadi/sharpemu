@@ -312,8 +312,8 @@ namespace LibAtrac9
                 int precision = channel.Precisions[i] + 1;
                 if (precision <= maxHuffPrecision)
                 {
-                    HuffmanCodebook huff = Tables.HuffmanSpectrum[channel.CodebookSet[i]][precision][Tables.QuantUnitToCodebookIndex[i]];
                     // A valid stream never selects a codebook the format leaves undefined.
+                    HuffmanCodebook huff = Tables.HuffmanSpectrum[channel.CodebookSet[i]]?[precision]?[Tables.QuantUnitToCodebookIndex[i]];
                     if (huff == null)
                     {
                         throw new InvalidDataException(
