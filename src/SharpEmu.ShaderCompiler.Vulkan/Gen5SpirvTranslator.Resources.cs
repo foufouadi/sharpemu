@@ -72,7 +72,6 @@ public static partial class Gen5SpirvTranslator
         private uint _imageSlotTableDwordCount;
         private uint _pageTable;
         private uint _faultBuffer;
-        private uint _residencyFeedback;
         private uint _globalDataShare;
         private uint _samplerArray;
         private uint _samplerType;
@@ -175,9 +174,6 @@ public static partial class Gen5SpirvTranslator
                         break;
                     case DescriptorBindingKind.FaultBuffer:
                         _faultBuffer = DeclareWordBlock("faultBuffer", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
-                        break;
-                    case DescriptorBindingKind.ResidencyFeedback:
-                        _residencyFeedback = DeclareWordBlock("residencyFeedback", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
                         break;
                     case DescriptorBindingKind.FlattenedResourceTable:
                         _flattenedTable = DeclareWordBlock("flattenedResourceTable", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
@@ -445,24 +441,6 @@ public static partial class Gen5SpirvTranslator
 
         private uint BlockWordPointer(uint block, uint dwordIndex) =>
             _module.AddInstruction(SpirvOp.AccessChain, _storageUintPointer, block, UInt(0), dwordIndex);
-
-        private void MarkImageResidency(uint resourceIndex)
-        {
-            if (_residencyFeedback == 0)
-            {
-                return;
-            }
-
-            var word = ShiftRightLogical(resourceIndex, UInt(5));
-            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(resourceIndex, UInt(31)));
-            _module.AddInstruction(
-                SpirvOp.AtomicOr,
-                _uintType,
-                BlockWordPointer(_residencyFeedback, word),
-                UInt(1),
-                UInt(0),
-                bit);
-        }
 
         private uint IsBlockWordInRange(uint block, uint dwordIndex) =>
             _module.AddInstruction(
@@ -1586,14 +1564,13 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var localElementIndex = dynamicElement != uint.MaxValue ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
-            MarkImageResidency(IAdd(UInt(imageClass.SlotOffset), localElementIndex));
+            var localElementIndex = dynamicElement != 0 ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
             var elementIndex = request.Bindings.UsesBindlessImages
                 ? LoadImageSlot(imageClass, localElementIndex)
                 : localElementIndex;
             var elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
             var imageValue = Load(imageClass.ImageType, elementPointer);
-            if (dynamicElement != uint.MaxValue)
+            if (dynamicElement != 0)
             {
                 // The index can differ between invocations of one draw.
                 _module.AddCapability(SpirvCapability.ShaderNonUniform);
@@ -1628,7 +1605,7 @@ public static partial class Gen5SpirvTranslator
                 var sampler = Load(_samplerType, samplerPointer);
                 objectType = _module.TypeSampledImage(imageClass.ImageType);
                 imageObject = _module.AddInstruction(SpirvOp.SampledImage, objectType, imageValue, sampler);
-                if (dynamicElement != uint.MaxValue)
+                if (dynamicElement != 0)
                     _module.AddDecoration(imageObject, SpirvDecoration.NonUniform);
             }
             else

@@ -258,7 +258,6 @@ internal static unsafe partial class VulkanVideoPresenter
             // Draw-local feedback copies stay alive until the GPU has consumed
             // the descriptors that reference them.
             public CachedImage[] FeedbackSnapshots = [];
-            public ResidencyFeedbackCapture[] ResidencyFeedback = [];
             // Host buffers that took uploads the stream ring could not hold; recycled with the draw.
             public (VkBuffer Buffer, DeviceMemory Memory)[]? OverflowBuffers;
         }

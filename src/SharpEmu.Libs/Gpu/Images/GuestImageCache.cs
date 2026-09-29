@@ -69,8 +69,6 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ulong TotalUsedMemory => _totalUsedMemory;
 
-    public bool IsUnderMemoryPressure => _totalUsedMemory >= _memoryPressureBytes;
-
     public bool ScratchOverBudget => _tiler.ScratchOverBudget;
 
     public int ImageCount => _slots.Count;
