@@ -28,6 +28,8 @@ public sealed class AjmExportsTests : IDisposable
     private const ulong BatchInfoAddress = MemoryBase + 0x300;
     private const ulong StatisticsAddress = MemoryBase + 0x400;
     private const ulong BatchBufferAddress = MemoryBase + 0x500;
+    private const ulong ConfigAddress = MemoryBase + 0xB00;
+    private const ulong ConfigInfoAddress = MemoryBase + 0xB10;
 
     private readonly FakeCpuMemory _memory = new(MemoryBase, 0x1000);
     private readonly CpuContext _ctx;
@@ -196,6 +198,61 @@ public sealed class AjmExportsTests : IDisposable
 
         Assert.Equal(0, CreateInstance(contextId, 1, flags, InstanceAddress));
         Assert.Equal(0x4001u, ReadUInt32(InstanceAddress));
+    }
+
+    [Fact]
+    public void ParseConfigData_LayoutSevenIsReportedAsStereo()
+    {
+        WriteBytes(ConfigAddress, [0xFE, 0x4E, 0x00, 0x40]);
+
+        _ctx[CpuRegister.Rdi] = ConfigAddress;
+        _ctx[CpuRegister.Rsi] = ConfigInfoAddress;
+        Assert.Equal(0, AjmExports.AjmDecAt9ParseConfigData(_ctx));
+
+        Assert.Equal(3u, ReadUInt32(ConfigInfoAddress));
+        Assert.Equal(1u, ReadUInt32(ConfigInfoAddress + 4));
+        Assert.Equal(2u, ReadUInt32(ConfigInfoAddress + 8));
+        Assert.Equal(128u, ReadUInt32(ConfigInfoAddress + 12));
+        Assert.Equal(3u, ReadUInt32(ConfigInfoAddress + 16));
+    }
+
+    [Fact]
+    public void ParseConfigData_Ps5MultichannelLayoutReportsFixedSuperframe()
+    {
+        WriteBytes(ConfigAddress, [0x30, 0x62, 0xC0, 0x40]);
+
+        _ctx[CpuRegister.Rdi] = ConfigAddress;
+        _ctx[CpuRegister.Rsi] = ConfigInfoAddress;
+        Assert.Equal(0, AjmExports.AjmDecAt9ParseConfigData(_ctx));
+
+        Assert.Equal(204u, ReadUInt32(ConfigInfoAddress));
+        Assert.Equal(1u, ReadUInt32(ConfigInfoAddress + 4));
+        Assert.Equal(12u, ReadUInt32(ConfigInfoAddress + 8));
+        Assert.Equal(256u, ReadUInt32(ConfigInfoAddress + 12));
+        Assert.Equal(17u, ReadUInt32(ConfigInfoAddress + 16));
+    }
+
+    [Fact]
+    public void UnsupportedStandardLayoutProducesSilentSuperframeWithoutError()
+    {
+        // Layout 6 is outside LibAtrac9's standard channel table. It must not
+        // be handed to the decoder, but the header still describes a complete
+        // stereo-duration superframe so the caller can keep its timeline.
+        var decoder = new Atrac9DecodeState();
+        Assert.True(decoder.TryInitialize([0xFE, 0x4C, 0x00, 0x40]));
+
+        var output = new byte[128 * 2 * sizeof(short)];
+        var result = decoder.Decode(
+            [0x00, 0x00, 0x00],
+            output,
+            Atrac9PcmEncoding.Signed16,
+            requestedChannels: 2,
+            multipleFrames: false);
+
+        Assert.Equal(0, result.Status);
+        Assert.Equal(output.Length, result.OutputWritten);
+        Assert.Equal(128u, result.TotalDecodedSamples);
+        Assert.All(output, value => Assert.Equal(0, value));
     }
 
     /// <summary>
@@ -515,6 +572,8 @@ public sealed class AjmExportsTests : IDisposable
         Assert.True(_memory.TryRead(address, value));
         return value;
     }
+
+    private void WriteBytes(ulong address, ReadOnlySpan<byte> value) => Assert.True(_memory.TryWrite(address, value));
 
     private void WriteUInt32(ulong address, uint value)
     {
