@@ -87,6 +87,25 @@ public static class AudioOut2Exports
         public uint QueueDepth { get; }
         public IHostAudioStream? Backend { get; }
 
+        public uint QueuedGrains
+        {
+            get
+            {
+                var queuedMilliseconds = Backend?.QueuedMilliseconds ?? -1;
+                if (queuedMilliseconds < 0)
+                {
+                    return 0;
+                }
+
+                var grainMilliseconds = (double)GrainSamples * 1000.0 / Frequency;
+                return Math.Min(
+                    QueueDepth,
+                    checked((uint)Math.Ceiling(queuedMilliseconds / grainMilliseconds)));
+            }
+        }
+
+        public uint FreeGrains => QueueDepth - Math.Min(QueueDepth, QueuedGrains);
+
         public void PaceAdvance()
         {
             long delay;
@@ -408,7 +427,10 @@ public static class AudioOut2Exports
         Span<byte> level = stackalloc byte[sizeof(uint)];
         if (outLevelAddress != 0)
         {
-            BinaryPrimitives.WriteUInt32LittleEndian(level, 0);
+            var queued = Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var currentContext)
+                ? currentContext.QueuedGrains
+                : 0u;
+            BinaryPrimitives.WriteUInt32LittleEndian(level, queued);
             if (!ctx.Memory.TryWrite(outLevelAddress, level))
             {
                 return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -420,7 +442,7 @@ public static class AudioOut2Exports
             IsWritableOutBuffer(outAvailableAddress))
         {
             var available = Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context)
-                ? context.QueueDepth
+                ? context.FreeGrains
                 : 4u;
             BinaryPrimitives.WriteUInt32LittleEndian(level, available);
             if (!ctx.Memory.TryWrite(outAvailableAddress, level))
@@ -597,7 +619,7 @@ public static class AudioOut2Exports
         Span<byte> state = stackalloc byte[PortStateSize];
         state.Clear();
         //   +0x00 u16 output   = CONNECTED_PRIMARY (1)
-        //   +0x02 u8  channels = from port format when known, else 2
+        //   +0x02 u8  active   = 1 (the game waits for output to become active)
         //   +0x04 s16 volume   = -1 (N/A for main)
         byte channels = 2;
         if (Ports.TryGetValue(portHandle, out var port) &&
@@ -607,7 +629,8 @@ public static class AudioOut2Exports
         }
 
         BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], PortStateOutputConnectedPrimary);
-        state[0x02] = channels;
+        state[0x02] = 1;
+        state[0x03] = channels;
         BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], -1);
 
         if (!ctx.Memory.TryWrite(stateAddress, state))
