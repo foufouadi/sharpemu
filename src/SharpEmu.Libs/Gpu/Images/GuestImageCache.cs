@@ -17,6 +17,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 {
     private const ulong TicksBeforeRemoval = 32;
     private const ulong MiB = 1024 * 1024;
+    private const ulong GiB = 1024 * MiB;
+    private const ulong MinimumMemorySafetyMargin = 512 * MiB;
+    private const ulong NoBudgetImageCacheLimit = 4 * GiB;
 
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
@@ -39,6 +42,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private long _pendingPoolReleaseBytes;
     private ulong _collectionTick;
     private bool _allocationCollectionBlocked;
+    private bool _collectionThresholdsOverridden;
+    private bool _collectionBudgetLogged;
     private uint _queryEpoch;
     private bool _readbackLinearImages;
     private bool _disposed;
@@ -56,16 +61,53 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _bufferCache = bufferCache;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
-        var budget = Math.Max(device.DeviceLocalBudgetBytes, 1UL);
-        _collectionStartBytes = budget / 2;
-        _memoryPressureBytes = budget * 3 / 5;
-        _criticalMemoryBytes = budget * 7 / 10;
-        Console.Error.WriteLine(
-            $"[LOADER][INFO] Image cache budget source={(device.HasMemoryBudget ? "VK_EXT_memory_budget" : "device-local heap")} " +
-            $"heap={device.DeviceLocalHeapBytes} budget={device.DeviceLocalBudgetBytes} " +
-            $"thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
+        RefreshCollectionBudget();
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
+    }
+
+    private void RefreshCollectionBudget()
+    {
+        _device.RefreshMemoryBudget();
+        if (_collectionThresholdsOverridden)
+        {
+            return;
+        }
+
+        var available = Math.Max(_device.DeviceLocalAvailableBytes, 1UL);
+        var imageBudget = ComputeImageCacheBudget(available, _device.HasMemoryBudget);
+
+        _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
+        _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
+        _criticalMemoryBytes = Math.Max(imageBudget * 7 / 10, MiB);
+        if (!_collectionBudgetLogged)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Image cache budget source={(_device.HasMemoryBudget ? "VK_EXT_memory_budget" : "conservative heap fallback")} " +
+                $"heap={_device.DeviceLocalHeapBytes} budget={_device.DeviceLocalBudgetBytes} " +
+                $"usage={_device.DeviceLocalUsageBytes} available={_device.DeviceLocalAvailableBytes} " +
+                $"image_budget={imageBudget} thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
+            _collectionBudgetLogged = true;
+        }
+    }
+
+    internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget)
+    {
+        available = Math.Max(available, 1UL);
+        var safetyMargin = Math.Max(available / 4, MinimumMemorySafetyMargin);
+        var imageBudget = available > safetyMargin
+            ? available - safetyMargin
+            : Math.Max(available / 2, MiB);
+        if (!hasMemoryBudget)
+        {
+            // Without VK_EXT_memory_budget the physical heap size says nothing
+            // about allocations already held by the driver or other processes.
+            // Keep the historical conservative cap instead of treating all VRAM
+            // as available to the image cache.
+            imageBudget = Math.Min(imageBudget, NoBudgetImageCacheLimit);
+        }
+
+        return imageBudget;
     }
 
     public ulong TotalUsedMemory => _device.ImageMemory.PlacedBytes;

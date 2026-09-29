@@ -261,11 +261,17 @@ public sealed unsafe partial class GuestImageCache
             var linear = new TilerBufferSpan(source.Handle, sourceOffset, info.Data.Size);
             if (plan.Tiled)
             {
+                // Detile scratch is a real device-local allocation. Evict cold
+                // image cache entries before requesting a large dedicated
+                // buffer, otherwise the cache thresholds cannot protect this
+                // path from a single oversized upload.
+                CollectForAllocation(plan.LinearSize);
                 linear = _tiler.Detile(source.Handle, sourceOffset, info.Data.Size, plan.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(plan.Tiles));
             }
 
             if (plan.SwapBgra16)
             {
+                CollectForAllocation(linear.Size);
                 linear = _tiler.SwapBgra16(linear);
             }
 
@@ -288,6 +294,7 @@ public sealed unsafe partial class GuestImageCache
         if (info.TileMode != GuestTileMode.Linear)
         {
             var tiles = DepthTileTransfers(info, block, fullSliceSize);
+            CollectForAllocation(info.Data.Size);
             depthLinear = _tiler.Detile(source.Handle, sourceOffset, info.Data.Size, info.Data.Size, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tiles));
         }
 
@@ -306,7 +313,9 @@ public sealed unsafe partial class GuestImageCache
                 throw SubmissionScheduler.Fatal($"The depth upload conversion size overflows: transferSlice={transferSlice} layers={layers}.");
             }
 
-            var widened = _tiler.GetScratchBuffer(transferSlice * layers);
+            var widenedSize = transferSlice * layers;
+            CollectForAllocation(widenedSize);
+            var widened = _tiler.GetScratchBuffer(widenedSize);
             _tiler.ConvertDepth16(depthLinear, widened, DepthConversionDirection.Widen, info.PixelFormat == Format.D32SfloatS8Uint, new DepthConversionLayout
             {
                 Width = info.Extent.Width,

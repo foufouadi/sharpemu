@@ -23,8 +23,23 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         Device = device;
         vk.GetPhysicalDeviceMemoryProperties(physicalDevice, out _memoryProperties);
         DeviceLocalHeapBytes = CalculateDeviceLocalHeapBytes();
-        DeviceLocalBudgetBytes = memoryBudgetEnabled ? QueryDeviceLocalBudgetBytes() : DeviceLocalHeapBytes;
-        HasMemoryBudget = memoryBudgetEnabled && DeviceLocalBudgetBytes != DeviceLocalHeapBytes;
+        var queriedMemory = memoryBudgetEnabled
+            ? QueryDeviceLocalMemory()
+            : (Budget: 0UL, Usage: 0UL, Available: 0UL);
+        if (queriedMemory.Budget != 0)
+        {
+            DeviceLocalBudgetBytes = queriedMemory.Budget;
+            DeviceLocalUsageBytes = queriedMemory.Usage;
+            DeviceLocalAvailableBytes = queriedMemory.Available;
+            HasMemoryBudget = true;
+        }
+        else
+        {
+            DeviceLocalBudgetBytes = DeviceLocalHeapBytes;
+            DeviceLocalUsageBytes = 0;
+            DeviceLocalAvailableBytes = DeviceLocalHeapBytes;
+            HasMemoryBudget = false;
+        }
         vk.GetPhysicalDeviceProperties(physicalDevice, out var properties);
         MinUniformBufferOffsetAlignment = Math.Max(properties.Limits.MinUniformBufferOffsetAlignment, 1);
         MinStorageBufferOffsetAlignment = Math.Max(properties.Limits.MinStorageBufferOffsetAlignment, 1);
@@ -42,7 +57,11 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
 
     public ulong DeviceLocalHeapBytes { get; }
 
-    public ulong DeviceLocalBudgetBytes { get; }
+    public ulong DeviceLocalBudgetBytes { get; private set; }
+
+    public ulong DeviceLocalUsageBytes { get; private set; }
+
+    public ulong DeviceLocalAvailableBytes { get; private set; }
 
     public bool HasMemoryBudget { get; }
 
@@ -97,18 +116,18 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         }
     }
 
-    private ulong QueryDeviceLocalBudgetBytes()
+    private (ulong Budget, ulong Usage, ulong Available) QueryDeviceLocalMemory()
     {
         var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
         {
             SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
         };
-        var properties = new PhysicalDeviceProperties2
+        var properties = new PhysicalDeviceMemoryProperties2
         {
-            SType = StructureType.PhysicalDeviceProperties2,
+            SType = StructureType.PhysicalDeviceMemoryProperties2,
             PNext = &budget,
         };
-        Vk.GetPhysicalDeviceProperties2(PhysicalDevice, &properties);
+        Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &properties);
 
         var usedHeaps = new bool[_memoryProperties.MemoryHeapCount];
         fixed (PhysicalDeviceMemoryProperties* memoryProperties = &_memoryProperties)
@@ -123,16 +142,46 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
             }
         }
 
-        ulong total = 0;
+        ulong totalBudget = 0;
+        ulong totalUsage = 0;
+        ulong totalAvailable = 0;
         for (var index = 0u; index < _memoryProperties.MemoryHeapCount; index++)
         {
             if (usedHeaps[(int)index])
             {
-                total += budget.HeapBudget[index];
+                var heapBudget = budget.HeapBudget[index];
+                var heapUsage = budget.HeapUsage[index];
+                totalBudget = checked(totalBudget + heapBudget);
+                totalUsage = checked(totalUsage + heapUsage);
+                totalAvailable = checked(totalAvailable + CalculateAvailableBytes(heapBudget, heapUsage));
             }
         }
 
-        return total != 0 ? total : DeviceLocalHeapBytes;
+        return totalBudget != 0
+            ? (totalBudget, totalUsage, totalAvailable)
+            : (0, 0, 0);
+    }
+
+    internal static ulong CalculateAvailableBytes(ulong budget, ulong usage) =>
+        budget > usage ? budget - usage : 0;
+
+    public bool RefreshMemoryBudget()
+    {
+        if (!HasMemoryBudget)
+        {
+            return false;
+        }
+
+        var queriedMemory = QueryDeviceLocalMemory();
+        if (queriedMemory.Budget == 0)
+        {
+            return false;
+        }
+
+        DeviceLocalBudgetBytes = queriedMemory.Budget;
+        DeviceLocalUsageBytes = queriedMemory.Usage;
+        DeviceLocalAvailableBytes = queriedMemory.Available;
+        return true;
     }
 
     public int LiveAllocations => Volatile.Read(ref _liveAllocations);

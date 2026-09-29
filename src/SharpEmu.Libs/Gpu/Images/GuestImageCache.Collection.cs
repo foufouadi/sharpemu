@@ -24,6 +24,7 @@ public sealed partial class GuestImageCache
     // action, so no image is freed while the current tick can reference it.
     private void CollectForAllocation(ulong requiredBytes)
     {
+        RefreshCollectionBudget();
         // A burst can contain only newly touched images. Once the recency walk finds
         // no evictable image, retrying it for every allocation in the same tick is
         // pure repeated work; the next tick will make older images eligible.
@@ -57,6 +58,7 @@ public sealed partial class GuestImageCache
     public void RunGarbageCollector()
     {
         using var held = _lock.Hold();
+        RefreshCollectionBudget();
         var tick = _collectionTick++;
         _allocationCollectionBlocked = false;
         if (CollectionMemoryBytes < _collectionStartBytes)
@@ -153,6 +155,7 @@ public sealed partial class GuestImageCache
     // Test seams: thresholds, the recency order and the private state the tests inspect.
     internal void SetCollectionThresholds(ulong trigger, ulong pressure, ulong critical, ulong tick)
     {
+        _collectionThresholdsOverridden = true;
         _collectionStartBytes = trigger;
         _memoryPressureBytes = pressure;
         _criticalMemoryBytes = critical;
