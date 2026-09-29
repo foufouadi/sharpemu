@@ -94,16 +94,37 @@ public static class AudioOut2Exports
         {
             get
             {
-                var queuedMilliseconds = Backend?.QueuedMilliseconds ?? -1;
-                if (queuedMilliseconds < 0)
+                if (Backend is { } backend)
                 {
-                    return 0;
+                    var queuedMilliseconds = backend.QueuedMilliseconds;
+                    if (queuedMilliseconds >= 0)
+                    {
+                        var grainMilliseconds = (double)GrainSamples * 1000.0 / Frequency;
+                        return Math.Min(
+                            QueueDepth,
+                            checked((uint)Math.Ceiling(queuedMilliseconds / grainMilliseconds)));
+                    }
                 }
 
-                var grainMilliseconds = (double)GrainSamples * 1000.0 / Frequency;
-                return Math.Min(
-                    QueueDepth,
-                    checked((uint)Math.Ceiling(queuedMilliseconds / grainMilliseconds)));
+                // A context can be intentionally backend-less (headless runs,
+                // unavailable host audio, or before lazy backend binding). In
+                // that case PaceAdvance is the queue: report the portion of
+                // its software clock that has not elapsed yet instead of
+                // claiming that every grain is free.
+                lock (_paceGate)
+                {
+                    var remaining = _nextAdvanceTimestamp - Stopwatch.GetTimestamp();
+                    if (remaining <= 0)
+                    {
+                        return 0;
+                    }
+
+                    var grainTicks = checked(
+                        (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+                    return Math.Min(
+                        QueueDepth,
+                        checked((uint)Math.Ceiling((double)remaining / grainTicks)));
+                }
             }
         }
 
@@ -593,6 +614,10 @@ public static class AudioOut2Exports
     }
 
     // Fixed-size connected stereo state. Do not trust r8/r9 for byte counts.
+    // SceAudioOut2PortState is laid out as u16 output at +0, u8 active at +2,
+    // u8 channel count at +3, and s16 volume at +4. GTA's older trace/comment
+    // that treated +2 as channels is not the SDK layout; keep the active byte
+    // at +2 for Yotei and expose the decoded channel count at +3.
     [SysAbiExport(
         Nid = "gatEUKG+Ea4",
         ExportName = "sceAudioOut2PortGetState",

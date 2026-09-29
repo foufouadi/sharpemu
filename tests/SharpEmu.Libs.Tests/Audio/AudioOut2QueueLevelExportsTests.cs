@@ -52,6 +52,38 @@ public sealed class AudioOut2QueueLevelExportsTests
         Assert.Equal(0, AudioOut2Exports.AudioOut2ContextDestroy(ctx));
     }
 
+    [Fact]
+    public void ContextGetQueueLevelUsesSoftwarePacingWithoutBackend()
+    {
+        var memory = new FakeCpuMemory(MemoryBase, 0x1000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Span<byte> parameters = stackalloc byte[0x40];
+        BinaryPrimitives.WriteUInt32LittleEndian(parameters[0x0C..], 4);
+        BinaryPrimitives.WriteUInt32LittleEndian(parameters[0x10..], 4096);
+        Assert.True(memory.TryWrite(ParamAddress, parameters));
+
+        ctx[CpuRegister.Rdi] = ParamAddress;
+        ctx[CpuRegister.Rsi] = ContextMemoryAddress;
+        ctx[CpuRegister.Rdx] = 0x4000;
+        ctx[CpuRegister.Rcx] = ContextOutAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(ctx));
+        var handle = ReadUInt64(memory, ContextOutAddress);
+
+        // No port is attached, so ContextPush cannot bind a host backend and
+        // must account for the grain through the software pacing clock.
+        ctx[CpuRegister.Rdi] = handle;
+        ctx[CpuRegister.Rsi] = 0;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextPush(ctx));
+
+        ctx[CpuRegister.Rdi] = handle;
+        ctx[CpuRegister.Rsi] = QueuedAddress;
+        ctx[CpuRegister.Rdx] = 0;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx));
+        Assert.InRange(ReadUInt32(memory, QueuedAddress), 1u, 4u);
+
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextDestroy(ctx));
+    }
+
     private static uint ReadUInt32(FakeCpuMemory memory, ulong address)
     {
         Span<byte> value = stackalloc byte[sizeof(uint)];
