@@ -170,16 +170,27 @@ internal static unsafe partial class VulkanVideoPresenter
             return resident;
         }
 
-        private static TextureResource MakeNonResidentImage(ImageResource image, uint[] words)
+        private TextureResource ResolveNonResidentImage(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
             var descriptor = new TextureDescriptorWords(words);
+            var resolution = ImageRequestBuilders.NullTextureResolution(ShapeOf(image));
+            _ = BeginBatchedGuestCommands();
+            var request = resolution.Request;
+            var imageIdentifier = _imageCache.FindImage(ref request);
+            resolution = resolution with { Request = request };
+            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
+            BindImage(imageIdentifier, image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage);
             return new TextureResource
             {
                 Address = descriptor.BaseAddress,
+                ImageIdentifier = imageIdentifier,
+                Request = request,
+                Resolution = resolution,
                 IsStorage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage,
-                IsResident = false,
+                IsResident = true,
                 Width = descriptor.Width,
                 Height = descriptor.Height,
+                DestinationSelect = resolution.Swizzle,
             };
         }
 
@@ -337,7 +348,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     : index == hostMovie.Chroma
                         ? CreateHostMovieTextureResource(movieCandidates![index], plane: 1)
                         : residentImages is { } && !residentImages[index]
-                            ? MakeNonResidentImage(info.Images[index], snapshot.Images[index])
+                            ? ResolveNonResidentImage(info.Images[index], snapshot.Images[index], program, index)
                             : ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
             }
 

@@ -1512,7 +1512,7 @@ public static partial class Gen5SpirvTranslator
             out uint dstSelect,
             out string error,
             (uint Resource, uint Element)? fixedElement = null,
-            uint dynamicElement = 0)
+            uint dynamicElement = uint.MaxValue)
         {
             error = string.Empty;
             resource = default;
@@ -1564,13 +1564,13 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var localElementIndex = dynamicElement != 0 ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
+            var localElementIndex = dynamicElement != uint.MaxValue ? dynamicElement : UInt(fixedElement?.Element ?? (uint)element);
             var elementIndex = request.Bindings.UsesBindlessImages
                 ? LoadImageSlot(imageClass, localElementIndex)
                 : localElementIndex;
             var elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
             var imageValue = Load(imageClass.ImageType, elementPointer);
-            if (dynamicElement != 0)
+            if (dynamicElement != uint.MaxValue)
             {
                 // The index can differ between invocations of one draw.
                 _module.AddCapability(SpirvCapability.ShaderNonUniform);
@@ -1605,7 +1605,7 @@ public static partial class Gen5SpirvTranslator
                 var sampler = Load(_samplerType, samplerPointer);
                 objectType = _module.TypeSampledImage(imageClass.ImageType);
                 imageObject = _module.AddInstruction(SpirvOp.SampledImage, objectType, imageValue, sampler);
-                if (dynamicElement != 0)
+                if (dynamicElement != uint.MaxValue)
                     _module.AddDecoration(imageObject, SpirvDecoration.NonUniform);
             }
             else
