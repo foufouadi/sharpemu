@@ -120,7 +120,20 @@ public sealed partial class GuestImageCache
         RemoveFromIndex(imageIdentifier);
         if (_scheduler.Active)
         {
-            _scheduler.QueueCompletionAction(() => _slots.Erase(imageIdentifier));
+            var pendingRelease = image.AccountedSize;
+            if (pendingRelease != 0)
+            {
+                Interlocked.Add(ref _pendingPoolReleaseBytes, checked((long)pendingRelease));
+            }
+
+            _scheduler.QueueCompletionAction(() =>
+            {
+                _slots.Erase(imageIdentifier);
+                if (pendingRelease != 0)
+                {
+                    Interlocked.Add(ref _pendingPoolReleaseBytes, -checked((long)pendingRelease));
+                }
+            });
         }
         else
         {

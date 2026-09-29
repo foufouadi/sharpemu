@@ -8,6 +8,16 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Garbage collection by recency and memory pressure, and the scheduled readback flush.
 public sealed partial class GuestImageCache
 {
+    private ulong CollectionMemoryBytes
+    {
+        get
+        {
+            var allocated = _device.ImageMemory.AllocatedBytes;
+            var pending = (ulong)Math.Max(Volatile.Read(ref _pendingPoolReleaseBytes), 0);
+            return allocated > pending ? allocated - pending : 0;
+        }
+    }
+
     // Allocation-time pressure is deliberately separate from the periodic sweep:
     // a visibility-buffer burst can create thousands of images before the next
     // frame boundary. Destruction still goes through DeleteImage's completion
@@ -22,18 +32,19 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        if (requiredBytes > _criticalMemoryBytes || _totalUsedMemory <= _criticalMemoryBytes - requiredBytes)
+        var current = CollectionMemoryBytes;
+        if (requiredBytes > _criticalMemoryBytes || current <= _criticalMemoryBytes - requiredBytes)
         {
             return;
         }
 
         var target = _criticalMemoryBytes - requiredBytes;
         var blocked = false;
-        while (_totalUsedMemory > target)
+        while (CollectionMemoryBytes > target)
         {
-            var before = _totalUsedMemory;
+            var before = CollectionMemoryBytes;
             Collect(_collectionTick, allowAggressive: true);
-            if (_totalUsedMemory == before)
+            if (CollectionMemoryBytes == before)
             {
                 blocked = true;
                 break;
@@ -48,13 +59,13 @@ public sealed partial class GuestImageCache
         using var held = _lock.Hold();
         var tick = _collectionTick++;
         _allocationCollectionBlocked = false;
-        if (_totalUsedMemory < _collectionStartBytes)
+        if (CollectionMemoryBytes < _collectionStartBytes)
         {
             return;
         }
 
         Collect(tick, allowAggressive: false);
-        if (_totalUsedMemory >= _criticalMemoryBytes)
+        if (CollectionMemoryBytes >= _criticalMemoryBytes)
         {
             Collect(tick, allowAggressive: true);
         }
@@ -62,8 +73,8 @@ public sealed partial class GuestImageCache
 
     private void Collect(ulong tick, bool allowAggressive)
     {
-        var pressured = _totalUsedMemory >= _memoryPressureBytes;
-        var aggressive = allowAggressive && _totalUsedMemory >= _criticalMemoryBytes;
+        var pressured = CollectionMemoryBytes >= _memoryPressureBytes;
+        var aggressive = allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes;
         var age = Math.Min(aggressive ? 160UL : pressured ? 80UL : 16UL, tick);
         var deletions = aggressive ? 40 : pressured ? 20 : 10;
         var candidates = new List<ResourceSlotIdentifier>(deletions);
@@ -109,13 +120,13 @@ public sealed partial class GuestImageCache
             }
 
             DeleteImage(imageIdentifier);
-            if (_totalUsedMemory < _criticalMemoryBytes && aggressive)
+            if (CollectionMemoryBytes < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;
                 aggressive = false;
             }
 
-            if (_totalUsedMemory < _memoryPressureBytes && pressured)
+            if (CollectionMemoryBytes < _memoryPressureBytes && pressured)
             {
                 deletions >>= 1;
                 pressured = false;

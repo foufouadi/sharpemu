@@ -36,6 +36,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _collectionStartBytes;
     private ulong _memoryPressureBytes;
     private ulong _criticalMemoryBytes;
+    private long _pendingPoolReleaseBytes;
     private ulong _collectionTick;
     private bool _allocationCollectionBlocked;
     private uint _queryEpoch;
@@ -67,7 +68,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
     }
 
-    public ulong TotalUsedMemory => _totalUsedMemory;
+    public ulong TotalUsedMemory => _device.ImageMemory.PlacedBytes;
+
+    public ulong TotalAllocatedMemory => _device.ImageMemory.AllocatedBytes;
 
     public bool ScratchOverBudget => _tiler.ScratchOverBudget;
 

@@ -61,6 +61,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     // Images share pooled device-memory blocks; see ImageMemoryPool.
     public ImageMemoryPool ImageMemory => _imageMemory ??= new ImageMemoryPool(this);
 
+    public ulong ImageMemoryAllocatedBytes => _imageMemory?.AllocatedBytes ?? 0;
+
+    public ulong ImageMemoryPlacedBytes => _imageMemory?.PlacedBytes ?? 0;
+
     public (uint X, uint Y, uint Z) MaxComputeWorkGroupCount { get; }
 
     public uint MemoryTypeCount => _memoryProperties.MemoryTypeCount;

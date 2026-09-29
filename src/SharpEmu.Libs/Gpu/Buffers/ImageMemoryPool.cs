@@ -28,11 +28,21 @@ public sealed class ImageMemoryPool
     private readonly GpuDeviceInfo _device;
     private readonly List<Block?> _blocks = [];
     private readonly object _gate = new();
+    private long _allocatedBytes;
+    private long _placedBytes;
 
     public ImageMemoryPool(GpuDeviceInfo device)
     {
         _device = device;
     }
+
+    // Bytes reserved from the Vulkan driver, including free space left inside
+    // pooled blocks and dedicated allocations still held by the pool.
+    public ulong AllocatedBytes => (ulong)Math.Max(Volatile.Read(ref _allocatedBytes), 0);
+
+    // Bytes occupied by live image placements. This excludes free ranges inside
+    // pooled blocks and is therefore the useful fragmentation comparison.
+    public ulong PlacedBytes => (ulong)Math.Max(Volatile.Read(ref _placedBytes), 0);
 
     public Result Allocate(in MemoryRequirements requirements, uint memoryType, out ImageMemory memory)
     {
@@ -44,6 +54,8 @@ public sealed class ImageMemoryPool
             if (dedicated == Result.Success)
             {
                 memory = new ImageMemory(handle, 0, requirements.Size, -1);
+                Interlocked.Add(ref _allocatedBytes, checked((long)requirements.Size));
+                Interlocked.Add(ref _placedBytes, checked((long)requirements.Size));
             }
 
             return dedicated;
@@ -57,6 +69,7 @@ public sealed class ImageMemoryPool
                 if (_blocks[index] is { } block && block.MemoryType == memoryType && TryPlace(block, requirements.Size, alignment, out var offset))
                 {
                     memory = new ImageMemory(block.Memory, offset, requirements.Size, index);
+                    Interlocked.Add(ref _placedBytes, checked((long)requirements.Size));
                     return Result.Success;
                 }
             }
@@ -82,6 +95,8 @@ public sealed class ImageMemoryPool
             }
 
             TryPlace(created, requirements.Size, alignment, out var placed);
+            Interlocked.Add(ref _allocatedBytes, checked((long)BlockSize));
+            Interlocked.Add(ref _placedBytes, checked((long)requirements.Size));
             memory = new ImageMemory(blockMemory, placed, requirements.Size, slot);
             return Result.Success;
         }
@@ -97,6 +112,8 @@ public sealed class ImageMemoryPool
         if (memory.Block < 0)
         {
             _device.FreeMemory(memory.Memory);
+            Interlocked.Add(ref _allocatedBytes, -checked((long)memory.Size));
+            Interlocked.Add(ref _placedBytes, -checked((long)memory.Size));
             return;
         }
 
@@ -125,10 +142,12 @@ public sealed class ImageMemoryPool
 
             block.Free[start] = end - start;
             block.Used -= memory.Size;
+            Interlocked.Add(ref _placedBytes, -checked((long)memory.Size));
             if (block.Used == 0)
             {
                 _device.FreeMemory(block.Memory);
                 _blocks[memory.Block] = null;
+                Interlocked.Add(ref _allocatedBytes, -checked((long)BlockSize));
             }
         }
     }

@@ -41,7 +41,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _imageCache?.Dispose();
             _samplerStore.Dispose();
             _bufferCache.Dispose();
-            PerfOverlay.SetGuestCacheStatistics(0, 0, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);
+            PerfOverlay.SetGuestCacheStatistics(
+                0,
+                0,
+                0,
+                _deviceInfo.LiveAllocations,
+                _deviceInfo.PeakAllocations);
             _hostBufferPool.Dispose();
             foreach (var guestImageVersion in _guestImageVersions.Values)
             {

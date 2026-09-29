@@ -37,6 +37,7 @@ public static class PerfOverlay
     private static long _drawsInWindow;
     private static long _guestBufferCacheBytes;
     private static long _guestImageCacheBytes;
+    private static long _imagePoolAllocatedBytes;
     private static int _liveDeviceAllocations;
     private static int _peakDeviceAllocations;
 
@@ -132,10 +133,16 @@ public static class PerfOverlay
     /// <summary>Called per translated draw/dispatch executed.</summary>
     public static void RecordDraw() => Interlocked.Increment(ref _drawsInWindow);
 
-    public static void SetGuestCacheStatistics(ulong bufferBytes, ulong imageBytes, int liveDeviceAllocations, int peakDeviceAllocations)
+    public static void SetGuestCacheStatistics(
+        ulong bufferBytes,
+        ulong imageBytes,
+        ulong imagePoolAllocatedBytes,
+        int liveDeviceAllocations,
+        int peakDeviceAllocations)
     {
         Interlocked.Exchange(ref _guestBufferCacheBytes, checked((long)bufferBytes));
         Interlocked.Exchange(ref _guestImageCacheBytes, checked((long)imageBytes));
+        Interlocked.Exchange(ref _imagePoolAllocatedBytes, checked((long)imagePoolAllocatedBytes));
         Interlocked.Exchange(ref _liveDeviceAllocations, liveDeviceAllocations);
         Interlocked.Exchange(ref _peakDeviceAllocations, peakDeviceAllocations);
     }
@@ -260,13 +267,14 @@ public static class PerfOverlay
             var heapMb = GC.GetTotalMemory(false) / (1024 * 1024);
             var guestBufferMb = Interlocked.Read(ref _guestBufferCacheBytes) / (1024 * 1024);
             var guestImageMemoryInMiB = Interlocked.Read(ref _guestImageCacheBytes) / (1024 * 1024);
+            var imagePoolAllocatedInMiB = Interlocked.Read(ref _imagePoolAllocatedBytes) / (1024 * 1024);
             var liveAllocations = Volatile.Read(ref _liveDeviceAllocations);
             var peakAllocations = Volatile.Read(ref _peakDeviceAllocations);
             var gpuPercent = _gpuUsage?.Percent ?? double.NaN;
             _gpuUsage?.RequestSample();
             var gpuLabel = FormatUsage(gpuPercent);
             var timeLabel = $"{elapsedHours:00}:{elapsedMinutes:00}:{elapsedRemainingSeconds:00}";
-            _line4 = $"MEM {heapMb}M BUF {guestBufferMb}M IMG {guestImageMemoryInMiB}M";
+            _line4 = $"MEM {heapMb}M BUF {guestBufferMb}M IMG {guestImageMemoryInMiB}/{imagePoolAllocatedInMiB}M";
             _line5 = $"CPU {_cpuPercent:0}%  GPU {gpuLabel}";
             _line6 = $"TIME {timeLabel}  VKALLOC {liveAllocations}/{peakAllocations}";
             _minimalLine1 = $"FPS {_fps:0.0}  CPU {_cpuPercent:0}%";
