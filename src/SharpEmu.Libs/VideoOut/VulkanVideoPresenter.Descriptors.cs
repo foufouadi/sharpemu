@@ -98,6 +98,91 @@ internal static unsafe partial class VulkanVideoPresenter
             DepthCompare: image.DepthCompare,
             Atomic: image.Atomic);
 
+        private static bool[] FindResidentBindlessImages(ShaderResourceInfo info, uint[] flattenedTable)
+        {
+            var resident = new bool[info.Images.Count];
+            for (var index = 0; index < info.Images.Count; index++)
+            {
+                if (info.Images[index].IndirectRoot == DescriptorConstants.NoIndex)
+                {
+                    resident[index] = true;
+                }
+            }
+
+            for (var rootIndex = 0; rootIndex < info.Images.Count; rootIndex++)
+            {
+                var root = info.Images[rootIndex];
+                if (root.IndirectRoot != (uint)rootIndex || root.IndirectSearchIterations == 0)
+                {
+                    continue;
+                }
+
+                var candidates = root.IndirectResources;
+                var offset = root.IndirectMappingOffset;
+                if (candidates.Count == 0 || offset >= flattenedTable.Length)
+                {
+                    // An incomplete mapping is not a valid basis for dropping a
+                    // descriptor: preserve the old eager behavior for this table.
+                    foreach (var candidate in candidates)
+                    {
+                        if (candidate < resident.Length)
+                        {
+                            resident[(int)candidate] = true;
+                        }
+                    }
+
+                    if (candidates.Count == 0)
+                    {
+                        resident[rootIndex] = true;
+                    }
+
+                    continue;
+                }
+
+                var count = flattenedTable[offset];
+                if (count == 0 || (ulong)offset + 1 + (ulong)count * 2 > (ulong)flattenedTable.Length)
+                {
+                    foreach (var candidate in candidates)
+                    {
+                        if (candidate < resident.Length)
+                        {
+                            resident[(int)candidate] = true;
+                        }
+                    }
+
+                    continue;
+                }
+
+                for (var entry = 0u; entry < count; entry++)
+                {
+                    var candidate = flattenedTable[offset + 2 + entry * 2];
+                    if (candidate < candidates.Count)
+                    {
+                        var resource = candidates[(int)candidate];
+                        if (resource < resident.Length)
+                        {
+                            resident[(int)resource] = true;
+                        }
+                    }
+                }
+            }
+
+            return resident;
+        }
+
+        private static TextureResource MakeNonResidentImage(ImageResource image, uint[] words)
+        {
+            var descriptor = new TextureDescriptorWords(words);
+            return new TextureResource
+            {
+                Address = descriptor.BaseAddress,
+                IsStorage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage,
+                IsResident = false,
+                Width = descriptor.Width,
+                Height = descriptor.Height,
+            };
+        }
+
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
@@ -136,6 +221,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Request = request,
                 Resolution = resolution,
                 IsStorage = storage,
+                IsResident = true,
                 DestinationSelect = words[3] & 0xFFFu,
                 Width = descriptor.Width,
                 Height = descriptor.Height,
@@ -150,7 +236,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var paired = false;
             foreach (var pair in info.SampledPairs)
             {
-                if (pair.Sampler != sampler || pair.Image >= images.Length || images[pair.Image].IsHostMovie)
+                if (pair.Sampler != sampler || pair.Image >= images.Length || images[pair.Image].IsHostMovie || !images[pair.Image].IsResident)
                 {
                     continue;
                 }
@@ -243,13 +329,16 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Images = new TextureResource[info.Images.Count];
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
+            var residentImages = layout.UsesBindlessImages ? FindResidentBindlessImages(info, snapshot.FlattenedResourceTable) : null;
             for (var index = 0; index < info.Images.Count; index++)
             {
                 descriptors.Images[index] = index == hostMovie.Luma
                     ? CreateHostMovieTextureResource(movieCandidates![index], plane: 0)
                     : index == hostMovie.Chroma
                         ? CreateHostMovieTextureResource(movieCandidates![index], plane: 1)
-                        : ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
+                        : residentImages is { } && !residentImages[index]
+                            ? MakeNonResidentImage(info.Images[index], snapshot.Images[index])
+                            : ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
             }
 
             descriptors.Samplers = new Sampler[info.Samplers.Count];
@@ -308,7 +397,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             foreach (var binding in prepared.Textures)
             {
-                if (binding.IsHostMovie || IsStaleImage(binding.ImageIdentifier, out var image) || image is null)
+                if (binding.IsHostMovie || !binding.IsResident || IsStaleImage(binding.ImageIdentifier, out var image) || image is null)
                 {
                     continue;
                 }
@@ -523,6 +612,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     var texture = prepared.Descriptors.Images[resource];
                     var occurrence = occurrences[resource]++;
+                    if (!texture.IsResident)
+                    {
+                        table[slot++] = 0;
+                        continue;
+                    }
+
                     var view = texture.MipViews.Length == 0
                         ? texture.View
                         : occurrence < (uint)texture.MipViews.Length ? texture.MipViews[occurrence] : default;
@@ -587,7 +682,7 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < images.Length; index++)
             {
                 var binding = images[index];
-                if (binding.IsHostMovie)
+                if (binding.IsHostMovie || !binding.IsResident)
                 {
                     continue;
                 }
@@ -606,7 +701,7 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < images.Length; index++)
             {
                 var binding = images[index];
-                if (binding.IsHostMovie)
+                if (binding.IsHostMovie || !binding.IsResident)
                 {
                     continue;
                 }

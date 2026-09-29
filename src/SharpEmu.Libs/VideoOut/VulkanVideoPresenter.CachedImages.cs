@@ -115,6 +115,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public Sampler Sampler;
         public GuestSampler SamplerState;
         public bool IsStorage;
+        public bool IsResident;
         public bool IsHostMovie;
         public int HostMoviePlane = -1;
         public long HostMovieFrameSerial;
@@ -494,6 +495,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Resolution = resolution,
                 MipLevel = texture.MipLevel,
                 IsStorage = texture.IsStorage,
+                IsResident = true,
                 SamplerState = texture.Sampler,
                 DestinationSelect = texture.DstSelect,
                 Width = texture.Width,
