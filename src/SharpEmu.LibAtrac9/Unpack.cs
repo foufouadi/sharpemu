@@ -313,6 +313,13 @@ namespace LibAtrac9
                 if (precision <= maxHuffPrecision)
                 {
                     HuffmanCodebook huff = Tables.HuffmanSpectrum[channel.CodebookSet[i]][precision][Tables.QuantUnitToCodebookIndex[i]];
+                    // A valid stream never selects a codebook the format leaves undefined.
+                    if (huff == null)
+                    {
+                        throw new InvalidDataException(
+                            $"The ATRAC9 block selects an undefined spectrum codebook: set={channel.CodebookSet[i]} precision={precision} unit={i}.");
+                    }
+
                     int groupCount = subbandCount >> huff.ValueCountPower;
                     for (int j = 0; j < groupCount; j++)
                     {
