@@ -20,26 +20,53 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     // useful, while retaining the full capacity on devices with lower limits.
     private const uint StableCapacityPerBinding = 128u * 1024u;
 
-    private sealed class SlotKey : IEquatable<SlotKey>
+    private readonly struct SlotKey : IEquatable<SlotKey>
     {
+        private const int MaxWords = 8;
+
         public readonly DescriptorBindingKind Kind;
         public readonly ulong View;
         public readonly ImageLayout Layout;
-        public readonly uint[] Words;
+        private readonly uint _wordCount;
+        private readonly uint _word0;
+        private readonly uint _word1;
+        private readonly uint _word2;
+        private readonly uint _word3;
+        private readonly uint _word4;
+        private readonly uint _word5;
+        private readonly uint _word6;
+        private readonly uint _word7;
 
         public SlotKey(DescriptorBindingKind kind, ulong view, ImageLayout layout, ReadOnlySpan<uint> words)
         {
+            if (words.Length > MaxWords)
+            {
+                throw SubmissionScheduler.Fatal($"A bindless image descriptor has too many key words: {words.Length} > {MaxWords}.");
+            }
+
             Kind = kind;
             View = view;
             Layout = layout;
-            Words = words.ToArray();
+            _wordCount = (uint)words.Length;
+            _word0 = words.Length > 0 ? words[0] : 0;
+            _word1 = words.Length > 1 ? words[1] : 0;
+            _word2 = words.Length > 2 ? words[2] : 0;
+            _word3 = words.Length > 3 ? words[3] : 0;
+            _word4 = words.Length > 4 ? words[4] : 0;
+            _word5 = words.Length > 5 ? words[5] : 0;
+            _word6 = words.Length > 6 ? words[6] : 0;
+            _word7 = words.Length > 7 ? words[7] : 0;
         }
 
-        public bool Equals(SlotKey? other) => other is not null && Kind == other.Kind && View == other.View &&
+        public bool Equals(SlotKey other) => Kind == other.Kind && View == other.View &&
             Layout == other.Layout &&
-            Words.AsSpan().SequenceEqual(other.Words);
+            _wordCount == other._wordCount &&
+            _word0 == other._word0 && _word1 == other._word1 &&
+            _word2 == other._word2 && _word3 == other._word3 &&
+            _word4 == other._word4 && _word5 == other._word5 &&
+            _word6 == other._word6 && _word7 == other._word7;
 
-        public override bool Equals(object? obj) => Equals(obj as SlotKey);
+        public override bool Equals(object? obj) => obj is SlotKey other && Equals(other);
 
         public override int GetHashCode()
         {
@@ -47,7 +74,15 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             hash.Add(Kind);
             hash.Add(View);
             hash.Add(Layout);
-            hash.AddBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(Words.AsSpan()));
+            hash.Add(_wordCount);
+            hash.Add(_word0);
+            hash.Add(_word1);
+            hash.Add(_word2);
+            hash.Add(_word3);
+            hash.Add(_word4);
+            hash.Add(_word5);
+            hash.Add(_word6);
+            hash.Add(_word7);
             return hash.ToHashCode();
         }
     }
@@ -56,6 +91,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     private readonly SubmissionScheduler _scheduler;
     private readonly DescriptorSet _set;
     private readonly Dictionary<SlotKey, uint> _slots = new();
+    private readonly Dictionary<ulong, HashSet<SlotKey>> _slotsByView = new();
     private readonly List<uint>[] _free = [[], []];
     private readonly uint[] _next = new uint[BindingCount];
     private readonly uint[] _capacity = new uint[BindingCount];
@@ -222,6 +258,12 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             _device.Vk.UpdateDescriptorSets(_device.Device, 1, &write, 0, null);
         }
         _slots.Add(key, slot);
+        if (!_slotsByView.TryGetValue(view.Handle, out var viewSlots))
+        {
+            viewSlots = [];
+            _slotsByView.Add(view.Handle, viewSlots);
+        }
+        viewSlots.Add(key);
         return slot;
     }
 
@@ -232,13 +274,22 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             return;
         }
 
-        var handles = views.Select(static view => view.Handle).ToHashSet();
         var retired = new List<(uint Binding, uint Slot)>();
-        foreach (var pair in _slots.Where(pair => handles.Contains(pair.Key.View)).ToArray())
+        foreach (var view in views)
         {
-            var binding = DescriptorWriter.DescriptorType(pair.Key.Kind) == DescriptorType.SampledImage ? 0u : 1u;
-            _slots.Remove(pair.Key);
-            retired.Add((binding, pair.Value));
+            if (!_slotsByView.Remove(view.Handle, out var viewSlots))
+            {
+                continue;
+            }
+
+            foreach (var key in viewSlots)
+            {
+                var binding = DescriptorWriter.DescriptorType(key.Kind) == DescriptorType.SampledImage ? 0u : 1u;
+                if (_slots.Remove(key, out var slot))
+                {
+                    retired.Add((binding, slot));
+                }
+            }
         }
 
         if (retired.Count != 0)
@@ -279,6 +330,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         if (_pool.Handle != 0) _device.Vk.DestroyDescriptorPool(_device.Device, _pool, null);
         if (_layout.Handle != 0) _device.Vk.DestroyDescriptorSetLayout(_device.Device, _layout, null);
         _slots.Clear();
+        _slotsByView.Clear();
     }
 
     private static void Check(Result result, string operation)
