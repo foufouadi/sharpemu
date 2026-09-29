@@ -2561,14 +2561,22 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode == "SBcnt1I32B64")
             {
-                var wideCount = _module.AddInstruction(
-                    SpirvOp.BitCount,
-                    _ulongType,
-                    GetRawSource64(instruction, 0));
-                var bitCountResult = _module.AddInstruction(
+                var wide = GetRawSource64(instruction, 0);
+                var low = _module.AddInstruction(
                     SpirvOp.UConvert,
                     _uintType,
-                    wideCount);
+                    wide);
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(
+                        wide,
+                        _module.Constant64(_ulongType, 32)));
+                var bitCountResult = _module.AddInstruction(
+                    SpirvOp.IAdd,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, low),
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, high));
                 StoreS(destination, bitCountResult);
                 Store(_scc, IsNotZero(bitCountResult));
                 return true;
