@@ -666,6 +666,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsPerVertexPixelInputs;
         private const string FragmentShaderBarycentricExtensionName = "VK_KHR_fragment_shader_barycentric";
         private const string DeviceFaultExtensionName = "VK_EXT_device_fault";
+        private const string MemoryBudgetExtensionName = "VK_EXT_memory_budget";
+        private bool _memoryBudgetEnabled;
 
         private void CreateDevice()
         {
@@ -904,11 +906,13 @@ internal static unsafe partial class VulkanVideoPresenter
             var barycentricExtension = (byte*)SilkMarshal.StringToPtr(FragmentShaderBarycentricExtensionName);
             var viewportIndexLayerExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_shader_viewport_index_layer");
             var deviceFaultExtension = (byte*)SilkMarshal.StringToPtr(DeviceFaultExtensionName);
+            var memoryBudgetExtension = (byte*)SilkMarshal.StringToPtr(MemoryBudgetExtensionName);
             var supportsDeviceFault = IsDeviceExtensionAvailable(DeviceFaultExtensionName);
+            _memoryBudgetEnabled = IsDeviceExtensionAvailable(MemoryBudgetExtensionName);
             var deviceFaultFeatures = new PhysicalDeviceFaultFeaturesEXT { SType = StructureType.PhysicalDeviceFaultFeaturesExt };
             try
             {
-                var extensions = stackalloc byte*[13];
+                var extensions = stackalloc byte*[14];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -949,6 +953,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (supportsDeviceFault)
                 {
                     extensions[extensionCount++] = deviceFaultExtension;
+                }
+
+                if (_memoryBudgetEnabled)
+                {
+                    extensions[extensionCount++] = memoryBudgetExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -1085,10 +1094,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)barycentricExtension);
                 SilkMarshal.Free((nint)viewportIndexLayerExtension);
                 SilkMarshal.Free((nint)deviceFaultExtension);
+                SilkMarshal.Free((nint)memoryBudgetExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device);
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled);
             CreateScheduler();
             CreateBufferCache();
             CreateImageCache();

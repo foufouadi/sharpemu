@@ -34,8 +34,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly SortedDictionary<ulong, SurfaceMetadata> _surfaceMetadata = new();
     private ulong _totalUsedMemory;
     private ulong _collectionStartBytes;
-    private ulong _memoryPressureBytes = 1536 * MiB;
-    private ulong _criticalMemoryBytes = 3072 * MiB;
+    private ulong _memoryPressureBytes;
+    private ulong _criticalMemoryBytes;
     private ulong _collectionTick;
     private bool _allocationCollectionBlocked;
     private uint _queryEpoch;
@@ -55,6 +55,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _bufferCache = bufferCache;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
+        var budget = Math.Max(device.DeviceLocalBudgetBytes, 1UL);
+        _collectionStartBytes = budget / 2;
+        _memoryPressureBytes = budget * 3 / 5;
+        _criticalMemoryBytes = budget * 7 / 10;
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] Image cache budget source={(device.HasMemoryBudget ? "VK_EXT_memory_budget" : "device-local heap")} " +
+            $"heap={device.DeviceLocalHeapBytes} budget={device.DeviceLocalBudgetBytes} " +
+            $"thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
     }

@@ -16,12 +16,15 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     private int _liveAllocations;
     private int _peakAllocations;
 
-    public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device)
+    public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device, bool memoryBudgetEnabled = false)
     {
         Vk = vk;
         PhysicalDevice = physicalDevice;
         Device = device;
         vk.GetPhysicalDeviceMemoryProperties(physicalDevice, out _memoryProperties);
+        DeviceLocalHeapBytes = CalculateDeviceLocalHeapBytes();
+        DeviceLocalBudgetBytes = memoryBudgetEnabled ? QueryDeviceLocalBudgetBytes() : DeviceLocalHeapBytes;
+        HasMemoryBudget = memoryBudgetEnabled && DeviceLocalBudgetBytes != DeviceLocalHeapBytes;
         vk.GetPhysicalDeviceProperties(physicalDevice, out var properties);
         MinUniformBufferOffsetAlignment = Math.Max(properties.Limits.MinUniformBufferOffsetAlignment, 1);
         MinStorageBufferOffsetAlignment = Math.Max(properties.Limits.MinStorageBufferOffsetAlignment, 1);
@@ -36,6 +39,12 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     public PhysicalDevice PhysicalDevice { get; }
 
     public Device Device { get; }
+
+    public ulong DeviceLocalHeapBytes { get; }
+
+    public ulong DeviceLocalBudgetBytes { get; }
+
+    public bool HasMemoryBudget { get; }
 
     public ulong MinUniformBufferOffsetAlignment { get; }
 
@@ -55,6 +64,72 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     public (uint X, uint Y, uint Z) MaxComputeWorkGroupCount { get; }
 
     public uint MemoryTypeCount => _memoryProperties.MemoryTypeCount;
+
+    private ulong CalculateDeviceLocalHeapBytes()
+    {
+        var usedHeaps = new bool[_memoryProperties.MemoryHeapCount];
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            var memoryTypes = &properties->MemoryTypes.Element0;
+            for (var index = 0u; index < properties->MemoryTypeCount; index++)
+            {
+                if ((memoryTypes[index].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    usedHeaps[(int)memoryTypes[index].HeapIndex] = true;
+                }
+            }
+
+            var heaps = &properties->MemoryHeaps.Element0;
+            ulong total = 0;
+            for (var index = 0u; index < properties->MemoryHeapCount; index++)
+            {
+                if (usedHeaps[(int)index])
+                {
+                    total += heaps[index].Size;
+                }
+            }
+
+            return total;
+        }
+    }
+
+    private ulong QueryDeviceLocalBudgetBytes()
+    {
+        var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT
+        {
+            SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt,
+        };
+        var properties = new PhysicalDeviceProperties2
+        {
+            SType = StructureType.PhysicalDeviceProperties2,
+            PNext = &budget,
+        };
+        Vk.GetPhysicalDeviceProperties2(PhysicalDevice, &properties);
+
+        var usedHeaps = new bool[_memoryProperties.MemoryHeapCount];
+        fixed (PhysicalDeviceMemoryProperties* memoryProperties = &_memoryProperties)
+        {
+            var memoryTypes = &memoryProperties->MemoryTypes.Element0;
+            for (var index = 0u; index < memoryProperties->MemoryTypeCount; index++)
+            {
+                if ((memoryTypes[index].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    usedHeaps[(int)memoryTypes[index].HeapIndex] = true;
+                }
+            }
+        }
+
+        ulong total = 0;
+        for (var index = 0u; index < _memoryProperties.MemoryHeapCount; index++)
+        {
+            if (usedHeaps[(int)index])
+            {
+                total += budget.HeapBudget[index];
+            }
+        }
+
+        return total != 0 ? total : DeviceLocalHeapBytes;
+    }
 
     public int LiveAllocations => Volatile.Read(ref _liveAllocations);
 
