@@ -850,6 +850,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptorIndexingQuery.DescriptorBindingPartiallyBound &&
                 descriptorIndexingQuery.DescriptorBindingSampledImageUpdateAfterBind &&
                 descriptorIndexingQuery.DescriptorBindingStorageImageUpdateAfterBind &&
+                descriptorIndexingQuery.DescriptorBindingUpdateUnusedWhilePending &&
                 supportsNullDescriptor;
             SetBindlessImageHeapCapability(supportsBindlessImageHeap);
             var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
@@ -861,6 +862,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 DescriptorBindingPartiallyBound = supportsBindlessImageHeap,
                 DescriptorBindingSampledImageUpdateAfterBind = supportsBindlessImageHeap,
                 DescriptorBindingStorageImageUpdateAfterBind = supportsBindlessImageHeap,
+                DescriptorBindingUpdateUnusedWhilePending = supportsBindlessImageHeap,
             };
             if (!supportsSharedInt64Atomics)
             {

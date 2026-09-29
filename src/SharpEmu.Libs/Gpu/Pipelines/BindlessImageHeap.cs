@@ -116,7 +116,9 @@ public sealed unsafe class BindlessImageHeap : IDisposable
                 DescriptorCount = _capacity[index],
                 StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             };
-            flags[index] = DescriptorBindingFlags.PartiallyBoundBit | DescriptorBindingFlags.UpdateAfterBindBit;
+            flags[index] = DescriptorBindingFlags.PartiallyBoundBit |
+                DescriptorBindingFlags.UpdateAfterBindBit |
+                DescriptorBindingFlags.UpdateUnusedWhilePendingBit;
         }
 
         var bindingFlags = new DescriptorSetLayoutBindingFlagsCreateInfo
@@ -234,7 +236,6 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         foreach (var pair in _slots.Where(pair => handles.Contains(pair.Key.View)).ToArray())
         {
             var binding = DescriptorWriter.DescriptorType(pair.Key.Kind) == DescriptorType.SampledImage ? 0u : 1u;
-            WriteNullDescriptor(binding, pair.Value);
             _slots.Remove(pair.Key);
             retired.Add((binding, pair.Value));
         }
@@ -245,6 +246,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             {
                 foreach (var (binding, slot) in retired)
                 {
+                    WriteNullDescriptor(binding, slot);
                     _free[binding].Add(slot);
                 }
             });
