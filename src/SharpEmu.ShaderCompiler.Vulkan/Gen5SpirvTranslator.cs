@@ -335,32 +335,105 @@ public static partial class Gen5SpirvTranslator
 
                 _module.AddLabel(switchHeader);
                 var selector = Load(_uintType, _programCounter);
-                _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
-                var switchOperands = new uint[2 + (blocks.Count * 2)];
-                switchOperands[0] = selector;
-                switchOperands[1] = defaultLabel;
-                for (var index = 0; index < blocks.Count; index++)
+                if (blocks.Count <= 512)
                 {
-                    switchOperands[2 + (index * 2)] = (uint)index;
-                    switchOperands[3 + (index * 2)] = caseLabels[index];
-                }
-
-                _module.AddStatement(SpirvOp.Switch, switchOperands);
-                for (var index = 0; index < blocks.Count; index++)
-                {
-                    _module.AddLabel(caseLabels[index]);
-                    if (!TryEmitBlock(blocks, index, out error))
+                    _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
+                    var switchOperands = new uint[2 + (blocks.Count * 2)];
+                    switchOperands[0] = selector;
+                    switchOperands[1] = defaultLabel;
+                    for (var index = 0; index < blocks.Count; index++)
                     {
-                        error = $"block=0x{blocks[index].StartPc:X}: {error}";
+                        switchOperands[2 + (index * 2)] = (uint)index;
+                        switchOperands[3 + (index * 2)] = caseLabels[index];
+                    }
+
+                    _module.AddStatement(SpirvOp.Switch, switchOperands);
+                    for (var index = 0; index < blocks.Count; index++)
+                    {
+                        _module.AddLabel(caseLabels[index]);
+                        if (!TryEmitBlock(blocks, index, out error))
+                        {
+                            error = $"block=0x{blocks[index].StartPc:X}: {error}";
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, switchMerge);
+                    }
+
+                    _module.AddLabel(defaultLabel);
+                    Store(_programActive, _module.ConstantBool(false));
+                    _module.AddStatement(SpirvOp.Branch, switchMerge);
+                }
+                else
+                {
+                    var dispatchRoot = _module.AllocateId();
+                    var dispatchMerge = _module.AllocateId();
+                    var inRange = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        selector,
+                        UInt((uint)blocks.Count));
+                    _module.AddStatement(SpirvOp.SelectionMerge, dispatchMerge, 0);
+                    _module.AddStatement(SpirvOp.BranchConditional, inRange, dispatchRoot, defaultLabel);
+                    _module.AddLabel(dispatchRoot);
+
+                    bool EmitDispatchTree(int first, int count, uint continuation, out string treeError)
+                    {
+                        treeError = string.Empty;
+                        if (count == 1)
+                        {
+                            _module.AddStatement(SpirvOp.Branch, caseLabels[first]);
+                            _module.AddLabel(caseLabels[first]);
+                            if (!TryEmitBlock(blocks, first, out treeError))
+                            {
+                                treeError = $"block=0x{blocks[first].StartPc:X}: {treeError}";
+                                return false;
+                            }
+
+                            _module.AddStatement(SpirvOp.Branch, continuation);
+                            return true;
+                        }
+
+                        var leftCount = count / 2;
+                        var split = first + leftCount;
+                        var leftLabel = _module.AllocateId();
+                        var rightLabel = _module.AllocateId();
+                        var mergeLabel = _module.AllocateId();
+                        var left = _module.AddInstruction(
+                            SpirvOp.ULessThan,
+                            _boolType,
+                            selector,
+                            UInt((uint)split));
+                        _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
+                        _module.AddStatement(SpirvOp.BranchConditional, left, leftLabel, rightLabel);
+                        _module.AddLabel(leftLabel);
+                        if (!EmitDispatchTree(first, leftCount, mergeLabel, out treeError))
+                        {
+                            return false;
+                        }
+
+                        _module.AddLabel(rightLabel);
+                        if (!EmitDispatchTree(split, count - leftCount, mergeLabel, out treeError))
+                        {
+                            return false;
+                        }
+
+                        _module.AddLabel(mergeLabel);
+                        _module.AddStatement(SpirvOp.Branch, continuation);
+                        return true;
+                    }
+
+                    if (!EmitDispatchTree(0, blocks.Count, dispatchMerge, out error))
+                    {
                         return false;
                     }
 
+                    _module.AddLabel(defaultLabel);
+                    Store(_programActive, _module.ConstantBool(false));
+                    _module.AddStatement(SpirvOp.Branch, dispatchMerge);
+                    _module.AddLabel(dispatchMerge);
                     _module.AddStatement(SpirvOp.Branch, switchMerge);
                 }
-
-                _module.AddLabel(defaultLabel);
-                Store(_programActive, _module.ConstantBool(false));
-                _module.AddStatement(SpirvOp.Branch, switchMerge);
 
                 _module.AddLabel(switchMerge);
                 _module.AddStatement(SpirvOp.Branch, loopContinue);
