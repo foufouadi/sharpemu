@@ -58,6 +58,22 @@ public sealed class PlayGoExportsTests : IDisposable
     }
 
     [Fact]
+    public void GetLocus_MetadataFreeApp0_ReportsAllInstalledPakChunks()
+    {
+        for (var chunk = 0; chunk <= 8; chunk++)
+        {
+            File.WriteAllBytes(Path.Combine(_app0Root, $"pakchunk{chunk}-Windows.pak"), []);
+        }
+
+        var handle = InitializeAndOpen();
+
+        Assert.Equal(BadChunkId, GetLocus(handle, [0, 8, 9]));
+        Assert.Equal(
+            new byte[] { LocusLocalFast, LocusLocalFast, LocusNotDownloaded },
+            ReadLoci(3));
+    }
+
+    [Fact]
     public void PlayGoPgm_ReportsEveryChunkAndProgress()
     {
         var cacheDirectory = Directory.CreateDirectory(Path.Combine(_app0Root, "cache_ps5"));
@@ -112,15 +128,20 @@ public sealed class PlayGoExportsTests : IDisposable
 
     [Theory]
     [InlineData(UnusableMetadataKind.DatOnly)]
+    [InlineData(UnusableMetadataKind.ScenarioOnly)]
     [InlineData(UnusableMetadataKind.MalformedChunkDefinitions)]
     [InlineData(UnusableMetadataKind.UnrecognizedChunkDefinitions)]
-    public void GetLocus_UnparseableMetadata_FallsBackToAuthoritativeChunkZero(UnusableMetadataKind metadataKind)
+    public void GetLocus_UnparseableMetadata_RemainsPermissive(UnusableMetadataKind metadataKind)
     {
         switch (metadataKind)
         {
             case UnusableMetadataKind.DatOnly:
                 var sceSys = Directory.CreateDirectory(Path.Combine(_app0Root, "sce_sys"));
                 File.WriteAllBytes(Path.Combine(sceSys.FullName, "playgo-chunk.dat"), [0x70, 0x6C, 0x67, 0x6F]);
+                break;
+            case UnusableMetadataKind.ScenarioOnly:
+                var scenarioDirectory = Directory.CreateDirectory(Path.Combine(_app0Root, "sce_sys"));
+                File.WriteAllText(Path.Combine(scenarioDirectory.FullName, "playgo-scenario.json"), "{}");
                 break;
             case UnusableMetadataKind.MalformedChunkDefinitions:
                 File.WriteAllText(
@@ -136,8 +157,8 @@ public sealed class PlayGoExportsTests : IDisposable
 
         var handle = InitializeAndOpen();
 
-        Assert.Equal(BadChunkId, GetLocus(handle, [42]));
-        Assert.Equal(new byte[] { LocusNotDownloaded }, ReadLoci(1));
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [42]));
+        Assert.Equal(new byte[] { LocusLocalFast }, ReadLoci(1));
     }
 
     [Fact]
@@ -282,6 +303,7 @@ public sealed class PlayGoExportsTests : IDisposable
     public enum UnusableMetadataKind
     {
         DatOnly,
+        ScenarioOnly,
         MalformedChunkDefinitions,
         UnrecognizedChunkDefinitions,
     }

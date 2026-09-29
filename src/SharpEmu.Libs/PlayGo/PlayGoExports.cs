@@ -738,7 +738,16 @@ public static class PlayGoExports
 
         if (File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml))
         {
-            TracePlayGo("metadata_present_but_unparsed; falling back to installed chunks");
+            // These sidecars are used by PS4 and by scenarios whose chunk map
+            // is not understood here. Their presence proves PlayGo is in use,
+            // but does not prove that the derived chunk list is complete. Keep
+            // the pre-pgm permissive behaviour so titles such as The Invincible
+            // do not receive BAD_CHUNK_ID for content they own.
+            TracePlayGo("metadata_present_but_unparsed; chunk_ids_unknown");
+            return new PlayGoMetadata(
+                true,
+                Array.Empty<ushort>(),
+                PlayGoChunkIdKnowledge.Unknown);
         }
 
         // Derive the installed chunk set from pak files when no usable chunk map
