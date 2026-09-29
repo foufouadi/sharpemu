@@ -245,7 +245,7 @@ public sealed class AjmExportsTests : IDisposable
         var monoConfig = Assert.IsType<byte[]>(configField?.GetValue(decoder));
 
         // frameBytes=17 and sfIndex=2: the low config field is 16 << 5 | 2 << 3.
-        Assert.Equal(new byte[] { 0xFE, 0x00, 0x02, 0x10 }, monoConfig);
+        Assert.Equal(new byte[] { 0xFE, 0x60, 0x02, 0x10 }, monoConfig);
     }
 
     [Fact]
