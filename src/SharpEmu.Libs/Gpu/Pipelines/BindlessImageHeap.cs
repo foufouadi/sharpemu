@@ -184,6 +184,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             throw SubmissionScheduler.Fatal($"The bindless image slot is invalid: kind={kind} view=0x{view.Handle:X}.");
         }
 
+        layout = index == 1 ? ImageLayout.General : layout;
         var key = new SlotKey(kind, view.Handle, layout, words);
         if (_slots.TryGetValue(key, out var existing))
         {
@@ -255,7 +256,10 @@ public sealed unsafe class BindlessImageHeap : IDisposable
 
     private void WriteNullDescriptor(uint binding, uint slot)
     {
-        var info = new DescriptorImageInfo { ImageLayout = ImageLayout.Undefined };
+        var info = new DescriptorImageInfo
+        {
+            ImageLayout = binding == 1 ? ImageLayout.General : ImageLayout.Undefined,
+        };
         DescriptorImageInfo* infoPointer = &info;
         var write = new WriteDescriptorSet
         {
