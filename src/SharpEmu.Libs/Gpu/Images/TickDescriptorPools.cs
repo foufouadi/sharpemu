@@ -63,6 +63,7 @@ public sealed unsafe class TickDescriptorPools : IDisposable
                 PPoolSizes = descriptorPoolSizes,
             };
             var result = _device.Vk.CreateDescriptorPool(_device.Device, &info, null, out var pool);
+            System.Threading.Interlocked.Increment(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
             if (result != Result.Success)
             {
                 throw SubmissionScheduler.Fatal($"vkCreateDescriptorPool failed: result={result}.");
@@ -102,11 +103,13 @@ public sealed unsafe class TickDescriptorPools : IDisposable
         foreach (var (_, pool, _) in _activePools)
         {
             _device.Vk.DestroyDescriptorPool(_device.Device, pool, null);
+            System.Threading.Interlocked.Decrement(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
         }
 
         foreach (var pool in _availablePools)
         {
             _device.Vk.DestroyDescriptorPool(_device.Device, pool, null);
+            System.Threading.Interlocked.Decrement(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
         }
 
         _activePools.Clear();

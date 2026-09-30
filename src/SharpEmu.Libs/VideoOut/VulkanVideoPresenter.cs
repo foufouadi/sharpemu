@@ -102,6 +102,15 @@ internal static unsafe partial class VulkanVideoPresenter
     private static void SetSharedInt64AtomicsCapability(bool supported) =>
         Volatile.Write(ref _sharedInt64AtomicsSupported, supported ? 1 : 0);
 
+    private static int _exactFloat16ConversionsSupported;
+
+    // True when the device was created with shaderFloat16 and f16 float controls.
+    internal static bool ExactFloat16ConversionsEnabled =>
+        Volatile.Read(ref _exactFloat16ConversionsSupported) != 0;
+
+    private static void SetExactFloat16ConversionsCapability(bool supported) =>
+        Volatile.Write(ref _exactFloat16ConversionsSupported, supported ? 1 : 0);
+
     internal static bool GraphicsSubgroupOperationsEnabled =>
         VulkanGraphicsSubgroupPolicy.ShouldUseNativeGraphicsSubgroups(
             unchecked((uint)Volatile.Read(ref _nativeSubgroupSize)),

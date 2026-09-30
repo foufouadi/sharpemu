@@ -42,6 +42,10 @@ internal interface IShaderPipelineHost
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
 
+    // The device converts f16<->f32 natively with the hardware's rounding and denormals
+    // (see VulkanFloat16Support).
+    bool ExactFloat16ConversionsEnabled => false;
+
     bool NonUniformImageIndexingEnabled => false;
     bool UsesBindlessImages => false;
     bool PerVertexPixelInputsSupported => true;
@@ -63,6 +67,9 @@ internal interface IShaderPipelineHost
     // may own the range (or, for a clean read, when a clean word read would be refused);
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
+
+    // TEMP DIAG: whether the GPU wrote any byte of the range (byte granular, no page rounding).
+    bool DiagGpuWroteBytes(ulong address, ulong size) => false;
 
     // Creates the host module of one compiled permutation and returns its handle.
     ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId);

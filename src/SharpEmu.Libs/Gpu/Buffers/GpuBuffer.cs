@@ -29,7 +29,17 @@ public unsafe class GpuBuffer : IDisposable
     private VkBuffer _handle;
     private DeviceMemory _memory;
 
-    public GpuBuffer(GpuDeviceInfo device, SubmissionScheduler scheduler, GpuBufferUsage usage, ulong cpuAddress, BufferUsageFlags flags, ulong size)
+    // Set when the memory is a range of a shared block of the device's buffer pool.
+    private ImageMemory _pooled;
+
+    // Device-local buffers below this share pooled blocks.
+    public const ulong PooledSizeLimit = 8UL << 20;
+
+    // `pooled` places a small device-local buffer in a shared block of the device's buffer
+    // pool. Its memory then holds whatever the previous occupant left, so only buffers whose
+    // every byte is written before use (guest buffers filled from guest memory) ask for it;
+    // a dedicated allocation starts out zeroed on the drivers SharpEmu runs on.
+    public GpuBuffer(GpuDeviceInfo device, SubmissionScheduler scheduler, GpuBufferUsage usage, ulong cpuAddress, BufferUsageFlags flags, ulong size, bool pooled = false)
     {
         if (size == 0)
         {
@@ -65,11 +75,23 @@ public unsafe class GpuBuffer : IDisposable
             AllocationSize = requirements.Size,
         };
 
-        // The best-scored type first; a full heap falls through to the next candidate.
+        // The best-scored type first; a full heap falls through to the next candidate. A small
+        // device-local buffer first takes a range of a pooled block of its best type.
         var result = Result.ErrorOutOfDeviceMemory;
+        ulong memoryOffset = 0;
         foreach (var candidate in RankMemoryTypes(device, requirements.MemoryTypeBits, usage))
         {
             allocateInfo.MemoryTypeIndex = candidate;
+            if (pooled && usage == GpuBufferUsage.DeviceLocal && requirements.Size < PooledSizeLimit &&
+                (device.GetMemoryTypeFlags(candidate) & MemoryPropertyFlags.HostVisibleBit) == 0 &&
+                device.BufferMemory.Allocate(requirements, candidate, out _pooled) == Result.Success)
+            {
+                _memory = _pooled.Memory;
+                memoryOffset = _pooled.Offset;
+                result = Result.Success;
+                break;
+            }
+
             result = device.AllocateMemory(allocateInfo, out _memory);
             if (result == Result.Success)
             {
@@ -78,10 +100,14 @@ public unsafe class GpuBuffer : IDisposable
         }
 
         RequireSuccess(result, $"vkAllocateMemory({usage}, 0x{size:X} bytes)");
-        RequireSuccess(vk.BindBufferMemory(device.Device, _handle, _memory, 0), "vkBindBufferMemory");
+        RequireSuccess(vk.BindBufferMemory(device.Device, _handle, _memory, memoryOffset), "vkBindBufferMemory");
         _allocationSize = requirements.Size;
 
         var properties = device.GetMemoryTypeFlags(allocateInfo.MemoryTypeIndex);
+        // TEMP DIAG: bytes per memory class for the periodic memory report.
+        _diagClass = (properties & MemoryPropertyFlags.HostVisibleBit) == 0 ? 0
+            : (properties & MemoryPropertyFlags.DeviceLocalBit) == 0 ? 1 : 2;
+        Interlocked.Add(ref DiagBytes[_diagClass], (long)_allocationSize);
         IsCoherent = (properties & MemoryPropertyFlags.HostCoherentBit) != 0;
         if ((properties & MemoryPropertyFlags.HostVisibleBit) != 0)
         {
@@ -98,12 +124,72 @@ public unsafe class GpuBuffer : IDisposable
             {
                 throw SubmissionScheduler.Fatal("The buffer device address is unavailable.");
             }
+
+            DiagRegister(_deviceAddress, requirements.Size, usage, cpuAddress, size); // TEMP DIAG
         }
+    }
+
+    // TEMP DIAG: live and recently destroyed device-address ranges, to name the target of a GPU fault.
+    private readonly record struct DiagRange(ulong Address, ulong Size, GpuBufferUsage Usage, ulong CpuAddress, ulong RequestedSize, long Created, long Destroyed);
+    private static readonly object DiagGate = new();
+    private static readonly Dictionary<ulong, DiagRange> DiagLive = new();
+    private static readonly Queue<DiagRange> DiagDead = new();
+
+    private static void DiagRegister(ulong address, ulong size, GpuBufferUsage usage, ulong cpuAddress, ulong requested)
+    {
+        lock (DiagGate)
+        {
+            DiagLive[address] = new DiagRange(address, size, usage, cpuAddress, requested, Environment.TickCount64, 0);
+        }
+    }
+
+    private static void DiagUnregister(ulong address)
+    {
+        lock (DiagGate)
+        {
+            if (DiagLive.Remove(address, out var range))
+            {
+                DiagDead.Enqueue(range with { Destroyed = Environment.TickCount64 });
+                while (DiagDead.Count > 8192)
+                {
+                    DiagDead.Dequeue();
+                }
+            }
+        }
+    }
+
+    public static string DiagDescribeAddress(ulong address)
+    {
+        var now = Environment.TickCount64;
+        var text = new System.Text.StringBuilder();
+        lock (DiagGate)
+        {
+            foreach (var range in DiagLive.Values.Concat(DiagDead))
+            {
+                // Within the range, or within 16 MiB after it (overruns).
+                if (address >= range.Address && address < range.Address + range.Size + (16UL << 20))
+                {
+                    text.Append(
+                        $" [{(range.Destroyed == 0 ? "live" : $"destroyed {now - range.Destroyed} ms ago")}] " +
+                        $"va=0x{range.Address:X}+0x{range.Size:X} off=0x{address - range.Address:X} usage={range.Usage} " +
+                        $"cpu=0x{range.CpuAddress:X} requested=0x{range.RequestedSize:X} age={now - range.Created} ms;");
+                }
+            }
+
+            text.Append($" live_ranges={DiagLive.Count}");
+        }
+
+        return text.ToString();
     }
 
     public VkBuffer Handle => _handle;
 
     public ulong Size { get; }
+
+    // TEMP DIAG: live bytes of device-only, host-only and host-visible device memory.
+    internal static readonly long[] DiagBytes = new long[3];
+    internal static Action<GpuBuffer>? DiagOnDispose;
+    private readonly int _diagClass;
 
     public Span<byte> Mapped => _mapped == null ? Span<byte>.Empty : new Span<byte>(_mapped, checked((int)Size));
 
@@ -236,8 +322,23 @@ public unsafe class GpuBuffer : IDisposable
             return;
         }
 
+        if (_deviceAddress != 0)
+        {
+            DiagUnregister(_deviceAddress); // TEMP DIAG
+            DiagOnDispose?.Invoke(this); // TEMP DIAG
+        }
+
+        Interlocked.Add(ref DiagBytes[_diagClass], -(long)_allocationSize); // TEMP DIAG
         _device.Vk.DestroyBuffer(_device.Device, _handle, null);
-        _device.FreeMemory(_memory);
+        if (_pooled.Memory.Handle != 0)
+        {
+            _device.BufferMemory.Free(_pooled);
+            _pooled = default;
+        }
+        else
+        {
+            _device.FreeMemory(_memory);
+        }
         _handle = default;
         _memory = default;
     }

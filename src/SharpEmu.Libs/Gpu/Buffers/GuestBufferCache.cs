@@ -829,6 +829,55 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void Unregister(ResourceSlotIdentifier bufferIdentifier) => UpdateRegistration(bufferIdentifier, insert: false);
 
+    // TEMP DIAG (SHARPEMU_DIAG_PAGE_TABLE=1): a CPU mirror of the device-address page table.
+    // It reports a clear that wipes another buffer's entries, and a buffer destroyed while
+    // entries still point into it (the GPU could then write through a freed address).
+    private static readonly bool DiagPageTable = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_PAGE_TABLE") == "1";
+    private static readonly Dictionary<ulong, ulong> DiagPageOwner = [];
+    private static readonly Dictionary<ulong, long> DiagOwnerPages = [];
+    private static int _diagPageTableReports;
+
+    private static void DiagMirrorPageTable(GpuBuffer buffer, ulong first, ulong sizePages, bool insert)
+    {
+        if (!DiagPageTable) return;
+        lock (DiagPageOwner)
+        {
+            GpuBuffer.DiagOnDispose ??= DiagCheckDisposed;
+            var device = buffer.DeviceAddress;
+            for (ulong page = first; page < first + sizePages; page++)
+            {
+                if (DiagPageOwner.TryGetValue(page, out var owner))
+                {
+                    DiagOwnerPages[owner]--;
+                    if (!insert && owner != device && _diagPageTableReports++ < 20)
+                        Console.Error.WriteLine($"[DIAG][PAGE_TABLE] clear of buffer va=0x{device:X} cpu=0x{buffer.CpuAddress:X} wipes page 0x{page:X} owned by va=0x{owner:X}");
+                    DiagPageOwner.Remove(page);
+                }
+
+                if (insert)
+                {
+                    DiagPageOwner[page] = device;
+                    DiagOwnerPages[device] = DiagOwnerPages.GetValueOrDefault(device) + 1;
+                }
+            }
+        }
+    }
+
+    private static void DiagCheckDisposed(GpuBuffer buffer)
+    {
+        lock (DiagPageOwner)
+        {
+            if (DiagOwnerPages.TryGetValue(buffer.DeviceAddress, out var pages) && pages > 0 && _diagPageTableReports++ < 40)
+            {
+                var sample = DiagPageOwner.Where(pair => pair.Value == buffer.DeviceAddress).Take(4).Select(pair => $"0x{pair.Key:X}");
+                Console.Error.WriteLine(
+                    $"[DIAG][PAGE_TABLE] buffer va=0x{buffer.DeviceAddress:X} cpu=0x{buffer.CpuAddress:X} size=0x{buffer.Size:X} destroyed with {pages} page-table entries still pointing into it: pages {string.Join(',', sample)}" + Environment.NewLine + Environment.StackTrace);
+            }
+
+            DiagOwnerPages.Remove(buffer.DeviceAddress);
+        }
+    }
+
     private void UpdateRegistration(ResourceSlotIdentifier bufferIdentifier, bool insert)
     {
         var buffer = _registry.GetBuffer(bufferIdentifier);
@@ -841,6 +890,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (GuestGpuMemoryHook.Traces(buffer.CpuAddress, buffer.Size))
             GuestGpuMemoryHook.Trace(buffer.CpuAddress, buffer.Size,
                 $"device-address-registration insert={insert} buffer={bufferIdentifier} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
+        DiagMirrorPageTable(buffer, first, sizePages, insert); // TEMP DIAG
         if (insert)
         {
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
@@ -933,6 +983,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The download ring could not map the batch.");
         }
 
+        if (baseOffset + packedSize + 0x10000 > _download.Size) // TEMP DIAG: writes that end near the ring end
+        {
+            Console.Error.WriteLine($"[DIAG][RING_END] buffer-batch base=0x{baseOffset:X} packed=0x{packedSize:X} end=0x{baseOffset + packedSize:X} ring=0x{_download.Size:X} copies={batch.Count} " +
+                string.Join(",", batch.Select(copy => $"dst=0x{copy.Placement.DestinationOffset:X}+0x{copy.Placement.TransferSize:X}")));
+        }
+
         foreach (var copy in batch)
         {
             var placement = copy.Placement;
@@ -1015,7 +1071,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
             _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
-            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin), overlap.Begin, overlap.End - overlap.Begin);
+            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, pooled: true), overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {
             MergeOverlappingBuffer(bufferIdentifier, oldId, !overlap.HasStreamLeap);

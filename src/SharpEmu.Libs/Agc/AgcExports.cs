@@ -209,6 +209,10 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceAgcAllocationFailures = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AGC_ALLOCATION_FAILURES"),
+        "1",
+        StringComparison.Ordinal);
     private static readonly bool _traceAgcShader =
         _traceAgc ||
         string.Equals(
@@ -501,6 +505,9 @@ public static partial class AgcExports
             !TryReadUInt64(ctx, commandBufferAddress + CommandBufferUserDataOffset, out var userData) ||
             !TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out var reservedDwords))
         {
+            TraceAgcAllocationFailure(
+                $"agc.cmd_alloc_read_failed buf=0x{commandBufferAddress:X16} need={sizeDwords} " +
+                $"advance={advanceCursor}");
             return false;
         }
 
@@ -525,7 +532,7 @@ public static partial class AgcExports
                     out callbackResult,
                     out callbackError))
             {
-                TraceAgc(
+                TraceAgcAllocationFailure(
                     $"agc.cmd_alloc_callback_failed buf=0x{commandBufferAddress:X16} " +
                     $"callback=0x{callback:X16} result=0x{callbackResult:X16} " +
                     $"error={callbackError ?? "none"}");
@@ -541,7 +548,23 @@ public static partial class AgcExports
                 !TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out reservedDwords) ||
                 sizeDwords > GetRemainingCommandDwords(cursorUp, cursorDown, reservedDwords))
             {
-                TraceAgc($"agc.cmd_alloc_callback_no_space buf=0x{commandBufferAddress:X16} need={sizeDwords}");
+                TraceAgcAllocationFailure(
+                    $"agc.cmd_alloc_callback_no_space buf=0x{commandBufferAddress:X16} need={sizeDwords} " +
+                    $"up=0x{cursorUp:X16} down=0x{cursorDown:X16} reserved={reservedDwords}");
+                // TEMP DIAG: guest callback state. 0x8009F5750 chains <= 64 chunks (count at +0x900);
+                // 0x800AB4550 pops 64 KiB chunks from a free list at +0xB8 (mode byte at +0xA8).
+                if (_traceAgcAllocationFailures && userData != 0)
+                {
+                    TryReadUInt32(ctx, userData + 0x900, out var chunkCount);
+                    TryReadUInt64(ctx, userData + 0xB8, out var freeList);
+                    TryReadUInt64(ctx, userData + 0xB0, out var usedList);
+                    var mode = TryReadUInt32(ctx, userData + 0xA8, out var modeWord) ? modeWord & 0xFF : 0xFFu;
+                    TraceAgcAllocationFailure(
+                        $"agc.cmd_alloc_callback_state callback=0x{callback:X16} result=0x{callbackResult:X16} " +
+                        $"userdata=0x{userData:X16} count900={chunkCount} mode_a8={mode} " +
+                        $"free_b8=0x{freeList:X16} used_b0=0x{usedList:X16}");
+                }
+
                 return false;
             }
         }
@@ -549,6 +572,9 @@ public static partial class AgcExports
         var nextCursor = cursorUp + ((ulong)sizeDwords * sizeof(uint));
         if (advanceCursor && !ctx.TryWriteUInt64(commandBufferAddress + CommandBufferCursorUpOffset, nextCursor))
         {
+            TraceAgcAllocationFailure(
+                $"agc.cmd_alloc_cursor_write_failed buf=0x{commandBufferAddress:X16} " +
+                $"up=0x{cursorUp:X16} next=0x{nextCursor:X16} need={sizeDwords}");
             return false;
         }
 
@@ -571,6 +597,14 @@ public static partial class AgcExports
 
     private static int ReturnPointer(CpuContext ctx, ulong pointer)
     {
+        if (pointer == 0 && _traceAgcAllocationFailures)
+        {
+            TraceAgcAllocationFailure(
+                $"agc.return_pointer_null rip=0x{ctx.Rip:X16} " +
+                $"rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16}");
+        }
+
         ctx[CpuRegister.Rax] = pointer;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -788,6 +822,14 @@ public static partial class AgcExports
         }
 
         Console.Error.WriteLine($"[LOADER][TRACE] t={TraceSeconds()} {message}");
+    }
+
+    private static void TraceAgcAllocationFailure(string message)
+    {
+        if (_traceAgcAllocationFailures)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] t={TraceSeconds()} {message}");
+        }
     }
 
     private static void TraceAgcShader(

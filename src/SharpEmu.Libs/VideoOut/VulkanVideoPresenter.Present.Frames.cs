@@ -711,6 +711,25 @@ internal static unsafe partial class VulkanVideoPresenter
         // Captures the display surface through the store in queue order; presentation reads the copy.
         private GuestImageResource CreateGuestFlipSnapshot(Format format, uint width, uint height, ulong address, long version)
         {
+            GuestImageResource? reused = null;
+            lock (_recycledFlipSnapshots)
+            {
+                var recycled = _recycledFlipSnapshots.FindIndex(snapshot => snapshot.Width == width && snapshot.Height == height && snapshot.Format == format);
+                if (recycled >= 0)
+                {
+                    reused = _recycledFlipSnapshots[recycled];
+                    _recycledFlipSnapshots.RemoveAt(recycled);
+                }
+            }
+
+            if (reused is not null)
+            {
+                reused.Address = address;
+                reused.FlipVersion = version;
+                SetDebugName(ObjectType.Image, reused.Image.Handle, $"guest flip v{version} source 0x{address:X16}");
+                return reused;
+            }
+
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,

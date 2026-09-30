@@ -213,6 +213,9 @@ internal sealed class ShaderProgramCache
             ShaderCacheCounters.CountProgram();
         }
 
+        if (DescriptorTableDiag.Enabled) DescriptorTableDiag.Report(source.Hash, entry.Plan, inputs, _host); // TEMP DIAG
+        DescriptorTableDiag.ReportAccesses(source.Hash, entry.Plan, inputs, _host); // TEMP DIAG
+
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         var captureIndirectImageFailure = ShaderPermutationDump.CreateFailureCapture(source);
@@ -537,6 +540,7 @@ internal sealed class ShaderProgramCache
     {
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
+        var exactFloat16Conversions = _host.ExactFloat16ConversionsEnabled;
         var nonUniformImageIndexing = _host.NonUniformImageIndexingEnabled;
         switch (source.Stage)
         {
@@ -550,6 +554,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
@@ -577,6 +582,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
@@ -596,6 +602,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),

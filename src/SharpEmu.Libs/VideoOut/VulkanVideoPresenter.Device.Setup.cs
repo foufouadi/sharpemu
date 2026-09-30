@@ -280,7 +280,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     enabledExtensions[index] = extensions[index];
                 }
 
-                if (_vulkanDebugUtilsEnabled &&
+                if ((_vulkanDebugUtilsEnabled || AddressBindingDiag.Enabled) &&
                     IsInstanceExtensionAvailable(DebugUtilsExtensionName))
                 {
                     debugUtilsExtension = (byte*)SilkMarshal.StringToPtr(DebugUtilsExtensionName);
@@ -343,6 +343,24 @@ internal static unsafe partial class VulkanVideoPresenter
                         _debugUtils = debugUtils;
                         RegisterDebugMessenger(debugUtils);
                         Console.Error.WriteLine("[LOADER][INFO] Vulkan Validation Layers active (SHARPEMU_VK_VALIDATION=1).");
+                    }
+
+                    // TEMP DIAG: address-binding reports go to their own messenger.
+                    if (AddressBindingDiag.Enabled && debugUtilsExtension is not null &&
+                        _vk.TryGetInstanceExtension(_instance, out ExtDebugUtils bindingUtils))
+                    {
+                        var bindingInfo = new DebugUtilsMessengerCreateInfoEXT
+                        {
+                            SType = StructureType.DebugUtilsMessengerCreateInfoExt,
+                            MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.InfoBitExt
+                                              | DebugUtilsMessageSeverityFlagsEXT.VerboseBitExt
+                                              | DebugUtilsMessageSeverityFlagsEXT.WarningBitExt
+                                              | DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt,
+                            MessageType = DebugUtilsMessageTypeFlagsEXT.DeviceAddressBindingBitExt,
+                            PfnUserCallback = new PfnDebugUtilsMessengerCallbackEXT(AddressBindingDiag.Callback),
+                        };
+                        Check(bindingUtils.CreateDebugUtilsMessenger(_instance, &bindingInfo, null, out _), "vkCreateDebugUtilsMessengerEXT(binding)");
+                        Console.Error.WriteLine("[LOADER][INFO] address binding reports: messenger registered");
                     }
                 }
                 finally
@@ -600,6 +618,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _maxPushDescriptors = pushDescriptorProperties.MaxPushDescriptors;
             _maxPerStageSampledImages = properties.Limits.MaxPerStageDescriptorSampledImages;
             _maxPerStageStorageImages = properties.Limits.MaxPerStageDescriptorStorageImages;
+            _maxPerStageStorageBuffers = properties.Limits.MaxPerStageDescriptorStorageBuffers;
             _maxPerStageUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindSampledImages;
             _maxPerStageUpdateAfterBindStorageImages = descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindStorageImages;
             _maxUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSampledImages;
@@ -842,6 +861,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
+            var supportsExactFloat16 = VulkanFloat16Support.SupportsExactConversions(_vk, _physicalDevice);
+            SetExactFloat16ConversionsCapability(supportsExactFloat16);
             var supportsNonUniformImageIndexing = descriptorIndexingQuery.ShaderSampledImageArrayNonUniformIndexing &&
                 descriptorIndexingQuery.ShaderStorageImageArrayNonUniformIndexing;
             SetNonUniformImageIndexingCapability(supportsNonUniformImageIndexing);
@@ -914,7 +935,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var deviceFaultFeatures = new PhysicalDeviceFaultFeaturesEXT { SType = StructureType.PhysicalDeviceFaultFeaturesExt };
             try
             {
-                var extensions = stackalloc byte*[14];
+                var extensions = stackalloc byte*[16];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -962,6 +983,14 @@ internal static unsafe partial class VulkanVideoPresenter
                     extensions[extensionCount++] = memoryBudgetExtension;
                 }
 
+                var bindingReport = AddressBindingDiag.Enabled && IsDeviceExtensionAvailable(AddressBindingDiag.ExtensionName); // TEMP DIAG
+                if (bindingReport)
+                {
+                    extensions[extensionCount++] = (byte*)SilkMarshal.StringToPtr(AddressBindingDiag.ExtensionName);
+                }
+
+                Console.Error.WriteLine($"[LOADER][INFO] address binding reports: enabled={AddressBindingDiag.Enabled} device_extension={bindingReport}");
+
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
                 {
                     // The spec requires enabling this when the (MoltenVK)
@@ -1008,6 +1037,17 @@ internal static unsafe partial class VulkanVideoPresenter
                         PNext = renderingChain,
                     };
                     renderingChain = &atomicInt64Features;
+                }
+
+                var float16Features = new PhysicalDeviceShaderFloat16Int8Features
+                {
+                    SType = StructureType.PhysicalDeviceShaderFloat16Int8Features,
+                    ShaderFloat16 = true,
+                };
+                if (supportsExactFloat16)
+                {
+                    float16Features.PNext = renderingChain;
+                    renderingChain = &float16Features;
                 }
 
                 if (_supportsFragmentShaderBarycentric)
@@ -1058,6 +1098,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &deviceFaultFeatures;
                 }
 
+                var bindingReportFeatures = new PhysicalDeviceAddressBindingReportFeaturesEXT
+                {
+                    SType = StructureType.PhysicalDeviceAddressBindingReportFeaturesExt,
+                    ReportAddressBinding = true,
+                };
+                if (bindingReport)
+                {
+                    bindingReportFeatures.PNext = renderingChain;
+                    renderingChain = &bindingReportFeatures;
+                }
+
                 vulkan13Features = new PhysicalDeviceVulkan13Features
                 {
                     SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -1101,6 +1152,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
             _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled);
+            SharpEmu.Libs.Gpu.MemoryReportDiag.Start(_deviceInfo, () => SharpEmu.Libs.Kernel.KernelMemoryCompatExports.DiagDirectAllocatedBytes); // TEMP DIAG
             CreateScheduler();
             CreateBufferCache();
             CreateImageCache();

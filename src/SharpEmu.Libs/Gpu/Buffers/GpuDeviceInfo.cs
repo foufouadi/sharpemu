@@ -80,6 +80,12 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     // Images share pooled device-memory blocks; see ImageMemoryPool.
     public ImageMemoryPool ImageMemory => _imageMemory ??= new ImageMemoryPool(this);
 
+    // Small device-local buffers (the 16 KiB pages demand paging creates by the thousand)
+    // share 64 MiB blocks instead of one driver allocation each.
+    private ImageMemoryPool? _bufferMemory;
+
+    public ImageMemoryPool BufferMemory => _bufferMemory ??= new ImageMemoryPool(this, 64UL << 20, deviceAddress: true);
+
     public ulong ImageMemoryAllocatedBytes => _imageMemory?.AllocatedBytes ?? 0;
 
     public ulong ImageMemoryPlacedBytes => _imageMemory?.PlacedBytes ?? 0;
@@ -227,6 +233,30 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         }
     }
 
+    // TEMP DIAG: live device memory by memory type index.
+    internal static readonly long[] DiagBytesByType = new long[32];
+    internal static readonly long[] DiagCountByType = new long[32];
+    internal static long DiagAllocations;
+    internal static long DiagFrees;
+    internal static long DiagAllocatedBytes;
+    private static int _diagLargeLogged;
+    private static int _diagSmallLogged;
+    private static int _diagExactLogged;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, (uint Type, ulong Size)> DiagLive = new();
+
+    internal string DiagDescribeMemoryTypes()
+    {
+        var parts = new List<string>();
+        for (uint type = 0; type < 32; type++)
+        {
+            var bytes = Interlocked.Read(ref DiagBytesByType[type]);
+            if (bytes == 0) continue;
+            parts.Add($"type{type}[{GetMemoryTypeFlags(type)}]={bytes >> 20}MB/n{Interlocked.Read(ref DiagCountByType[type])}");
+        }
+
+        return string.Join(' ', parts);
+    }
+
     // Every device-memory allocation goes through here so the live count stays exact.
     public Result AllocateMemory(in MemoryAllocateInfo info, out DeviceMemory memory)
     {
@@ -235,6 +265,43 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
             var result = Vk.AllocateMemory(Device, pointer, null, out memory);
             if (result == Result.Success)
             {
+                // TEMP DIAG: live bytes per memory type for the periodic memory report.
+                DiagLive[memory.Handle] = (info.MemoryTypeIndex, info.AllocationSize);
+                Interlocked.Add(ref DiagBytesByType[info.MemoryTypeIndex & 31], (long)info.AllocationSize);
+                Interlocked.Increment(ref DiagCountByType[info.MemoryTypeIndex & 31]);
+                Interlocked.Increment(ref DiagAllocations);
+                // Small allocations: one sample stack every 500 once past 1500 live allocations.
+                if (info.AllocationSize < 1UL << 20 && Interlocked.Read(ref DiagAllocations) > 1500 &&
+                    Interlocked.Read(ref DiagAllocations) % 500 == 0 && Interlocked.Increment(ref _diagSmallLogged) <= 12)
+                {
+                    var smallFrames = new System.Diagnostics.StackTrace(1, false).GetFrames()
+                        .Select(frame => frame.GetMethod())
+                        .Where(method => method is not null)
+                        .Take(8)
+                        .Select(method => $"{method!.DeclaringType?.Name}.{method.Name}");
+                    Console.Error.WriteLine($"[DIAG][SMALL_ALLOC] size_kb={info.AllocationSize >> 10} type={info.MemoryTypeIndex} from {string.Join(" < ", smallFrames)}");
+                }
+
+                if (info.AllocationSize == 0x1FE0000 && Interlocked.Increment(ref _diagExactLogged) <= 6)
+                {
+                    var exactFrames = new System.Diagnostics.StackTrace(1, false).GetFrames()
+                        .Select(frame => frame.GetMethod())
+                        .Where(method => method is not null)
+                        .Take(10)
+                        .Select(method => $"{method!.DeclaringType?.Name}.{method.Name}");
+                    Console.Error.WriteLine($"[DIAG][ALLOC_1FE0000] count={Interlocked.Read(ref DiagAllocations)} from {string.Join(" < ", exactFrames)}");
+                }
+
+                if (info.AllocationSize >= 64UL << 20 && Interlocked.Increment(ref _diagLargeLogged) <= 40)
+                {
+                    var frames = new System.Diagnostics.StackTrace(1, false).GetFrames()
+                        .Select(frame => frame.GetMethod())
+                        .Where(method => method is not null)
+                        .Take(6)
+                        .Select(method => $"{method!.DeclaringType?.Name}.{method.Name}");
+                    Console.Error.WriteLine($"[DIAG][LARGE_ALLOC] size_mb={info.AllocationSize >> 20} type={info.MemoryTypeIndex} from {string.Join(" < ", frames)}");
+                }
+                Interlocked.Add(ref DiagAllocatedBytes, (long)info.AllocationSize);
                 var live = Interlocked.Increment(ref _liveAllocations);
                 int peak;
                 while ((peak = Volatile.Read(ref _peakAllocations)) < live &&
@@ -252,6 +319,13 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         if (memory.Handle == 0)
         {
             return;
+        }
+
+        if (DiagLive.TryRemove(memory.Handle, out var freed)) // TEMP DIAG
+        {
+            Interlocked.Add(ref DiagBytesByType[freed.Type & 31], -(long)freed.Size);
+            Interlocked.Decrement(ref DiagCountByType[freed.Type & 31]);
+            Interlocked.Increment(ref DiagFrees);
         }
 
         Vk.FreeMemory(Device, memory, null);

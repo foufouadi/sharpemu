@@ -83,7 +83,7 @@ public sealed class Gen5LargeDispatcherValidationTests
         ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
     }
 
-    private static IReadOnlyList<SpirvOp> ReadSpirvOpcodes(byte[] code)
+    internal static IReadOnlyList<SpirvOp> ReadSpirvOpcodes(byte[] code)
     {
         var words = new uint[code.Length / sizeof(uint)];
         Buffer.BlockCopy(code, 0, words, 0, code.Length);
@@ -119,7 +119,7 @@ public sealed class Gen5LargeDispatcherValidationTests
         return result;
     }
 
-    private static void ValidateStructuredControlFlow(byte[] code)
+    internal static void ValidateStructuredControlFlow(byte[] code)
     {
         var blockOpen = false;
         var blockTerminated = false;
@@ -207,7 +207,7 @@ public sealed class Gen5LargeDispatcherValidationTests
 
     private sealed record ParsedInstruction(SpirvOp Opcode, uint[] Operands);
 
-    private static void ValidateWithSpirvToolsWhenAvailable(byte[] code)
+    internal static void ValidateWithSpirvToolsWhenAvailable(byte[] code)
     {
         var sdk = Environment.GetEnvironmentVariable("VULKAN_SDK");
         var candidates = new List<string>();

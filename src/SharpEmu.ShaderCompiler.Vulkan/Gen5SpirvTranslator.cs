@@ -10,6 +10,10 @@ public static partial class Gen5SpirvTranslator
 {
     private const uint VectorRegisterCount = 512;
     private const uint LdsDwordCount = 8192;
+    // The top dwords of the compute LDS array are the translator's own: the wave64 scratch
+    // (last 3) and a dword kept at zero that out-of-range guest reads resolve to.
+    private const uint LdsGuestDwordCount = LdsDwordCount - 8;
+    private const uint LdsZeroDword = LdsDwordCount - 5;
     // Graphics stages model LDS as a per-invocation Private array rather than
     // real workgroup-shared memory. A full 32 KB Private array per vertex/pixel
     // invocation is wasteful and risks Metal compile limits, and per-invocation
@@ -134,6 +138,10 @@ public static partial class Gen5SpirvTranslator
         private uint _longType;
         private uint _ulongType;
         private uint _floatType;
+
+        // f16 and f16vec2, present only with SupportsExactFloat16Conversions.
+        private uint _halfType;
+        private uint _half2Type;
         private uint _vec2Type;
         private uint _vec3Type;
         private uint _vec4Type;
@@ -163,6 +171,10 @@ public static partial class Gen5SpirvTranslator
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
+        // In-bounds condition of each workgroup LDS pointer that may point at the zero dword,
+        // so a store through it can be dropped when the guest address is out of range.
+        private readonly Dictionary<uint, uint> _ldsPointerInBounds = [];
+        private bool _ldsIsWorkgroup;
         private uint _scratch;
         private uint _scratchElementPointer;
         private uint _scratchDwordCount;
@@ -314,153 +326,10 @@ public static partial class Gen5SpirvTranslator
                 }
                 EmitInitialState();
 
-                var loopHeader = _module.AllocateId();
-                var switchHeader = _module.AllocateId();
-                var switchMerge = _module.AllocateId();
-                var loopContinue = _module.AllocateId();
-                var loopMerge = _module.AllocateId();
-                var defaultLabel = _module.AllocateId();
-                var caseLabels = new uint[blocks.Count];
-                for (var index = 0; index < caseLabels.Length; index++)
+                if (!TryEmitControlFlow(blocks, out error))
                 {
-                    caseLabels[index] = _module.AllocateId();
+                    return false;
                 }
-
-                _module.AddStatement(SpirvOp.Branch, loopHeader);
-                _module.AddLabel(loopHeader);
-                // Check before the first block can write from an inactive invocation.
-                var programIsActive = Load(_boolType, _programActive);
-                _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
-                _module.AddStatement(SpirvOp.BranchConditional, programIsActive, switchHeader, loopMerge);
-
-                _module.AddLabel(switchHeader);
-                var selector = Load(_uintType, _programCounter);
-                if (blocks.Count <= 512)
-                {
-                    _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
-                    var switchOperands = new uint[2 + (blocks.Count * 2)];
-                    switchOperands[0] = selector;
-                    switchOperands[1] = defaultLabel;
-                    for (var index = 0; index < blocks.Count; index++)
-                    {
-                        switchOperands[2 + (index * 2)] = (uint)index;
-                        switchOperands[3 + (index * 2)] = caseLabels[index];
-                    }
-
-                    _module.AddStatement(SpirvOp.Switch, switchOperands);
-                    for (var index = 0; index < blocks.Count; index++)
-                    {
-                        _module.AddLabel(caseLabels[index]);
-                        if (!TryEmitBlock(blocks, index, out error))
-                        {
-                            error = $"block=0x{blocks[index].StartPc:X}: {error}";
-                            return false;
-                        }
-
-                        _module.AddStatement(SpirvOp.Branch, switchMerge);
-                    }
-
-                    _module.AddLabel(defaultLabel);
-                    Store(_programActive, _module.ConstantBool(false));
-                    _module.AddStatement(SpirvOp.Branch, switchMerge);
-                }
-                else
-                {
-                    var dispatchRoot = _module.AllocateId();
-                    var dispatchMerge = _module.AllocateId();
-                    var inRange = _module.AddInstruction(
-                        SpirvOp.ULessThan,
-                        _boolType,
-                        selector,
-                        UInt((uint)blocks.Count));
-                    _module.AddStatement(SpirvOp.SelectionMerge, dispatchMerge, 0);
-                    _module.AddStatement(SpirvOp.BranchConditional, inRange, dispatchRoot, defaultLabel);
-                    _module.AddLabel(dispatchRoot);
-
-                    bool EmitDispatchTree(int first, int count, uint continuation, out string treeError)
-                    {
-                        treeError = string.Empty;
-                        if (count == 1)
-                        {
-                            _module.AddStatement(SpirvOp.Branch, caseLabels[first]);
-                            _module.AddLabel(caseLabels[first]);
-                            if (!TryEmitBlock(blocks, first, out treeError))
-                            {
-                                treeError = $"block=0x{blocks[first].StartPc:X}: {treeError}";
-                                return false;
-                            }
-
-                            _module.AddStatement(SpirvOp.Branch, continuation);
-                            return true;
-                        }
-
-                        var leftCount = count / 2;
-                        var split = first + leftCount;
-                        var leftLabel = _module.AllocateId();
-                        var rightLabel = _module.AllocateId();
-                        var mergeLabel = _module.AllocateId();
-                        var left = _module.AddInstruction(
-                            SpirvOp.ULessThan,
-                            _boolType,
-                            selector,
-                            UInt((uint)split));
-                        _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
-                        _module.AddStatement(SpirvOp.BranchConditional, left, leftLabel, rightLabel);
-                        _module.AddLabel(leftLabel);
-                        if (!EmitDispatchTree(first, leftCount, mergeLabel, out treeError))
-                        {
-                            return false;
-                        }
-
-                        _module.AddLabel(rightLabel);
-                        if (!EmitDispatchTree(split, count - leftCount, mergeLabel, out treeError))
-                        {
-                            return false;
-                        }
-
-                        _module.AddLabel(mergeLabel);
-                        _module.AddStatement(SpirvOp.Branch, continuation);
-                        return true;
-                    }
-
-                    if (!EmitDispatchTree(0, blocks.Count, dispatchMerge, out error))
-                    {
-                        return false;
-                    }
-
-                    _module.AddLabel(defaultLabel);
-                    Store(_programActive, _module.ConstantBool(false));
-                    _module.AddStatement(SpirvOp.Branch, dispatchMerge);
-                    _module.AddLabel(dispatchMerge);
-                    _module.AddStatement(SpirvOp.Branch, switchMerge);
-                }
-
-                _module.AddLabel(switchMerge);
-                _module.AddStatement(SpirvOp.Branch, loopContinue);
-                _module.AddLabel(loopContinue);
-                var active = Load(_boolType, _programActive);
-                if (_maxDispatcherSteps > 0)
-                {
-                    var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                    Store(_iterationGuard, steps);
-                    var withinLimit = _module.AddInstruction(
-                        SpirvOp.ULessThan,
-                        _boolType,
-                        steps,
-                        UInt((uint)_maxDispatcherSteps));
-                    active = _module.AddInstruction(
-                        SpirvOp.LogicalAnd,
-                        _boolType,
-                        active,
-                        withinLimit);
-                }
-
-                _module.AddStatement(
-                    SpirvOp.BranchConditional,
-                    active,
-                    loopHeader,
-                    loopMerge);
-                _module.AddLabel(loopMerge);
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -527,6 +396,10 @@ public static partial class Gen5SpirvTranslator
 
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
+                if (!TryEmitStructuredBodyFunction(out error))
+                {
+                    return false;
+                }
 
                 var model = _stage switch
                 {
@@ -535,6 +408,13 @@ public static partial class Gen5SpirvTranslator
                     _ => SpirvExecutionModel.GLCompute,
                 };
                 _module.AddEntryPoint(model, main, "main", _interfaces);
+                if (_request.SupportsExactFloat16Conversions)
+                {
+                    // The f16 conversions round to nearest even and keep f16 denormals, as
+                    // the hardware does.
+                    _module.AddExecutionMode(main, SpirvExecutionMode.RoundingModeRTE, 16);
+                    _module.AddExecutionMode(main, SpirvExecutionMode.DenormPreserve, 16);
+                }
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
@@ -573,6 +453,12 @@ public static partial class Gen5SpirvTranslator
         {
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
+            if (_request.SupportsExactFloat16Conversions)
+            {
+                _module.AddCapability(SpirvCapability.Float16);
+                _module.AddCapability(SpirvCapability.DenormPreserve);
+                _module.AddCapability(SpirvCapability.RoundingModeRTE);
+            }
             _module.AddCapability(SpirvCapability.ImageQuery);
             if (UsesSubgroupOperations())
             {
@@ -600,6 +486,11 @@ public static partial class Gen5SpirvTranslator
             _ulongType = _module.TypeInt(64, signed: false);
             _floatType = _module.TypeFloat(32);
             _vec2Type = _module.TypeVector(_floatType, 2);
+            if (_request.SupportsExactFloat16Conversions)
+            {
+                _halfType = _module.TypeFloat(16);
+                _half2Type = _module.TypeVector(_halfType, 2);
+            }
             _vec3Type = _module.TypeVector(_floatType, 3);
             _vec4Type = _module.TypeVector(_floatType, 4);
             _uvec2Type = _module.TypeVector(_uintType, 2);
@@ -779,6 +670,7 @@ public static partial class Gen5SpirvTranslator
                 ? LdsDwordCount
                 : PrivateLdsDwordCount;
             _ldsDwordMask = dwordCount - 1;
+            _ldsIsWorkgroup = storageClass == SpirvStorageClass.Workgroup;
 
             var ldsArrayType = _module.TypeArray(_uintType, dwordCount);
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
@@ -1153,6 +1045,14 @@ public static partial class Gen5SpirvTranslator
             }
             Store(_programCounter, UInt(0));
             Store(_programActive, _module.ConstantBool(true));
+            if (_ldsIsWorkgroup)
+            {
+                // Every invocation zeroes the dword out-of-range LDS reads resolve to. Only zero
+                // is ever stored there, so each invocation sees zero without a barrier.
+                Store(
+                    _module.AddInstruction(SpirvOp.AccessChain, _ldsElementPointer, _lds, UInt(LdsZeroDword)),
+                    UInt(0));
+            }
 
             if (_stage == Gen5SpirvStage.Vertex)
             {
@@ -1364,7 +1264,176 @@ public static partial class Gen5SpirvTranslator
 
         private enum SharedMemoryPhase { None, Read, Write }
 
+        // The PC dispatcher: one loop whose switch runs the block the program counter names.
+        // Correct for any control flow, including irreducible graphs, but costly to compile.
+        private bool TryEmitDispatcher(IReadOnlyList<ShaderBlock> blocks, out string error)
+        {
+            error = string.Empty;
+            var loopHeader = _module.AllocateId();
+            var switchHeader = _module.AllocateId();
+            var switchMerge = _module.AllocateId();
+            var loopContinue = _module.AllocateId();
+            var loopMerge = _module.AllocateId();
+            var defaultLabel = _module.AllocateId();
+            var caseLabels = new uint[blocks.Count];
+            for (var index = 0; index < caseLabels.Length; index++)
+            {
+                caseLabels[index] = _module.AllocateId();
+            }
+
+            _module.AddStatement(SpirvOp.Branch, loopHeader);
+            _module.AddLabel(loopHeader);
+            // Check before the first block can write from an inactive invocation.
+            var programIsActive = Load(_boolType, _programActive);
+            _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
+            _module.AddStatement(SpirvOp.BranchConditional, programIsActive, switchHeader, loopMerge);
+
+            _module.AddLabel(switchHeader);
+            var selector = Load(_uintType, _programCounter);
+            if (blocks.Count <= 512)
+            {
+                _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
+                var switchOperands = new uint[2 + (blocks.Count * 2)];
+                switchOperands[0] = selector;
+                switchOperands[1] = defaultLabel;
+                for (var index = 0; index < blocks.Count; index++)
+                {
+                    switchOperands[2 + (index * 2)] = (uint)index;
+                    switchOperands[3 + (index * 2)] = caseLabels[index];
+                }
+
+                _module.AddStatement(SpirvOp.Switch, switchOperands);
+                for (var index = 0; index < blocks.Count; index++)
+                {
+                    _module.AddLabel(caseLabels[index]);
+                    if (!TryEmitBlock(blocks, index, out error))
+                    {
+                        error = $"block=0x{blocks[index].StartPc:X}: {error}";
+                        return false;
+                    }
+
+                    _module.AddStatement(SpirvOp.Branch, switchMerge);
+                }
+
+                _module.AddLabel(defaultLabel);
+                Store(_programActive, _module.ConstantBool(false));
+                _module.AddStatement(SpirvOp.Branch, switchMerge);
+            }
+            else
+            {
+                var dispatchRoot = _module.AllocateId();
+                var dispatchMerge = _module.AllocateId();
+                var inRange = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    selector,
+                    UInt((uint)blocks.Count));
+                _module.AddStatement(SpirvOp.SelectionMerge, dispatchMerge, 0);
+                _module.AddStatement(SpirvOp.BranchConditional, inRange, dispatchRoot, defaultLabel);
+                _module.AddLabel(dispatchRoot);
+
+                bool EmitDispatchTree(int first, int count, uint continuation, out string treeError)
+                {
+                    treeError = string.Empty;
+                    if (count == 1)
+                    {
+                        _module.AddStatement(SpirvOp.Branch, caseLabels[first]);
+                        _module.AddLabel(caseLabels[first]);
+                        if (!TryEmitBlock(blocks, first, out treeError))
+                        {
+                            treeError = $"block=0x{blocks[first].StartPc:X}: {treeError}";
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, continuation);
+                        return true;
+                    }
+
+                    var leftCount = count / 2;
+                    var split = first + leftCount;
+                    var leftLabel = _module.AllocateId();
+                    var rightLabel = _module.AllocateId();
+                    var mergeLabel = _module.AllocateId();
+                    var left = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        selector,
+                        UInt((uint)split));
+                    _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
+                    _module.AddStatement(SpirvOp.BranchConditional, left, leftLabel, rightLabel);
+                    _module.AddLabel(leftLabel);
+                    if (!EmitDispatchTree(first, leftCount, mergeLabel, out treeError))
+                    {
+                        return false;
+                    }
+
+                    _module.AddLabel(rightLabel);
+                    if (!EmitDispatchTree(split, count - leftCount, mergeLabel, out treeError))
+                    {
+                        return false;
+                    }
+
+                    _module.AddLabel(mergeLabel);
+                    _module.AddStatement(SpirvOp.Branch, continuation);
+                    return true;
+                }
+
+                if (!EmitDispatchTree(0, blocks.Count, dispatchMerge, out error))
+                {
+                    return false;
+                }
+
+                _module.AddLabel(defaultLabel);
+                Store(_programActive, _module.ConstantBool(false));
+                _module.AddStatement(SpirvOp.Branch, dispatchMerge);
+                _module.AddLabel(dispatchMerge);
+                _module.AddStatement(SpirvOp.Branch, switchMerge);
+            }
+
+            _module.AddLabel(switchMerge);
+            _module.AddStatement(SpirvOp.Branch, loopContinue);
+            _module.AddLabel(loopContinue);
+            var active = Load(_boolType, _programActive);
+            if (_maxDispatcherSteps > 0)
+            {
+                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
+                Store(_iterationGuard, steps);
+                var withinLimit = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    steps,
+                    UInt((uint)_maxDispatcherSteps));
+                active = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    active,
+                    withinLimit);
+            }
+
+            _module.AddStatement(
+                SpirvOp.BranchConditional,
+                active,
+                loopHeader,
+                loopMerge);
+            _module.AddLabel(loopMerge);
+            return true;
+        }
+
         private bool TryEmitBlock(
+            IReadOnlyList<ShaderBlock> blocks,
+            int blockIndex,
+            out string error)
+        {
+            if (!TryEmitBlockInstructions(blocks, blockIndex, out error))
+            {
+                return false;
+            }
+
+            return TryEmitDispatcherTerminator(blocks, blockIndex, out error);
+        }
+
+        // Emits every instruction of a block except its terminating branch or S_ENDPGM.
+        private bool TryEmitBlockInstructions(
             IReadOnlyList<ShaderBlock> blocks,
             int blockIndex,
             out string error)
@@ -1397,10 +1466,20 @@ public static partial class Gen5SpirvTranslator
                     }
                 }
 
+                var wordsBefore = _module.FunctionWordCount;
+                _emitPath = string.Empty;
                 if (!TryEmitInstruction(instruction, out error))
                 {
                     error = $"pc=0x{instruction.Pc:X} {instruction.Opcode}: {error}";
                     return false;
+                }
+
+                // TEMP DIAG: SPIR-V cost of each buffer instruction and the lowering it took.
+                if (TraceEmitCost && (_emitPath.Length != 0 || _module.FunctionWordCount - wordsBefore >= 200))
+                {
+                    Console.Error.WriteLine(
+                        $"[SHADER][EMIT_COST] program=0x{_request.Program.Address:X} pc=0x{instruction.Pc:X} " +
+                        $"opcode={instruction.Opcode} path={(_emitPath.Length == 0 ? "-" : _emitPath)} words={_module.FunctionWordCount - wordsBefore}");
                 }
 
                 CapturePixelVgprs(instruction);
@@ -1410,6 +1489,17 @@ public static partial class Gen5SpirvTranslator
             }
 
             if (synchronizeSharedMemory && sharedMemoryPhase != SharedMemoryPhase.None) EmitWave64Barrier();
+            return true;
+        }
+
+        // Selects the next block through the program counter; the dispatcher loop branches on it.
+        private bool TryEmitDispatcherTerminator(
+            IReadOnlyList<ShaderBlock> blocks,
+            int blockIndex,
+            out string error)
+        {
+            error = string.Empty;
+            var block = blocks[blockIndex];
             var terminator = _request.Program.Instructions[block.EndIndex - 1];
             if (terminator.Opcode == "SEndpgm")
             {
@@ -1536,11 +1626,37 @@ public static partial class Gen5SpirvTranslator
             return condition != 0;
         }
 
+        // TEMP DIAG: SHARPEMU_DIAG_PROBE="probePc:r0,r1,r2,r3@storePc" (hex PCs, decimal VGPRs).
+        // Before probePc, copies the four VGPRs to v500..v503; before the ImageStore at storePc,
+        // copies them back into v0..v3, so that store writes the probed values.
+        private static readonly string? DiagProbe = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_PROBE");
+
+        private void EmitDiagProbe(Gen5ShaderInstruction instruction)
+        {
+            if (string.IsNullOrEmpty(DiagProbe)) return;
+            var at = DiagProbe.Split('@');
+            var head = at[0].Split(':');
+            var probePc = Convert.ToUInt32(head[0], 16);
+            var storePc = Convert.ToUInt32(at[1], 16);
+            if (!_request.Program.Instructions.Any(i => i.Pc == storePc && i.Opcode == "ImageStore")) return;
+            if (instruction.Pc == probePc)
+            {
+                var registers = head[1].Split(',').Select(uint.Parse).ToArray();
+                for (var i = 0; i < 4; i++) StoreV(500u + (uint)i, LoadV(registers[i]), guardWithExec: false);
+            }
+
+            if (instruction.Pc == storePc)
+            {
+                for (var i = 0u; i < 4; i++) StoreV(i, LoadV(500u + i), guardWithExec: false);
+            }
+        }
+
         private bool TryEmitInstruction(
             Gen5ShaderInstruction instruction,
             out string error)
         {
             error = string.Empty;
+            EmitDiagProbe(instruction); // TEMP DIAG
             // No shader trap handler is installed, so S_TRAP has no effect.
             if (instruction.Opcode == "STrap")
             {
@@ -2097,19 +2213,43 @@ public static partial class Gen5SpirvTranslator
             // dword count, so this is a no-op for in-range compute addresses but
             // prevents out-of-bounds access when a graphics-stage scratch write
             // uses an arbitrary computed byte address.
-            var index = BitwiseAnd(
-                ShiftRightLogical(addressWithOffset, UInt(2)),
-                UInt(_ldsDwordMask));
-            return _module.AddInstruction(
+            var dwordIndex = ShiftRightLogical(addressWithOffset, UInt(2));
+            if (!_ldsIsWorkgroup)
+            {
+                var index = BitwiseAnd(dwordIndex, UInt(_ldsDwordMask));
+                return _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _ldsElementPointer,
+                    _lds,
+                    index);
+            }
+
+            // Compute LDS follows the hardware: an address past the allocation reads 0 and
+            // drops writes. It must not wrap, since the top of the array holds the wave64
+            // scratch. Out-of-range accesses go to a dword that is always zero; StoreLds
+            // skips stores through them.
+            var inBounds = _module.AddInstruction(
+                SpirvOp.ULessThan,
+                _boolType,
+                dwordIndex,
+                UInt(LdsGuestDwordCount));
+            var pointer = _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _ldsElementPointer,
                 _lds,
-                index);
+                SelectU(inBounds, dwordIndex, UInt(LdsZeroDword)));
+            _ldsPointerInBounds[pointer] = inBounds;
+            return pointer;
         }
 
         private void StoreLds(uint pointer, uint value)
         {
             var active = Load(_boolType, _exec);
+            if (_ldsPointerInBounds.TryGetValue(pointer, out var inBounds))
+            {
+                active = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, active, inBounds);
+            }
+
             // Inactive lanes must not read and write back another lane's shared value.
             EmitConditional(active, () => Store(pointer, value));
         }
@@ -2485,6 +2625,7 @@ public static partial class Gen5SpirvTranslator
 
             if (_request.Memory.Find(instruction.Pc) is { DeviceDescriptor: true })
             {
+                _emitPath = "device-descriptor";
                 return TryEmitDeviceDescriptorBufferMemory(instruction, control, out error);
             }
 
@@ -2497,6 +2638,7 @@ public static partial class Gen5SpirvTranslator
                     // shader.  Its descriptor is supplied by the continuation
                     // object and is intentionally absent from this plan; keep
                     // the dead linear instruction side-effect free.
+                    _emitPath = "planning-only";
                     return true;
                 }
 
@@ -2507,11 +2649,15 @@ public static partial class Gen5SpirvTranslator
                     ?? BufferLoweringStrategy.NativeBinding;
                 if (strategy == BufferLoweringStrategy.PhysicalStorageBuffer)
                 {
+                    _emitPath = "physical";
                     return TryEmitPhysicalStorageBufferMemory(instruction, control, out error);
                 }
 
                 if (strategy == BufferLoweringStrategy.BoundedCandidateTable)
                 {
+                    _emitPath = _request.BufferCandidateTableByMemoryIndex.TryGetValue(accessMemoryIndex, out var traced)
+                        ? $"candidates:{traced.CandidateCount}"
+                        : "candidates:none";
                     return TryEmitBoundedCandidateTableMemory(instruction, control, accessMemoryIndex, out error);
                 }
             }
@@ -2522,6 +2668,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            _emitPath = "binding";
             return EmitResolvedBufferMemory(instruction, control, bindingIndex, out error);
         }
 
@@ -2797,6 +2944,18 @@ public static partial class Gen5SpirvTranslator
             {
                 if (!control.Typed)
                 {
+                    if (!_request.ForceGenericBufferFormats)
+                    {
+                        EmitStaticBufferFormatLoad(
+                            bindingIndex,
+                            byteAddress,
+                            descriptorFormat,
+                            specialized.DescriptorSwizzle & 0xFFF,
+                            control.VectorData,
+                            control.DwordCount);
+                        return true;
+                    }
+
                     EmitBufferFormatLoad(
                         bindingIndex,
                         byteAddress,
@@ -2959,6 +3118,13 @@ public static partial class Gen5SpirvTranslator
             var byteAddress = IAdd(UInt(unchecked((uint)control.OffsetBytes)), scalarOffset);
             byteAddress = IAdd(byteAddress, vectorOffset);
             byteAddress = IAdd(byteAddress, _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
+
+            // TEMP DIAG: measures the compile cost of these loads by leaving them out.
+            if (IsFormatBufferLoad(instruction.Opcode) && Environment.GetEnvironmentVariable("SHARPEMU_DIAG_SKIP_DEVICE_FORMAT_LOADS") == "1")
+            {
+                for (uint index = 0; index < control.DwordCount; index++) StoreV(control.VectorData + index, LoadDeviceBufferWord(baseAddress, size, byteAddress));
+                return true;
+            }
 
             if (IsFormatBufferLoad(instruction.Opcode))
             {
@@ -3255,6 +3421,8 @@ public static partial class Gen5SpirvTranslator
 
             // The element spans at most 16 bytes; read its aligned dwords once and take
             // every component from them instead of reading memory per component byte.
+            // The element spans at most 16 bytes; read its aligned dwords once and take
+            // every component from them instead of reading memory per component byte.
             var window = new uint[5];
             var alignedStart = BitwiseAnd(byteAddress, UInt(~3u));
             for (var index = 0; index < window.Length; index++)
@@ -3444,6 +3612,124 @@ public static partial class Gen5SpirvTranslator
             }
         }
 
+        // EmitBufferFormatLoad for a descriptor format and swizzle known when the shader is
+        // translated: only that format's layout and conversion are emitted, and only the
+        // memory components the swizzle selects are read. Same results, bit for bit.
+        private void EmitStaticBufferFormatLoad(
+            int bindingIndex,
+            uint byteAddress,
+            uint unifiedFormat,
+            uint swizzle,
+            uint vectorData,
+            uint componentCount)
+        {
+            Gfx10UnifiedFormat.TryDecode(unifiedFormat & 0x7F, out var dataFormat, out var numberFormat);
+            var one = UInt(numberFormat is 4 or 5 ? 1u : 0x3F800000u);
+            var canonical = new uint[4];
+            var componentBounds = new uint[4];
+            var inBounds = _module.ConstantBool(true);
+            for (uint destination = 0; destination < componentCount; destination++)
+            {
+                var selector = (swizzle >> (int)(destination * 3)) & 7;
+                if (selector < 4) continue;
+                var component = selector - 4;
+                if (canonical[component] == 0)
+                {
+                    canonical[component] = LoadStaticBufferFormatComponent(
+                        bindingIndex, byteAddress, dataFormat, numberFormat, component, out componentBounds[component]);
+                }
+
+                inBounds = LogicalAnd(inBounds, componentBounds[component]);
+            }
+
+            for (uint destination = 0; destination < componentCount; destination++)
+            {
+                var selector = (swizzle >> (int)(destination * 3)) & 7;
+                var constant = selector == 1 ? one : UInt(0);
+                var value = selector >= 4
+                    ? _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, canonical[selector - 4], constant)
+                    : constant;
+                StoreV(vectorData + destination, value);
+            }
+        }
+
+        // LoadGfx10BufferFormatComponent for a known data and number format.
+        private uint LoadStaticBufferFormatComponent(
+            int bindingIndex,
+            uint elementAddress,
+            uint dataFormat,
+            uint numberFormat,
+            uint component,
+            out uint componentInBounds)
+        {
+            if (!Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out var bitOffset, out var bitCount) ||
+                bitCount == 0)
+            {
+                // A component the format lacks: W reads as one, the others as zero.
+                componentInBounds = _module.ConstantBool(true);
+                return component == 3 ? UInt(numberFormat is 4 or 5 ? 1u : 0x3F800000u) : UInt(0);
+            }
+
+            var componentAddress = byteOffset == 0 ? elementAddress : IAdd(elementAddress, UInt(byteOffset));
+            var packed = LoadUnalignedBufferWord(bindingIndex, componentAddress);
+            componentInBounds = IsBufferElementInRange(bindingIndex, componentAddress, UInt(((bitOffset + bitCount + 7) >> 3) - 1));
+            var raw = bitCount == 32 && bitOffset == 0
+                ? packed
+                : _module.AddInstruction(SpirvOp.BitFieldUExtract, _uintType, packed, UInt(bitOffset), UInt(bitCount));
+            return ConvertStaticBufferComponent(raw, bitCount, numberFormat, dataFormat);
+        }
+
+        // ConvertGfx10BufferComponent for a known format: the same operations, only the one
+        // the number format selects.
+        private uint ConvertStaticBufferComponent(uint raw, uint bitCount, uint numberFormat, uint dataFormat)
+        {
+            var lowMask = bitCount == 32 ? uint.MaxValue : (1u << (int)bitCount) - 1;
+            uint SignedRaw() => _module.AddInstruction(
+                SpirvOp.BitFieldSExtract, _intType, Bitcast(_intType, raw), UInt(0), UInt(bitCount));
+            switch (numberFormat)
+            {
+                case 0:
+                    return Bitcast(_uintType, _module.AddInstruction(
+                        SpirvOp.FDiv, _floatType,
+                        _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, raw),
+                        _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, UInt(lowMask))));
+                case 1:
+                {
+                    var snorm = _module.AddInstruction(
+                        SpirvOp.FDiv, _floatType,
+                        _module.AddInstruction(SpirvOp.ConvertSToF, _floatType, SignedRaw()),
+                        _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, UInt(lowMask >> 1)));
+                    snorm = _module.AddInstruction(
+                        SpirvOp.Select, _floatType,
+                        _module.AddInstruction(SpirvOp.FOrdLessThan, _boolType, snorm, Float(-1f)),
+                        Float(-1f),
+                        snorm);
+                    return Bitcast(_uintType, snorm);
+                }
+                case 2:
+                    return Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, raw));
+                case 3:
+                    return Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertSToF, _floatType, SignedRaw()));
+                case 5:
+                    return Bitcast(_uintType, SignedRaw());
+                case 7:
+                    if (dataFormat is 6 or 7)
+                    {
+                        return DecodeUnsignedMiniFloat(raw, UInt(bitCount));
+                    }
+
+                    if (bitCount == 16)
+                    {
+                        var unpacked = Ext(62, _vec2Type, BitwiseAnd(raw, UInt(0xFFFF)));
+                        return Bitcast(_uintType, _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, unpacked, 0));
+                    }
+
+                    return raw;
+                default:
+                    return raw;
+            }
+        }
+
         // Check the first and last dwords of the required range together.
         private uint IsBufferElementInRange(int bindingIndex, uint byteAddress, uint lastByteOffset)
         {
@@ -3486,15 +3772,16 @@ public static partial class Gen5SpirvTranslator
             var numberFormatId = UInt(numberFormat);
             for (uint destination = 0; destination < control.DwordCount; destination++)
             {
-                var value = destination < componentCount
-                    ? LoadGfx10BufferFormatComponent(
-                        bindingIndex,
-                        byteAddress,
-                        dataFormatId,
-                        numberFormatId,
-                        (int)destination,
-                        out _)
-                    : UInt(0);
+                var value = destination >= componentCount ? UInt(0)
+                    : _request.ForceGenericBufferFormats
+                        ? LoadGfx10BufferFormatComponent(
+                            bindingIndex,
+                            byteAddress,
+                            dataFormatId,
+                            numberFormatId,
+                            (int)destination,
+                            out _)
+                        : LoadStaticBufferFormatComponent(bindingIndex, byteAddress, dataFormat, numberFormat, destination, out _);
                 StoreV(
                     control.VectorData + destination,
                     _module.AddInstruction(SpirvOp.Select, _uintType, valid, value, UInt(0)));

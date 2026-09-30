@@ -381,6 +381,19 @@ public sealed partial class ResourceTracker
         handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword) &&
             !DependsOnLoopCarriedRead(dword));
 
+    // TEMP DIAG: the previous rule, which kept every scalar-buffer-loaded V# on the device path.
+    private static readonly bool KeepShaderLoadedBuffersOnDevice =
+        Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DEVICE_LOADED_BUFFERS") == "1";
+
+    // TEMP DIAG (SHARPEMU_TRACE_DEVICE_REASON=1): which rule sent an access to the device path.
+    private static readonly bool TraceDeviceReasons = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DEVICE_REASON") == "1";
+
+    private void TraceDeviceReason(MemoryAccessInfo memory, string reason)
+    {
+        if (TraceDeviceReasons)
+            Console.Error.WriteLine($"[DIAG][DEVICE_REASON] hash=0x{_plan.Hash:X16} pc=0x{memory.Pc:X} opcode={memory.Opcode} kind={memory.Kind} reason={reason}");
+    }
+
     private bool IsDeviceLoadedBufferHandle(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
         handle.Operands.All(dword =>
@@ -973,6 +986,7 @@ public sealed partial class ResourceTracker
                 if (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle))
                 {
                     memory.DeviceDescriptor = true;
+                    TraceDeviceReason(memory, "unvalidated-shader-loaded"); // TEMP DIAG
                     _info.UsesDeviceAddresses = true;
                     return;
                 }
@@ -985,12 +999,16 @@ public sealed partial class ResourceTracker
                 return;
             }
 
-            // Scalar loads can address buffers that have no host descriptor binding, while
-            // vector buffer descriptors loaded from scalar-buffer data must stay device-side.
+            // Scalar loads can address buffers that have no host descriptor binding. A vector
+            // buffer descriptor loaded from scalar-buffer data is bound like any other when
+            // the draw can evaluate it (the V# is read from guest memory at dispatch); only one
+            // that stays unknown at dispatch reads through its registers on the device.
             if ((memory.Kind == MemoryResourceKind.ScalarBuffer && !IsHostBufferHandle(access.Handle)) ||
-                (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle)))
+                (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle) &&
+                 (KeepShaderLoadedBuffersOnDevice || !IsHostBufferHandle(access.Handle))))
             {
                 memory.DeviceDescriptor = true;
+                TraceDeviceReason(memory, "scalar-buffer-or-shader-loaded"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }
@@ -1004,6 +1022,7 @@ public sealed partial class ResourceTracker
                  access.Handle.Operands.Any(DependsOnLoopCarriedRead)))
             {
                 memory.DeviceDescriptor = true;
+                TraceDeviceReason(memory, "control-dependent-or-loop-carried"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }
@@ -1028,6 +1047,7 @@ public sealed partial class ResourceTracker
                 }
 
                 memory.DeviceDescriptor = true;
+                TraceDeviceReason(memory, "binding-budget"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }

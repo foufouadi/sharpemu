@@ -739,6 +739,15 @@ public sealed unsafe partial class GuestImageCache
         }
 
         download.Commit();
+        if (offset + range.Size + 0x10000 > download.Size) // TEMP DIAG: writes that end near the ring end
+        {
+            var path = plan.Depth ? "depth" : plan.Color.Tiled ? "tiled" : plan.Color.SwapBgra16 ? "swap" : "linear";
+            Console.Error.WriteLine(
+                $"[DIAG][RING_END] image-readback path={path} offset=0x{offset:X} size=0x{range.Size:X} end=0x{offset + range.Size:X} ring=0x{download.Size:X} " +
+                $"image=0x{range.Address:X} format={image.Backing.Format} extent={image.Description.Extent.Width}x{image.Description.Extent.Height} " +
+                $"layers={image.Description.Resources.Layers} mips={image.Description.Resources.Levels} tile={image.Description.TileMode}");
+        }
+
         if (!_backing.TryReadBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
         {
             return false;

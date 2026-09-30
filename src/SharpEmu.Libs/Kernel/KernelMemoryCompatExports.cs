@@ -106,6 +106,9 @@ public static partial class KernelMemoryCompatExports
     private static readonly object _statCacheGate = new();
     private static readonly object _guestMountGate = new();
     private static readonly DirectMemoryAllocationMap _directAllocations = new(GuestMemoryLayout.DirectBytes);
+
+    // TEMP DIAG: direct memory the game holds, for the periodic memory report.
+    internal static ulong DiagDirectAllocatedBytes => GuestMemoryLayout.DirectBytes - _directAllocations.AvailableBytes;
     private static readonly Dictionary<ulong, LibcHeapAllocation> _libcAllocations = new();
     // Keyed by (and kept sorted on) region base address so VirtualQuery can find a
     // containing/next region with a binary search instead of an O(n) scan. Every
@@ -3151,7 +3154,8 @@ public static partial class KernelMemoryCompatExports
     private static int MapDirectMemoryCore(CpuContext ctx, ulong inOutAddressPointer, ulong length,
         int protection, ulong flags, ulong directMemoryStart, ulong alignment)
         => RunMappingTransaction(() => MapDirectMemoryTransaction(ctx, inOutAddressPointer, length,
-            protection, flags, directMemoryStart, alignment));
+            protection, flags, directMemoryStart, alignment),
+            MapNeedsGpuDrain(ctx, inOutAddressPointer, length, flags));
 
     private static int MapDirectMemoryTransaction(CpuContext ctx, ulong inOutAddressPointer, ulong length,
         int protection, ulong flags, ulong directMemoryStart, ulong alignment)
@@ -3222,7 +3226,8 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelMapNamedFlexibleMemory(CpuContext ctx)
-        => RunMappingTransaction(() => MapFlexibleMemoryCore(ctx));
+        => RunMappingTransaction(() => MapFlexibleMemoryCore(ctx),
+            MapNeedsGpuDrain(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], ctx[CpuRegister.Rcx]));
 
     private static int MapFlexibleMemoryCore(CpuContext ctx)
     {

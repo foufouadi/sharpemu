@@ -1079,7 +1079,53 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // Retired flip snapshots kept for the next flips. Every flip copies the display surface
+        // into a snapshot of the same size and format; creating and freeing a 4K image per flip
+        // was hundreds of megabytes of driver allocations a second.
+        private const int MaxRecycledFlipSnapshots = 4;
+        private readonly List<GuestImageResource> _recycledFlipSnapshots = [];
+
         private void DestroyGuestImage(GuestImageResource resource)
+        {
+            lock (_recycledFlipSnapshots)
+            {
+                if (resource.Image.Handle != 0 && _recycledFlipSnapshots.Count < MaxRecycledFlipSnapshots && !_disposingFlipSnapshots)
+                {
+                    _recycledFlipSnapshots.Add(new GuestImageResource
+                    {
+                        Width = resource.Width,
+                        Height = resource.Height,
+                        Format = resource.Format,
+                        Image = resource.Image,
+                        Memory = resource.Memory,
+                    });
+                    resource.Image = default;
+                    resource.Memory = default;
+                    return;
+                }
+            }
+
+            ReleaseGuestImage(resource);
+        }
+
+        private bool _disposingFlipSnapshots;
+
+        // Teardown: every recycled snapshot goes back to the driver.
+        private void ReleaseRecycledFlipSnapshots()
+        {
+            lock (_recycledFlipSnapshots)
+            {
+                _disposingFlipSnapshots = true;
+                foreach (var snapshot in _recycledFlipSnapshots)
+                {
+                    ReleaseGuestImage(snapshot);
+                }
+
+                _recycledFlipSnapshots.Clear();
+            }
+        }
+
+        private void ReleaseGuestImage(GuestImageResource resource)
         {
             if (resource.Image.Handle != 0)
             {

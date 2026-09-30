@@ -272,15 +272,15 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
         using var harness = new ImageTestHarness(_vulkan);
         var tilerCase = TilerCases.Create(TileBlockKind.Standard4KB, 4, TilerCases.Shape.Blocks, 77)!;
         var tiled = harness.Upload(tilerCase.Tiled);
-        var baseline = harness.Device.LiveAllocations;
+        var baseline = LiveBuffers(harness);
         harness.Run(() =>
         {
             harness.Tiler.Detile(tiled.Handle, 0, tilerCase.Transfer.TiledSize, tilerCase.Transfer.LinearSize, new[] { tilerCase.Transfer });
             harness.Tiler.GetScratchBuffer(64);
-            Assert.Equal(baseline + 2, harness.Device.LiveAllocations);
+            Assert.Equal(baseline + 2, LiveBuffers(harness));
             harness.Scheduler.Finish();
         });
-        Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
+        Assert.Equal(baseline + 1, LiveBuffers(harness));
         harness.AssertNoValidationMessages();
     }
 
@@ -300,13 +300,13 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
             harness.Stream.Commit();
         });
         using var retention = harness.Stream.RetainContents();
-        var baseline = harness.Device.LiveAllocations;
+        var baseline = LiveBuffers(harness);
         harness.Run(() =>
         {
             harness.Tiler.Tile(linear.Handle, 0, linear.Size, tiled.Handle, 0, tiled.Size, [tilerCase.Transfer]);
-            Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
+            Assert.Equal(baseline + 1, LiveBuffers(harness));
             harness.Scheduler.Finish();
-            Assert.Equal(baseline, harness.Device.LiveAllocations);
+            Assert.Equal(baseline, LiveBuffers(harness));
             Assert.False(harness.Stream.Mapped.ContainsAnyExcept((byte)0xA5));
         });
         Assert.Equal(tilerCase.Tiled, harness.ReadBack(tiled.Handle, 0, tiled.Size));
@@ -445,4 +445,9 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
         Assert.Contains(fatal.Messages, message => message.Contains("swap input size is invalid"));
         harness.AssertNoValidationMessages();
     }
+
+    // Driver allocations plus buffers placed in the device's buffer pool, less the pool's
+    // blocks: one per live buffer, however it is backed.
+    private static int LiveBuffers(ImageTestHarness harness) =>
+        (int)harness.Device.LiveAllocations - harness.Device.BufferMemory.Blocks + harness.Device.BufferMemory.Placements;
 }

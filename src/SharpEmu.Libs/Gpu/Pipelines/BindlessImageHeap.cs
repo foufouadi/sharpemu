@@ -191,6 +191,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
                 PPoolSizes = poolPointer,
             };
             Check(device.Vk.CreateDescriptorPool(device.Device, &poolInfo, null, out var pool), "vkCreateDescriptorPool(bindless)");
+            System.Threading.Interlocked.Increment(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
             var setLayout = _layout;
             var allocate = new DescriptorSetAllocateInfo
             {
@@ -328,6 +329,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     public void Dispose()
     {
         if (_pool.Handle != 0) _device.Vk.DestroyDescriptorPool(_device.Device, _pool, null);
+        System.Threading.Interlocked.Decrement(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
         if (_layout.Handle != 0) _device.Vk.DestroyDescriptorSetLayout(_device.Device, _layout, null);
         _slots.Clear();
         _slotsByView.Clear();

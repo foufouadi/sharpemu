@@ -313,6 +313,10 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Null(ImageRequestBuilders.DepthTarget(RegisterWords.Depth(Base, 64, 64, depthTest: false, depthWrite: false), _vulkan.DeviceInfo));
         var unbound = new DepthTargetWords(0, 0, 0, 0, false, 0, 0, 2, 0, 0, 0, 0, 0);
         Assert.Null(ImageRequestBuilders.DepthTarget(unbound, _vulkan.DeviceInfo));
+        // Ghost of Yotei: Z and stencil formats INVALID with a swizzle mode, ZRANGE_PRECISION and
+        // TILE_STENCIL_DISABLE set, depth test and write enabled, no base. There is no depth surface.
+        var invalidFormats = new DepthTargetWords(0x8000_0180, 0x2000_0180, 0, 63 | (63 << 16), true, 0, 0, 2 | 4 | (7 << 4), 0, 0, 0, 0, 0);
+        Assert.Null(ImageRequestBuilders.DepthTarget(invalidFormats, _vulkan.DeviceInfo));
     }
 
     [Fact]

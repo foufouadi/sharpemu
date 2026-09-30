@@ -75,6 +75,12 @@ public sealed partial class GuestImageCache
 
     private void Collect(ulong tick, bool allowAggressive)
     {
+        // Under pressure the pool's retained free memory goes back before any image is evicted.
+        if (CollectionMemoryBytes >= _memoryPressureBytes)
+        {
+            _device.ImageMemory.ReleaseRetained();
+        }
+
         var pressured = CollectionMemoryBytes >= _memoryPressureBytes;
         var aggressive = allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes;
         var age = Math.Min(aggressive ? 160UL : pressured ? 80UL : 16UL, tick);

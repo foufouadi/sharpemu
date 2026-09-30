@@ -70,12 +70,38 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             PValues = &tick,
         };
         Result result;
+        var diagStart = DiagWaitCallers ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // TEMP DIAG
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
         }
+        if (DiagWaitCallers) DiagRecordWait(System.Diagnostics.Stopwatch.GetTimestamp() - diagStart); // TEMP DIAG
         failure = result.ToString();
         return result == Result.Success;
+    }
+
+    // TEMP DIAG (SHARPEMU_DIAG_WAIT_CALLERS=1): wait time per caller chain, printed every 10 s.
+    private static readonly bool DiagWaitCallers = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_WAIT_CALLERS") == "1";
+    private static readonly Dictionary<string, (long Ticks, long Count)> DiagWaits = new();
+    private static long _diagWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private static void DiagRecordWait(long ticks)
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var key = string.Join(" < ", frames.Take(6).Select(frame => frame.GetMethod() is { } method ? $"{method.DeclaringType?.Name}.{method.Name}" : "?"));
+        lock (DiagWaits)
+        {
+            DiagWaits[key] = DiagWaits.TryGetValue(key, out var old) ? (old.Ticks + ticks, old.Count + 1) : (ticks, 1);
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - _diagWaitReport < 10 * System.Diagnostics.Stopwatch.Frequency) return;
+            _diagWaitReport = now;
+            foreach (var (caller, value) in DiagWaits.OrderByDescending(pair => pair.Value.Ticks).Take(8))
+            {
+                Console.Error.WriteLine($"[DIAG][WAIT] ms={value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} n={value.Count} {caller}");
+            }
+
+            DiagWaits.Clear();
+        }
     }
 
     public nint[] AllocateBuffers(int count)
@@ -215,6 +241,8 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             for (var index = 0; index < counts.AddressInfoCount; index++)
             {
                 text.Append($" address[{index}]={addresses[index].AddressType}:0x{addresses[index].ReportedAddress:X}/0x{addresses[index].AddressPrecision:X}");
+                text.Append(SharpEmu.Libs.Gpu.Buffers.GpuBuffer.DiagDescribeAddress(addresses[index].ReportedAddress)); // TEMP DIAG
+                text.Append(SharpEmu.Libs.VideoOut.AddressBindingDiag.Describe(addresses[index].ReportedAddress & ~(addresses[index].AddressPrecision - 1))); // TEMP DIAG
             }
 
             for (var index = 0; index < counts.VendorInfoCount; index++)

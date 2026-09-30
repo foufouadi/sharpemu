@@ -161,7 +161,12 @@ public sealed class BufferCandidateTableInfo
 // The dense resource tables of a program plus the facts the pipeline layout needs.
 public sealed class ShaderResourceInfo
 {
-    public const int MaxBuffers = 32;
+    // Buffers past this read their V# from registers through the device-address table,
+    // which costs far more shader code than a binding. Stages past 32 descriptors bind
+    // from a descriptor-heap set instead of push descriptors; the device's per-stage limit
+    // is checked when the layout is made.
+    public static readonly int MaxBuffers =
+        Environment.GetEnvironmentVariable("SHARPEMU_DIAG_MAX_BUFFERS") is { } limit ? int.Parse(limit) : 256; // TEMP DIAG override
     // Bindless material tables select among many descriptors; the host binds each
     // candidate, and the device's per-stage limits are checked when the layout is made.
     public const int MaxImages = 65536;

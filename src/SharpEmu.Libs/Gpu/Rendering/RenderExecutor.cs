@@ -124,8 +124,11 @@ public sealed partial class RenderExecutor
 
         if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
         {
+            DiagCountDraw(skipped: true); // TEMP DIAG
             return;
         }
+
+        DiagCountDraw(skipped: false); // TEMP DIAG
 
         if (RenderTrace.Enabled)
         {
@@ -244,8 +247,11 @@ public sealed partial class RenderExecutor
 
         if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
         {
+            DiagCountDraw(skipped: true); // TEMP DIAG
             return;
         }
+
+        DiagCountDraw(skipped: false); // TEMP DIAG
 
         if (RenderTrace.Enabled)
         {
@@ -395,6 +401,20 @@ public sealed partial class RenderExecutor
         }
 
         return 0;
+    }
+
+    // TEMP DIAG: draws run and skipped (no vertex shader or an unsupported geometry stage).
+    private static long _diagDrawsRun;
+    private static long _diagDrawsSkipped;
+
+    private static void DiagCountDraw(bool skipped)
+    {
+        var total = Interlocked.Increment(ref skipped ? ref _diagDrawsSkipped : ref _diagDrawsRun) +
+            Interlocked.Read(ref skipped ? ref _diagDrawsRun : ref _diagDrawsSkipped);
+        if (total % 20000 == 0)
+        {
+            Console.Error.WriteLine($"[DIAG][DRAWS] run={Interlocked.Read(ref _diagDrawsRun)} skipped={Interlocked.Read(ref _diagDrawsSkipped)}");
+        }
     }
 
     private static bool HasValidVertexShader(ShaderProgramRegisters shader) => shader.Vertex.ExportAddress != 0;

@@ -371,14 +371,19 @@ public sealed unsafe class CachedImageTests : IClassFixture<HeadlessVulkanFixtur
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new ImageTestHarness(_vulkan);
+        // Earlier tests on this device may have left free memory in the pool.
+        harness.Device.ImageMemory.ReleaseRetained();
         var baseline = harness.Device.LiveAllocations;
         var image = harness.CreateImage(Color2D(64, 64, levels: 2, layers: 2));
         Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
         Assert.True(harness.Device.PeakAllocations >= baseline + 1);
         Assert.True(image.Backing.AllocationSize >= 64 * 64 * 4 * 2);
         image.Dispose();
-        Assert.Equal(baseline, harness.Device.LiveAllocations);
         Assert.False(image.Backing.Exists);
+        // The emptied block stays in the pool for the next image until memory is reclaimed.
+        Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
+        harness.Device.ImageMemory.ReleaseRetained();
+        Assert.Equal(baseline, harness.Device.LiveAllocations);
         harness.AssertNoValidationMessages();
     }
 }

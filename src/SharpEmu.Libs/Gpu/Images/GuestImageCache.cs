@@ -76,6 +76,10 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         var available = Math.Max(_device.DeviceLocalAvailableBytes, 1UL);
         var imageBudget = ComputeImageCacheBudget(available, _device.HasMemoryBudget);
+        if (ImageCacheBudgetCap is { } cap)
+        {
+            imageBudget = Math.Min(imageBudget, cap);
+        }
 
         _collectionStartBytes = Math.Max(imageBudget / 2, MiB);
         _memoryPressureBytes = Math.Max(imageBudget * 3 / 5, MiB);
@@ -90,6 +94,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             _collectionBudgetLogged = true;
         }
     }
+
+    // SHARPEMU_IMAGE_CACHE_BUDGET_MB caps the image cache below its VRAM-derived budget, which
+    // otherwise keeps most free VRAM for cached images. A lower cap leaves room for other
+    // VRAM users, such as a frame-capture tool's copies of every resource.
+    private static readonly ulong? ImageCacheBudgetCap =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_CACHE_BUDGET_MB"), out var megabytes) && megabytes > 0
+            ? megabytes * MiB
+            : null;
 
     internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget)
     {

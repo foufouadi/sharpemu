@@ -60,6 +60,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _maxPushDescriptors;
         private uint _maxPerStageSampledImages = uint.MaxValue;
         private uint _maxPerStageStorageImages = uint.MaxValue;
+        private uint _maxPerStageStorageBuffers = uint.MaxValue;
         private uint _maxPerStageUpdateAfterBindSampledImages = uint.MaxValue;
         private uint _maxPerStageUpdateAfterBindStorageImages = uint.MaxValue;
         private uint _maxUpdateAfterBindSampledImages = uint.MaxValue;
@@ -77,6 +78,10 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+        bool IShaderPipelineHost.ExactFloat16ConversionsEnabled => ExactFloat16ConversionsEnabled &&
+            Environment.GetEnvironmentVariable("SHARPEMU_DIAG_NO_NATIVE_F16") != "1"; // TEMP DIAG
+        bool IShaderPipelineHost.DiagGpuWroteBytes(ulong address, ulong size) => // TEMP DIAG
+            _bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size);
 
         bool IShaderPipelineHost.NonUniformImageIndexingEnabled => NonUniformImageIndexingEnabled;
         bool IShaderPipelineHost.UsesBindlessImages => BindlessImageHeapEnabled;
@@ -415,6 +420,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             // A zero limit is an unreported one.
+            if (_maxPerStageStorageBuffers != 0 && demand.StorageBuffers > _maxPerStageStorageBuffers)
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"The shader stage binds more buffers than the device allows: storage={demand.StorageBuffers}/{_maxPerStageStorageBuffers}.");
+            }
+
             if ((_maxPerStageSampledImages != 0 && demand.SampledImages > _maxPerStageSampledImages) ||
                 (_maxPerStageStorageImages != 0 && demand.StorageImages > _maxPerStageStorageImages))
             {
@@ -877,6 +888,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     Layout = layout,
                 };
                   var createStart = Stopwatch.GetTimestamp();
+                  // TEMP DIAG: names the pipeline being compiled if the driver dies in it.
+                  Console.Error.WriteLine($"[PERF] vkCreateComputePipelines begin cs=0x{description.Stage.Hash:X16} working_set_mb={Environment.WorkingSet >> 20}");
                   Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), "vkCreateComputePipelines(rendering)");
                   Console.Error.WriteLine(
                       $"[PERF] vkCreateComputePipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
