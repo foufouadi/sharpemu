@@ -386,8 +386,38 @@ public sealed partial class GuestImageCache
             return false;
         }
 
+        // Most CPU writes (AGC command building, labels) touch no image page. Checking
+        // the page owners without the lock keeps those writes from spinning behind the
+        // render thread, which holds the lock for most of a frame. The check sees the
+        // same state a locked call made before the write would.
+        if (!MayOwnPages(address, size))
+        {
+            return false;
+        }
+
         using var held = _lock.Hold();
         return InvalidateAliases(address, size);
+    }
+
+    private const ulong MaxLockFreeOwnerPages = 64;
+
+    private bool MayOwnPages(ulong address, ulong size)
+    {
+        if (!ImagePageOwnerTable.TryGetPageRange(address, size, out var first, out var lastExclusive) ||
+            lastExclusive - first > MaxLockFreeOwnerPages)
+        {
+            return true;
+        }
+
+        for (var page = first; page < lastExclusive; page++)
+        {
+            if (_pageOwners.Find(page) is { IsEmpty: false })
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public void InvalidateMemory(ulong address, ulong size)
@@ -412,7 +442,7 @@ public sealed partial class GuestImageCache
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
         {
             var owner = _slots.TryGet(imageIdentifier);
-            if (owner == null || owner.DepthOwner.IsValid)
+            if (owner == null)
             {
                 continue;
             }
@@ -455,7 +485,7 @@ public sealed partial class GuestImageCache
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
         {
             var image = _slots[imageIdentifier];
-            if (image.DepthOwner.IsValid || !image.Overlaps(address, size))
+            if (!image.Overlaps(address, size))
             {
                 continue;
             }
@@ -484,14 +514,9 @@ public sealed partial class GuestImageCache
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
         {
             var image = _slots[imageIdentifier];
-            if (image.DepthOwner.IsValid)
-            {
-                continue;
-            }
-
             imagePages = true;
             imageBytes |= image.Overlaps(address, size);
-            gpuImageBytes |= image.GpuOverlaps(address, size);
+            gpuImageBytes |= !image.DepthOwner.IsValid && image.GpuOverlaps(address, size);
         }
 
         return new ImageRegionInfo(imagePages, imageBytes, gpuImageBytes);

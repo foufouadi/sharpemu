@@ -306,6 +306,7 @@ public static class GuestPixelFormats
     private static readonly FormatFacts[] Facts =
     [
         new(GuestPixelFormat.Bits8UNorm, 1, 0, 1, true, false),
+        new(GuestPixelFormat.Bits8UScaled, 1, 0, 1, true, false),
         new(GuestPixelFormat.Bits8SNorm, 1, 0, 1, true, false),
         new(GuestPixelFormat.Bits8UInt, 1, 0, 1, true, true),
         new(GuestPixelFormat.Bits8SInt, 1, 0, 1, true, false, true),
@@ -552,7 +553,13 @@ public static class GuestPixelFormats
     }
 
     public static GuestPixelFormat RemapTextureFormat(GuestPixelFormat format) =>
-        format == GuestPixelFormat.Bits11_11_10UInt ? GuestPixelFormat.Bits32UInt : format;
+        format switch
+        {
+            GuestPixelFormat.Bits8UScaled => GuestPixelFormat.Bits8UNorm,
+            GuestPixelFormat.Bits8_8UScaled => GuestPixelFormat.Bits8_8UNorm,
+            GuestPixelFormat.Bits11_11_10UInt => GuestPixelFormat.Bits32UInt,
+            _ => format,
+        };
 
     public static Format HostFormat(GuestPixelFormat format) =>
         (uint)format < LookupSize ? HostLookup[(int)format] : Format.Undefined;

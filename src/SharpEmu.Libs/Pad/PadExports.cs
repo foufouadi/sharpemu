@@ -23,6 +23,7 @@ public static class PadExports
     private const int PrimaryPadHandle = 1;
     private const int ControllerInformationSize = 0x1C;
     private const int PadDataSize = 0x78;
+    private const float StandardGravity = 9.80665f;
 
     // Monster Truck Championship reads pad state with handle 0 before it opens a pad,
     // and rejecting that leaves its controller/FFB init path polling forever. After a
@@ -44,7 +45,9 @@ public static class PadExports
     private static PadState _cachedInputState;
 
     private static bool _initialized;
-    private static int _motionSensorEnabled;
+    // Motion data is reported until a title turns it off: Astro Bot reads it for
+    // shake/tilt without ever importing scePadSetMotionSensorState.
+    private static int _motionSensorEnabled = 1;
     private static int _controlsAnnouncementLogged;
 
     [SysAbiExport(
@@ -183,6 +186,19 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "r44mAxdSG+U",
+        ExportName = "scePadSetAngularVelocityDeadbandState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadSetAngularVelocityDeadbandState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
+    [SysAbiExport(
         Nid = "gjP9-KQzoUk",
         ExportName = "scePadGetControllerInformation",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -218,45 +234,20 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "PZSoY8j0Pko",
+        ExportName = "scePadGetFeatureReport",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetFeatureReport(CpuContext ctx) =>
+        ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(
         Nid = "hGbf2QTBmqc",
         ExportName = "scePadGetExtControllerInformation",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libScePad")]
-    public static int PadGetExtControllerInformation(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var informationAddress = ctx[CpuRegister.Rsi];
-        if (!IsPrimaryPadHandle(handle))
-        {
-            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
-        }
-
-        if (informationAddress == 0)
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        // Base ScePadControllerInformation + device-class/connection fields: report a connected
-        // DualSense so the guest's open -> get-ext-info -> close probe loop resolves.
-        Span<byte> information = stackalloc byte[0x40];
-        information.Clear();
-        BinaryPrimitives.WriteSingleLittleEndian(information[0x00..], 44.86f);
-        BinaryPrimitives.WriteUInt16LittleEndian(information[0x04..], 1920);
-        BinaryPrimitives.WriteUInt16LittleEndian(information[0x06..], 943);
-        information[0x08] = 30;
-        information[0x09] = 30;
-        information[0x0A] = StandardPortType;
-        information[0x0B] = 1;   // connected count
-        information[0x0C] = 1;   // connected
-        BinaryPrimitives.WriteInt32LittleEndian(information[0x10..], 0);
-        information[0x1C] = 0;   // deviceClass: 0 = standard controller / DualSense
-        information[0x1D] = 1;   // connected (ext)
-        information[0x1E] = 0;   // connectionType: local
-
-        return ctx.Memory.TryWrite(informationAddress, information)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
+    public static int PadGetExtControllerInformation(CpuContext ctx) =>
+        ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
 
     [SysAbiExport(
         Nid = "AcslpN1jHR8",
@@ -701,9 +692,10 @@ public static class PadExports
         BinaryPrimitives.WriteSingleLittleEndian(data[0x18..], 1.0f);
         if (Volatile.Read(ref _motionSensorEnabled) != 0 && input.Motion.Available)
         {
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x1C..], input.Motion.AccelerationX);
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x20..], input.Motion.AccelerationY);
-            BinaryPrimitives.WriteSingleLittleEndian(data[0x24..], input.Motion.AccelerationZ);
+            // Host acceleration is m/s^2 (SDL); ScePadData.acceleration is in G.
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x1C..], input.Motion.AccelerationX / StandardGravity);
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x20..], input.Motion.AccelerationY / StandardGravity);
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x24..], input.Motion.AccelerationZ / StandardGravity);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x28..], input.Motion.AngularVelocityX);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x2C..], input.Motion.AngularVelocityY);
             BinaryPrimitives.WriteSingleLittleEndian(data[0x30..], input.Motion.AngularVelocityZ);

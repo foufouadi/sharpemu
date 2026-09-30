@@ -10,11 +10,15 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
 {
     private PhysicalDeviceMemoryProperties _memoryProperties;
-    private readonly Dictionary<Format, FormatProperties> _formatProperties = new();
-    private readonly Dictionary<(Format, ImageType, ImageTiling, ImageUsageFlags, ImageCreateFlags), (Result Result, ImageFormatProperties Properties)> _imageFormatProperties = new();
-    private readonly object _gate = new();
+    // Queried for every draw target from the render thread and from other threads; a hit takes no lock.
+    // Two threads may query the same missing key once each; the driver answers identically.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Format, FormatProperties> _formatProperties = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(Format, ImageType, ImageTiling, ImageUsageFlags, ImageCreateFlags), (Result Result, ImageFormatProperties Properties)> _imageFormatProperties = new();
     private int _liveAllocations;
     private int _peakAllocations;
+
+    // VK_EXT_image_view_min_lod is enabled, so a view can clamp to a texture descriptor's MIN_LOD.
+    public bool ImageViewMinLodSupported { get; init; }
 
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device, bool memoryBudgetEnabled = false)
     {
@@ -47,9 +51,17 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         MaxStorageBufferRange = properties.Limits.MaxStorageBufferRange;
         MaxMemoryAllocationCount = properties.Limits.MaxMemoryAllocationCount;
         MaxComputeWorkGroupCount = (properties.Limits.MaxComputeWorkGroupCount[0], properties.Limits.MaxComputeWorkGroupCount[1], properties.Limits.MaxComputeWorkGroupCount[2]);
+        Slabs = new GpuMemorySlabs(this);
     }
 
+    // Shared chunks the small buffers are carved from; freed at device teardown.
+    internal GpuMemorySlabs Slabs { get; }
+
     public Vk Vk { get; }
+
+    // Queue families that may access every buffer; set before the first buffer is
+    // created when a second queue family (the async readback queue) reads them.
+    public uint[]? SharedQueueFamilies { get; set; }
 
     public PhysicalDevice PhysicalDevice { get; }
 
@@ -204,33 +216,27 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
 
     public FormatProperties GetFormatProperties(Format format)
     {
-        lock (_gate)
+        if (!_formatProperties.TryGetValue(format, out var properties))
         {
-            if (!_formatProperties.TryGetValue(format, out var properties))
-            {
-                Vk.GetPhysicalDeviceFormatProperties(PhysicalDevice, format, out properties);
-                _formatProperties[format] = properties;
-            }
-
-            return properties;
+            Vk.GetPhysicalDeviceFormatProperties(PhysicalDevice, format, out properties);
+            _formatProperties[format] = properties;
         }
+
+        return properties;
     }
 
     public bool TryGetImageFormatProperties(Format format, ImageType type, ImageTiling tiling, ImageUsageFlags usage, ImageCreateFlags flags, out ImageFormatProperties properties)
     {
-        lock (_gate)
+        var key = (format, type, tiling, usage, flags);
+        if (!_imageFormatProperties.TryGetValue(key, out var entry))
         {
-            var key = (format, type, tiling, usage, flags);
-            if (!_imageFormatProperties.TryGetValue(key, out var entry))
-            {
-                var result = Vk.GetPhysicalDeviceImageFormatProperties(PhysicalDevice, format, type, tiling, usage, flags, out var found);
-                entry = (result, found);
-                _imageFormatProperties[key] = entry;
-            }
-
-            properties = entry.Properties;
-            return entry.Result == Result.Success;
+            var result = Vk.GetPhysicalDeviceImageFormatProperties(PhysicalDevice, format, type, tiling, usage, flags, out var found);
+            entry = (result, found);
+            _imageFormatProperties[key] = entry;
         }
+
+        properties = entry.Properties;
+        return entry.Result == Result.Success;
     }
 
     // TEMP DIAG: live device memory by memory type index.

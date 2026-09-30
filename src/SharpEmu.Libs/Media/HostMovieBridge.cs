@@ -12,8 +12,9 @@ namespace SharpEmu.Libs.Media;
 ///
 /// Such a game never imports libSceVideodec or sceAvPlayer, so no HLE export
 /// can see its movie frames. Kernel file opens identify the active movie and
-/// the presenter requests BGRA frames from <see cref="FfmpegVideoDecoder"/> —
-/// the same decoder sceAvPlayer uses, so every format is handled in one place.
+/// the presenter requests frames from <see cref="FfmpegVideoDecoder"/> — the
+/// same decoder sceAvPlayer uses, so every format is handled in one place.
+/// Frames reach the presenter as <see cref="HostMovieYuv420"/> planes.
 /// </summary>
 internal static class HostMovieBridge
 {
@@ -46,6 +47,9 @@ internal static class HostMovieBridge
     private static long _frameSerial;
     private static uint _presentationWidth = MaxHostVideoWidth;
     private static uint _presentationHeight = MaxHostVideoHeight;
+    // TimedOutMoviePaths.Count, readable without Gate: every guest file read asks
+    // whether its file timed out, and almost none ever does.
+    private static int _timedOutMovieCount;
 
     internal static bool IsHostPlaybackActive
     {
@@ -132,6 +136,20 @@ internal static class HostMovieBridge
         out long frameSerial,
         out string hostPath)
     {
+        // The render thread asks before every draw and dispatch. With no movie attached
+        // it must not queue on Gate behind guest file reads (Demon's Souls: ~15 % of the
+        // render thread blocked here). A movie attached meanwhile is picked up next call.
+        if (Volatile.Read(ref _playback) is null && Volatile.Read(ref _frameBuffer) is null)
+        {
+            pixels = [];
+            width = 0;
+            height = 0;
+            advanced = false;
+            frameSerial = Volatile.Read(ref _frameSerial);
+            hostPath = string.Empty;
+            return false;
+        }
+
         lock (Gate)
         {
             pixels = [];
@@ -230,7 +248,7 @@ internal static class HostMovieBridge
             return;
         }
 
-        AttachPlaybackLocked(hostPath, info, source);
+        AttachPlaybackLocked(hostPath, info, new HostMovieYuv420Decoder(source));
         Console.Error.WriteLine(
             "[LOADER][INFO] Bink2 bridge attached: " + Path.GetFileName(hostPath) + " " +
             info.Width + "x" + info.Height + " @ " +
@@ -285,9 +303,12 @@ internal static class HostMovieBridge
         CloseActiveLocked();
         _activePath = hostPath;
         _activeInfo = info;
-        _frameBuffer = GC.AllocateUninitializedArray<byte>(GetFrameBufferLength(info));
+        var bgra = GC.AllocateUninitializedArray<byte>(GetFrameBufferLength(info));
+        FillDummyFrame(bgra, info.Width, info.Height);
+        _frameBuffer = GC.AllocateUninitializedArray<byte>(
+            HostMovieYuv420.FrameLength(info.Width, info.Height));
+        HostMovieYuv420.ConvertFromBgra(bgra, info.Width, info.Height, _frameBuffer);
         _frameBufferPresented = false;
-        FillDummyFrame(_frameBuffer, info.Width, info.Height);
         ArmPlaybackWatchdogLocked(hostPath);
         Console.Error.WriteLine(
             "[LOADER][INFO] Bink dummy attached: " + Path.GetFileName(hostPath) + " " +
@@ -327,6 +348,7 @@ internal static class HostMovieBridge
                         "[LOADER][WARN] Bink2 host watchdog expired for " +
                         Path.GetFileName(path) + "; advancing to the next movie.");
                     TimedOutMoviePaths.Add(path);
+                    Volatile.Write(ref _timedOutMovieCount, TimedOutMoviePaths.Count);
                     CloseActiveLocked();
                     AttachNextQueuedMovieLocked();
                 }
@@ -462,6 +484,11 @@ internal static class HostMovieBridge
 
     internal static bool ShouldForceGuestMovieEof(string hostPath)
     {
+        if (Volatile.Read(ref _timedOutMovieCount) == 0)
+        {
+            return false;
+        }
+
         lock (Gate)
         {
             return TimedOutMoviePaths.Contains(hostPath);
@@ -550,6 +577,7 @@ internal static class HostMovieBridge
         lock (Gate)
         {
             TimedOutMoviePaths.Remove(hostPath);
+            Volatile.Write(ref _timedOutMovieCount, TimedOutMoviePaths.Count);
             if (PendingMoviePathSet.Remove(hostPath))
             {
                 var retained = PendingMoviePaths

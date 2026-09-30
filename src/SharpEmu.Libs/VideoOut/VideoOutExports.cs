@@ -49,6 +49,14 @@ public static partial class VideoOutExports
     private const int MaxLatencyHistoryEntries = 256;
     private const ulong SceVideoOutOutputModeDefault = 1;
     private const ulong SceVideoOutOutputMode119_88Hz = 0xF;
+    // SHARPEMU_GUEST_REFRESH_RATE=<Hz> paces the emulated display (vblanks and flips) at
+    // that rate instead of 60 Hz. A game that flips every vblank then runs faster than 60 fps;
+    // one whose logic counts frames also runs faster.
+    private static readonly uint GuestRefreshRate =
+        uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_REFRESH_RATE"), out var rate) && rate is >= 30 and <= 1000
+            ? rate
+            : 60;
+
     private const ulong SceVideoOutRefreshRate59_94Hz = 3;
     private const ulong SceVideoOutRefreshRate119_88Hz = 13;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
@@ -239,7 +247,7 @@ public static partial class VideoOutExports
         public int CurrentBuffer { get; set; } = -1;
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
-        public uint RefreshRate { get; set; } = 60;
+        public uint RefreshRate { get; set; } = GuestRefreshRate;
         public ulong OutputMode { get; set; } = SceVideoOutOutputModeDefault;
         public float Gamma { get; set; } = 1.0f;
         public Dictionary<long, long> LatencyStartPoints { get; } = new();
@@ -861,6 +869,28 @@ public static partial class VideoOutExports
         }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    #pragma warning disable SHEM006
+    [SysAbiExport(
+        Nid = "kP2L8t3j-aM",
+        ExportName = "VideoOutVrrStatus_kP2L8t3j_aM",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOutVrrStatus")]
+    public static int VideoOutVrrStatus(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "5tRaBjtdTzY",
+        ExportName = "sceVideoOutVrrPegToFixedRate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutVrrPegToFixedRate(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "T4ucGB8CsnM",
+        ExportName = "sceVideoOutVrrUnpegFromFixedRate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutVrrUnpegFromFixedRate(CpuContext ctx) => ctx.SetReturn(0);
 
     [SysAbiExport(
         Nid = "Xru92wHJRmg",

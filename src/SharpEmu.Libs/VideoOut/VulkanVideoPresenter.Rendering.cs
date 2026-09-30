@@ -28,6 +28,10 @@ internal static unsafe partial class VulkanVideoPresenter
     private const string DepthClipControlExtensionName = "VK_EXT_depth_clip_control";
     private const string DepthClipEnableExtensionName = "VK_EXT_depth_clip_enable";
     private const int DrawsPerBatch = 64;
+    // A full batch does not split an open render pass: ending it there flushed and
+    // restarted Demon's Souls' 1440p G-buffer pass (five targets + depth) every 64 draws.
+    // The pass still ends at this cap so a long pass cannot hold the batch forever.
+    private const int DrawsPerBatchInRenderPass = 512;
     private const uint SingleRectangleVertexCount = 4;
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
@@ -175,12 +179,6 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void RunPendingOperations()
         {
-            // Start of a draw or dispatch: nothing is bound yet, so the tick can end here.
-            if (_imageCache.ScratchOverBudget && !_scheduler.InsideTickCallback)
-            {
-                _scheduler.Finish();
-            }
-
             RunPendingCommands();
         }
 
@@ -369,7 +367,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // Acquire the decoded frame before any stage selects its movie texture planes.
             PumpHostMovieFrame();
 
-            if (_batchDrawCount >= DrawsPerBatch)
+            if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
                 EndRendering();
                 FlushBatchedGuestCommands();
@@ -460,6 +458,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            RecordSampledColorMetadataClears(bindings);
+
             // Create feedback copies after load clears have been materialized;
             // otherwise a shader would sample the pre-clear contents.
             PrepareDepthFeedback(bindings);
@@ -534,6 +534,45 @@ internal static unsafe partial class VulkanVideoPresenter
             (ulong)attachment.BaseLayer < (ulong)sampled.BaseLayer + sampled.LayerCount;
 
         // Clears the depth view with a transfer so the draw can sample the cleared image.
+        // A DCC fast clear stays pending until the surface binds as a color target. A shader that
+        // samples or writes the surface first must see the cleared contents, and the later bind must
+        // not clear over its writes: Astro Bot's save-slot cards were drawn by compute into a
+        // fast-cleared target, then wiped black by the deferred clear. Only the zero clear code is
+        // materialized here; the register clear color is known only when the surface is a target.
+        private void RecordSampledColorMetadataClears(TextureResource[] bindings)
+        {
+            const byte DccClearToZero = 0x00;
+            foreach (var binding in bindings)
+            {
+                if (binding.IsHostMovie || binding.CachedImage is not { } image || image.Description.Metadata.Kind != MetadataKind.Dcc)
+                {
+                    continue;
+                }
+
+                var metadataAddress = image.Description.Metadata.Range.Address;
+                var view = binding.Request.View;
+                for (var layer = view.BaseLayer; layer < view.BaseLayer + view.LayerCount; layer++)
+                {
+                    if (!_imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) || (byte)metadataValue != DccClearToZero)
+                    {
+                        continue;
+                    }
+
+                    EndRendering();
+                    var command = BeginBatchedGuestCommands();
+                    var range = new SubresourceRange(0, 1, layer, 1);
+                    image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+                    var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, layer, 1);
+                    var clearValue = default(ClearColorValue);
+                    _vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                    if (!_imageCache.SetMetadataSlice(metadataAddress, layer, false))
+                    {
+                        throw SubmissionScheduler.Fatal($"The DCC clear state could not be consumed: metadata=0x{metadataAddress:X16} layer={layer}.");
+                    }
+                }
+            }
+        }
+
         private void RecordSampledDepthClear(CachedImage image, in ImageViewDescription view, Format format)
         {
             var aspects = (_boundDepthLoadState.DepthClearEnabled ? ImageAspectFlags.DepthBit : 0) |
@@ -854,6 +893,22 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
+            CountDraw();
+        }
+
+        void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var command = BeginBatchedGuestCommands();
+            if (_boundGraphicsPipeline is { RectangleList: true } entry)
+            {
+                BindRectangleListVariant(entry, strip: false, command);
+            }
+
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
+                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
         }
 

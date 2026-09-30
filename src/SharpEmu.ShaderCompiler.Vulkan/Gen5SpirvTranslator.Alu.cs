@@ -118,6 +118,21 @@ public static partial class Gen5SpirvTranslator
                     var oldValue = LoadV(destination);
                     var sourceValue = GetRawSource(instruction, 0);
                     var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(_waveLaneCount - 1));
+                    if (_laneSpillSlots.Count != 0)
+                    {
+                        foreach (var ((slotRegister, slotLane), variable) in _laneSpillSlots)
+                        {
+                            if (slotRegister != destination)
+                            {
+                                continue;
+                            }
+
+                            var isSlotLane = _module.AddInstruction(SpirvOp.IEqual, _boolType, selectedLane, UInt(slotLane));
+                            Store(variable, _module.AddInstruction(
+                                SpirvOp.Select, _uintType, isSlotLane, sourceValue, Load(_uintType, variable)));
+                        }
+                    }
+
                     var isTargetLane = _module.AddInstruction(
                         SpirvOp.IEqual,
                         _boolType,
@@ -732,6 +747,31 @@ public static partial class Gen5SpirvTranslator
                         SpirvOp.Select,
                         _uintType,
                         nonzero,
+                        position,
+                        UInt(uint.MaxValue));
+                    break;
+                }
+                case "VFfbhI32":
+                {
+                    // First bit that differs from the sign bit, counted from bit 31; ~0 for 0 and -1.
+                    var source = GetRawSource(instruction, 0);
+                    var msb = Bitcast(
+                        _uintType,
+                        Ext(74, _intType, Bitcast(_intType, source)));
+                    var position = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(31),
+                        msb);
+                    var found = _module.AddInstruction(
+                        SpirvOp.INotEqual,
+                        _boolType,
+                        msb,
+                        UInt(uint.MaxValue));
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        found,
                         position,
                         UInt(uint.MaxValue));
                     break;
@@ -1568,6 +1608,12 @@ public static partial class Gen5SpirvTranslator
             }
 
             var m0 = LoadS(M0ScalarRegister);
+            _moveRelativeOffsets ??= Ir.Gen5MoveRelativeOffsets.Analyze(_request.Program);
+            if (_moveRelativeOffsets.TryGetValue(instruction.Pc, out var offsets))
+            {
+                return TryEmitBoundedMoveRelative(instruction, destination, m0, offsets, out error);
+            }
+
             uint sourceOffset;
             uint destinationOffset;
             if (instruction.Opcode == "VMovrelsd2B32")
@@ -1607,6 +1653,62 @@ public static partial class Gen5SpirvTranslator
             }
 
             StoreVDynamic(IAdd(UInt(destination), destinationOffset), value);
+            return true;
+        }
+
+        private IReadOnlyDictionary<uint, uint[]>? _moveRelativeOffsets;
+
+        // A relative move whose M0 values are known picks among those registers with
+        // constant register numbers, so the VGPR array is never indexed at run time and
+        // the driver can keep it in hardware registers instead of scratch memory.
+        private bool TryEmitBoundedMoveRelative(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint m0,
+            uint[] offsets,
+            out string error)
+        {
+            error = string.Empty;
+            uint value;
+            if (instruction.Opcode == "VMovreldB32")
+            {
+                value = GetRawSource(instruction, 0);
+            }
+            else
+            {
+                var source = instruction.Sources[0];
+                if (source.Kind != Gen5OperandKind.VectorRegister)
+                {
+                    error = $"{instruction.Opcode} source must be a vector register";
+                    return false;
+                }
+
+                value = LoadV((source.Value + offsets[0]) & (VectorRegisterCount - 1));
+                for (var index = 1; index < offsets.Length; index++)
+                {
+                    value = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, m0, UInt(offsets[index])),
+                        LoadV((source.Value + offsets[index]) & (VectorRegisterCount - 1)),
+                        value);
+                }
+            }
+
+            if (instruction.Opcode == "VMovrelsB32")
+            {
+                StoreV(destination, value);
+                return true;
+            }
+
+            var active = Load(_boolType, _exec);
+            foreach (var offset in offsets)
+            {
+                var register = (destination + offset) & (VectorRegisterCount - 1);
+                var selected = LogicalAnd(active, _module.AddInstruction(SpirvOp.IEqual, _boolType, m0, UInt(offset)));
+                StoreV(register, _module.AddInstruction(SpirvOp.Select, _uintType, selected, value, LoadV(register)), guardWithExec: false);
+            }
+
             return true;
         }
 
@@ -2601,22 +2703,15 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode == "SBcnt1I32B64")
             {
+                // Vulkan only allows OpBitCount on 32-bit operands without
+                // maintenance9, so count each half separately.
                 var wide = GetRawSource64(instruction, 0);
-                var low = _module.AddInstruction(
-                    SpirvOp.UConvert,
-                    _uintType,
-                    wide);
-                var high = _module.AddInstruction(
-                    SpirvOp.UConvert,
-                    _uintType,
-                    ShiftRightLogical64(
-                        wide,
-                        _module.Constant64(_ulongType, 32)));
-                var bitCountResult = _module.AddInstruction(
-                    SpirvOp.IAdd,
-                    _uintType,
-                    _module.AddInstruction(SpirvOp.BitCount, _uintType, low),
-                    _module.AddInstruction(SpirvOp.BitCount, _uintType, high));
+                var bitCountResult = IAdd(
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, Narrow(wide)),
+                    _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        Narrow(ShiftRightLogical64(wide, _module.Constant64(_ulongType, 32)))));
                 StoreS(destination, bitCountResult);
                 Store(_scc, IsNotZero(bitCountResult));
                 return true;
@@ -3476,7 +3571,7 @@ public static partial class Gen5SpirvTranslator
 
                 if (!_emulateWave64 && _waveLaneCount != 64)
                 {
-                    newExec = BitwiseAnd(
+                    newExec = BitwiseAnd64(
                         newExec,
                         _module.Constant64(_ulongType, 0xFFFF_FFFFUL));
                 }
@@ -3907,7 +4002,15 @@ public static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFF8)), selector);
-            targetLane = BitwiseAnd(targetLane, UInt(31));
+            // Ensure target lane is properly constrained to wave size (32 or 64)
+            if (_waveLaneCount == 64)
+            {
+                targetLane = BitwiseAnd(targetLane, UInt(63));
+            }
+            else
+            {
+                targetLane = BitwiseAnd(targetLane, UInt(31));
+            }
             var shuffled = ShuffleLane(value, targetLane);
             if (control.FetchInactive)
             {
@@ -3940,7 +4043,10 @@ public static partial class Gen5SpirvTranslator
                 inRange,
                 targetLane,
                 lane);
-            safeTarget = BitwiseAnd(safeTarget, UInt(31));
+            // Mask to guest wave size (32 or 64 lanes) — on Radeon hardware, DPP 
+            // operations are limited to a single half-wave for some encodings, so we 
+            // must not clamp wave64 lanes to 31; use the full lane mask instead.
+            safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
             var shuffled = ShuffleLane(value, safeTarget);
 
             var sourceAvailable = inRange;
@@ -4981,7 +5087,13 @@ public static partial class Gen5SpirvTranslator
             }
             else
             {
-                // Fallback: no subgroup ops, read current lane's value.
+                // Fallback: no subgroup ops, read current lane's value, or the
+                // spill slot that V_WRITELANE filled for the selected lane.
+                if (instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
+                {
+                    sourceValue = SelectLaneSpillSlot(instruction.Sources[0].Value, selectedLane, sourceValue);
+                }
+
                 StoreS(destination, sourceValue);
             }
 
@@ -5039,7 +5151,10 @@ public static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(rowBase, selector);
-            targetLane = BitwiseAnd(targetLane, UInt(31));
+            // Mask to guest wave size — on Radeon hardware DPP is limited to a 
+            // single half-wave for some encodings, but we must not clamp wave64 
+            // lanes to 31; use the full lane mask instead.
+            targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 ? 63u : 31u));
             var shuffled = ShuffleLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)

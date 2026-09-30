@@ -51,7 +51,6 @@ public sealed class ImageBacking
     public ImageAccessState State = ImageAccessState.Initial;
     public List<ImageAccessState>? SubresourceStates;
     public DeviceMemory Memory;
-    public ImageMemory Placement;
     public ulong AllocationSize;
 
     public bool Exists => Handle.Handle != 0;
@@ -63,6 +62,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
     private readonly IGuestBackedSpace _guestBacking;
+    private readonly ImageBackingPool? _pool;
+    private ImageBackingPool.Key _poolKey;
     private ulong _maybeCpuHash;
     private bool _cpuDirty;
     private bool _maybeCpuDirty;
@@ -84,11 +85,13 @@ public sealed unsafe partial class CachedImage : IDisposable
     public ulong LastAccessTick;
     public int RecencyEntryIndex;
 
-    public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description)
+    public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
+        ImageBackingPool? pool = null)
     {
         _device = device;
         _scheduler = scheduler;
         _guestBacking = guestBacking;
+        _pool = pool;
         Description = description;
         Description.Validate();
         _cpuDirty = !ImageDescription.IsEmptyRange(Description.Data) && Description.Metadata.Compression == DisplayCompression.Uncompressed;
@@ -136,6 +139,12 @@ public sealed unsafe partial class CachedImage : IDisposable
         Backing.Flags = create.Flags;
         Backing.Usage = create.Usage;
 
+        _poolKey = ImageBackingPool.KeyOf(create);
+        if (_pool is not null && _pool.TryTake(_poolKey, out Backing.Handle, out Backing.Memory, out Backing.AllocationSize))
+        {
+            return;
+        }
+
         var vk = device.Vk;
         var createResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
         if (createResult != Result.Success)
@@ -144,6 +153,11 @@ public sealed unsafe partial class CachedImage : IDisposable
         }
 
         vk.GetImageMemoryRequirements(device.Device, Backing.Handle, out var requirements);
+        var allocateInfo = new MemoryAllocateInfo
+        {
+            SType = StructureType.MemoryAllocateInfo,
+            AllocationSize = requirements.Size,
+        };
         var allocated = Result.ErrorOutOfDeviceMemory;
         for (uint index = 0; index < device.MemoryTypeCount; index++)
         {
@@ -153,7 +167,8 @@ public sealed unsafe partial class CachedImage : IDisposable
                 continue;
             }
 
-            allocated = device.ImageMemory.Allocate(requirements, index, out Backing.Placement);
+            allocateInfo.MemoryTypeIndex = index;
+            allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
             if (allocated == Result.Success)
             {
                 break;
@@ -163,19 +178,19 @@ public sealed unsafe partial class CachedImage : IDisposable
         if (allocated != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
+            device.FreeMemory(Backing.Memory);
             Backing.Handle = default;
+            Backing.Memory = default;
             throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
         }
 
-        Backing.Memory = Backing.Placement.Memory;
-        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, Backing.Placement.Offset);
+        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, 0);
         if (bindResult != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
-            device.ImageMemory.Free(Backing.Placement);
+            device.FreeMemory(Backing.Memory);
             Backing.Handle = default;
             Backing.Memory = default;
-            Backing.Placement = default;
             throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size);
         }
 
@@ -197,6 +212,21 @@ public sealed unsafe partial class CachedImage : IDisposable
         if (SupportsImageConfiguration(device, configuration))
         {
             return true;
+        }
+
+        // Some drivers (AMDVLK) refuse storage usage on block-compressed images even
+        // with extended usage. Storage writes to such an image go through an
+        // uncompressed replacement instead (GuestImageCache.ReplaceCompressedForStorage).
+        if ((configuration.Flags & ImageCreateFlags.CreateBlockTexelViewCompatibleBit) != 0 &&
+            (configuration.Usage & ImageUsageFlags.StorageBit) != 0)
+        {
+            var withoutStorage = configuration;
+            withoutStorage.Usage &= ~ImageUsageFlags.StorageBit;
+            if (SupportsImageConfiguration(device, withoutStorage))
+            {
+                configuration = withoutStorage;
+                return true;
+            }
         }
 
         if (!allowCompressedImageFallback || (configuration.Flags & ImageCreateFlags.CreateBlockTexelViewCompatibleBit) == 0)
@@ -274,7 +304,18 @@ public sealed unsafe partial class CachedImage : IDisposable
             usage |= ImageUsageFlags.ColorAttachmentBit;
         }
 
-        var storageFormat = ViewFormatRules.SrgbStorageFormat(description.PixelFormat);
+        // Compressed images are written by compute shaders (GPU texture
+        // encoders) through an uncompressed block view; with extended usage the
+        // image may carry storage usage when that block view format supports it.
+        // TrySelectSupportedImageConfiguration drops it again if the driver refuses.
+        var storageFormat = GuestPixelFormats.BlockCompressedBytes(description.GuestFormat) != 0
+            ? ViewFormatRules.BlockBytes(description.PixelFormat) switch
+            {
+                8 => Format.R32G32Uint,
+                16 => Format.R32G32B32A32Uint,
+                _ => Format.Undefined,
+            }
+            : ViewFormatRules.SrgbStorageFormat(description.PixelFormat);
         var storageFeatures = storageFormat == Format.Undefined ? features : device.GetFormatProperties(storageFormat).OptimalTilingFeatures;
         if (description.Samples == 1 && (storageFeatures & FormatFeatureFlags.StorageImageBit) != 0)
         {
@@ -363,12 +404,26 @@ public sealed unsafe partial class CachedImage : IDisposable
         LastCpuWriteSize = 0;
     }
 
+    // Guest-byte hashes of each tile transfer piece at the last upload from guest memory; null
+    // once the image holds anything else, so a refresh falls back to a full upload.
+    private ulong[]? _guestPieceHashes;
+    private GuestSpan _guestPieceRange;
+
+    internal ulong[]? GuestPieceHashes => _guestPieceHashes != null && _guestPieceRange == Description.Data ? _guestPieceHashes : null;
+
+    internal void SetGuestPieceHashes(ulong[]? hashes)
+    {
+        _guestPieceHashes = hashes;
+        _guestPieceRange = Description.Data;
+    }
+
     public bool IsGpuModified => _gpuModified;
 
     public void MarkGpuModified()
     {
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
+        _guestPieceHashes = null;
     }
 
     public void ClearGpuModified() => _gpuModified = false;
@@ -513,9 +568,15 @@ public sealed unsafe partial class CachedImage : IDisposable
             }
         }
 
+        var minLod = new ImageViewMinLodCreateInfoEXT
+        {
+            SType = StructureType.ImageViewMinLodCreateInfoExt,
+            MinLod = normalized.MinLod,
+        };
         var usage = new ImageViewUsageCreateInfo
         {
             SType = StructureType.ImageViewUsageCreateInfo,
+            PNext = normalized.MinLod > 0 && _device.ImageViewMinLodSupported ? &minLod : null,
             Usage = isStorage ? image.Usage : image.Usage & ~ImageUsageFlags.StorageBit,
         };
         var create = new ImageViewCreateInfo
@@ -551,11 +612,14 @@ public sealed unsafe partial class CachedImage : IDisposable
         Views.Clear();
         if (Backing.Exists)
         {
-            _device.Vk.DestroyImage(_device.Device, Backing.Handle, null);
-            _device.ImageMemory.Free(Backing.Placement);
+            if (_pool is null || !_pool.TryReturn(_poolKey, Backing.Handle, Backing.Memory, Backing.AllocationSize))
+            {
+                _device.Vk.DestroyImage(_device.Device, Backing.Handle, null);
+                _device.FreeMemory(Backing.Memory);
+            }
+
             Backing.Handle = default;
             Backing.Memory = default;
-            Backing.Placement = default;
         }
     }
 }

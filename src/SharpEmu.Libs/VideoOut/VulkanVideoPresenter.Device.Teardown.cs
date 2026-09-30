@@ -40,6 +40,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _bindlessImageHeap = null;
             _imageCache?.Dispose();
             _samplerStore.Dispose();
+            _bufferCache.AsyncReadback?.Dispose();
+            _bufferCache.AsyncReadback = null;
             _bufferCache.Dispose();
             PerfOverlay.SetGuestCacheStatistics(
                 0,
@@ -57,7 +59,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 DestroyGuestImage(deferredVersion.Image);
             }
-            ReleaseRecycledFlipSnapshots();
+            DestroyFlipSnapshotPool();
             DestroySwapchainResources();
             Console.Error.WriteLine(
                 $"[LOADER][INFO] vk.device_memory live_allocations={_deviceInfo.LiveAllocations} " +
@@ -66,7 +68,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _scheduler.Dispose();
                 _deviceInfo.ImageMemory.ReleaseRetained();
-                _deviceInfo.BufferMemory.ReleaseRetained();
+                _deviceInfo.Slabs.Destroy();
                 if (_pipelineCache.Handle != 0)
                 {
                     _vk.DestroyPipelineCache(_device, _pipelineCache, null);

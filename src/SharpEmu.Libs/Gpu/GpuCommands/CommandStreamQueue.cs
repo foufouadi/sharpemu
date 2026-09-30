@@ -197,14 +197,10 @@ public sealed class CommandStreamQueue
         Monitor.PulseAll(_gate);
     }
 
-    // Marks the frame boundary; from another thread it first waits for the queue to drain.
+    // Marks the frame boundary and drains all pending GPU work before returning.
     public IdleOutcome Done()
     {
-        var outcome = IdleOutcome.Completed;
-        if (_processingThread != Thread.CurrentThread)
-        {
-            outcome = WaitForIdle();
-        }
+        var outcome = _processingThread == Thread.CurrentThread ? IdleOutcome.Completed : WaitForIdle();
 
         lock (_gate)
         {

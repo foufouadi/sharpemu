@@ -64,6 +64,8 @@ internal static unsafe partial class VulkanVideoPresenter
         public Format Format;
         public Image Image;
         public DeviceMemory Memory;
+        // Made by CreateGuestFlipSnapshot: its image goes back to the snapshot pool.
+        public bool FromSnapshotPool;
     }
 
     // A cached color target bound to one draw or resolve.
@@ -983,7 +985,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private (VkBuffer Buffer, DeviceMemory Memory) CreateTextureStagingBuffer(byte[] pixels, string debugName)
+        private (VkBuffer Buffer, DeviceMemory Memory) CreateTextureStagingBuffer(ReadOnlySpan<byte> pixels, string debugName)
         {
             var buffer = CreateHostBuffer(pixels, BufferUsageFlags.TransferSrcBit, out var memory, out _);
             SetDebugName(ObjectType.Buffer, buffer.Handle, debugName);
@@ -1087,46 +1089,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyGuestImage(GuestImageResource resource)
         {
-            lock (_recycledFlipSnapshots)
+            if (resource.FromSnapshotPool && resource.Image.Handle != 0 && ReturnFlipSnapshot(resource))
             {
-                if (resource.Image.Handle != 0 && _recycledFlipSnapshots.Count < MaxRecycledFlipSnapshots && !_disposingFlipSnapshots)
-                {
-                    _recycledFlipSnapshots.Add(new GuestImageResource
-                    {
-                        Width = resource.Width,
-                        Height = resource.Height,
-                        Format = resource.Format,
-                        Image = resource.Image,
-                        Memory = resource.Memory,
-                    });
-                    resource.Image = default;
-                    resource.Memory = default;
-                    return;
-                }
+                resource.Image = default;
+                resource.Memory = default;
+                return;
             }
 
-            ReleaseGuestImage(resource);
-        }
-
-        private bool _disposingFlipSnapshots;
-
-        // Teardown: every recycled snapshot goes back to the driver.
-        private void ReleaseRecycledFlipSnapshots()
-        {
-            lock (_recycledFlipSnapshots)
-            {
-                _disposingFlipSnapshots = true;
-                foreach (var snapshot in _recycledFlipSnapshots)
-                {
-                    ReleaseGuestImage(snapshot);
-                }
-
-                _recycledFlipSnapshots.Clear();
-            }
-        }
-
-        private void ReleaseGuestImage(GuestImageResource resource)
-        {
             if (resource.Image.Handle != 0)
             {
                 _vk.DestroyImage(_device, resource.Image, null);

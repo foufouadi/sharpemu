@@ -709,25 +709,60 @@ internal static unsafe partial class VulkanVideoPresenter
             return destination;
         }
         // Captures the display surface through the store in queue order; presentation reads the copy.
-        private GuestImageResource CreateGuestFlipSnapshot(Format format, uint width, uint height, ulong address, long version)
+        // Flip snapshots come and go every frame at the same few sizes. A retired one (its
+        // frame slot waited, so the GPU is done with it) is kept for the next flip of the
+        // same format and size instead of another vkCreateImage and vkAllocateMemory; the
+        // copy into it starts again from the undefined layout.
+        private const int MaxPooledFlipSnapshots = 4;
+        private readonly Dictionary<(Format Format, uint Width, uint Height), Stack<(Image Image, DeviceMemory Memory)>> _flipSnapshotPool = new();
+
+        private bool ReturnFlipSnapshot(GuestImageResource resource)
         {
-            GuestImageResource? reused = null;
-            lock (_recycledFlipSnapshots)
+            var key = (resource.Format, resource.Width, resource.Height);
+            if (!_flipSnapshotPool.TryGetValue(key, out var pooled))
             {
-                var recycled = _recycledFlipSnapshots.FindIndex(snapshot => snapshot.Width == width && snapshot.Height == height && snapshot.Format == format);
-                if (recycled >= 0)
+                pooled = new Stack<(Image, DeviceMemory)>();
+                _flipSnapshotPool.Add(key, pooled);
+            }
+
+            if (pooled.Count >= MaxPooledFlipSnapshots)
+            {
+                return false;
+            }
+
+            pooled.Push((resource.Image, resource.Memory));
+            return true;
+        }
+
+        private void DestroyFlipSnapshotPool()
+        {
+            foreach (var pooled in _flipSnapshotPool.Values)
+            {
+                while (pooled.TryPop(out var entry))
                 {
-                    reused = _recycledFlipSnapshots[recycled];
-                    _recycledFlipSnapshots.RemoveAt(recycled);
+                    _vk.DestroyImage(_device, entry.Image, null);
+                    _deviceInfo.FreeMemory(entry.Memory);
                 }
             }
 
-            if (reused is not null)
+            _flipSnapshotPool.Clear();
+        }
+
+        private GuestImageResource CreateGuestFlipSnapshot(Format format, uint width, uint height, ulong address, long version)
+        {
+            if (_flipSnapshotPool.TryGetValue((format, width, height), out var pooled) && pooled.TryPop(out var reused))
             {
-                reused.Address = address;
-                reused.FlipVersion = version;
-                SetDebugName(ObjectType.Image, reused.Image.Handle, $"guest flip v{version} source 0x{address:X16}");
-                return reused;
+                return new GuestImageResource
+                {
+                    Address = address,
+                    FlipVersion = version,
+                    Width = width,
+                    Height = height,
+                    Format = format,
+                    Image = reused.Image,
+                    Memory = reused.Memory,
+                    FromSnapshotPool = true,
+                };
             }
 
             var imageInfo = new ImageCreateInfo
@@ -775,6 +810,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Format = format,
                 Image = image,
                 Memory = memory,
+                FromSnapshotPool = true,
             };
         }
 

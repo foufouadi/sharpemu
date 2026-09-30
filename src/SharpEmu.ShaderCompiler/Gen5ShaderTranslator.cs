@@ -869,6 +869,7 @@ public static partial class Gen5ShaderTranslator
             0x38 => "VBfrevB32",
             0x39 => "VFfbhU32",
             0x3A => "VFfblB32",
+            0x3B => "VFfbhI32",
             0x42 => "VMovreldB32",
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",

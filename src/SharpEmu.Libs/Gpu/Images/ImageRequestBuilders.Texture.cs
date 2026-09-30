@@ -123,7 +123,7 @@ public static partial class ImageRequestBuilders
         var usage = shape.Storage ? ImageUsageFlags.StorageBit : ImageUsageFlags.SampledBit;
         if (shape.Volume)
         {
-            return new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, baseLevel, viewLevels, 0, 1, mapping, usage);
+            return WithMinLod(new ImageViewDescription(format, ImageViewType.Type3D, ImageAspectFlags.ColorBit, baseLevel, viewLevels, 0, 1, mapping, usage), descriptor, shape, firstLevel);
         }
 
         var baseLayer = descriptor.BaseArray;
@@ -136,7 +136,22 @@ public static partial class ImageRequestBuilders
         var type = shape.OneDimensional
             ? shape.Arrayed ? ImageViewType.Type1DArray : ImageViewType.Type1D
             : shape.Arrayed ? ImageViewType.Type2DArray : ImageViewType.Type2D;
-        return new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, baseLevel, viewLevels, baseLayer, layerCount, mapping, usage);
+        return WithMinLod(new ImageViewDescription(format, type, ImageAspectFlags.ColorBit, baseLevel, viewLevels, baseLayer, layerCount, mapping, usage), descriptor, shape, firstLevel);
+    }
+
+    // MIN_LOD (4.8 fixed point, absolute mip levels) keeps sampling off mips a streamed texture has not
+    // loaded yet; ignoring it sampled the unloaded mip 0 of Astro Bot's stadium sky and bloom spread its
+    // garbage HDR values over the screen. Storage views address levels explicitly and are not clamped.
+    private static ImageViewDescription WithMinLod(ImageViewDescription view, in TextureDescriptorWords descriptor, in ShaderImageShape shape, uint firstLevel)
+    {
+        // The host image starts at the first resident guest level; view levels count from there.
+        var minLod = descriptor.MinLod / 256f - firstLevel;
+        if (shape.Storage || minLod <= view.BaseLevel)
+        {
+            return view;
+        }
+
+        return view with { MinLod = Math.Min(minLod, view.BaseLevel + view.LevelCount - 1) };
     }
 
     public static uint DestinationSwizzle(in TextureDescriptorWords descriptor) =>
@@ -154,8 +169,39 @@ public static partial class ImageRequestBuilders
 
     private static bool IsMultisampledTexture(GuestImageType type) => type is GuestImageType.Color2DMsaa or GuestImageType.Color2DMsaaArray;
 
+    private readonly record struct TextureKey(uint W0, uint W1, uint W2, uint W3, uint W4, uint W5, uint W6, uint W7, ShaderImageShape Shape);
+
+    private const int TextureCacheLimit = 8192;
+
+    // Every texture binding of every draw resolves its T# here, and the tiled layout math
+    // allocates several arrays each time; the result depends only on the words and shape
+    // and is a pure value, so it is memoised per thread.
+    [ThreadStatic]
+    private static Dictionary<TextureKey, TextureRequestResolution>? _textureCache;
+
     // Builds the request for a sampled or storage texture; the words are the eight T# dwords.
     public static TextureRequestResolution Texture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
+    {
+        Span<uint> key = stackalloc uint[8];
+        words[..Math.Min(words.Length, 8)].CopyTo(key);
+        var cacheKey = new TextureKey(key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], shape);
+        var cache = _textureCache ??= new Dictionary<TextureKey, TextureRequestResolution>();
+        if (cache.TryGetValue(cacheKey, out var cached))
+        {
+            return cached;
+        }
+
+        var resolution = BuildTexture(key, shape);
+        if (cache.Count >= TextureCacheLimit)
+        {
+            cache.Clear();
+        }
+
+        cache[cacheKey] = resolution;
+        return resolution;
+    }
+
+    private static TextureRequestResolution BuildTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
     {
         Span<uint> padded = stackalloc uint[8];
         words[..Math.Min(words.Length, 8)].CopyTo(padded);

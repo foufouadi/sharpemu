@@ -111,6 +111,10 @@ internal sealed class ShaderProgramCache
 
     public ResourceMaterializationCache? Materializations => _materializations;
 
+    // Read once: the draw path asked the environment on every draw and dispatch
+    // (~4 % of the Demon's Souls render thread) for a debug dump that is almost never on.
+    private readonly bool _spirvDumpEnabled = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"), "1", StringComparison.Ordinal);
+
     public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
     {
         _context = context;
@@ -218,7 +222,7 @@ internal sealed class ShaderProgramCache
 
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
-        var captureIndirectImageFailure = ShaderPermutationDump.CreateFailureCapture(source);
+        var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
@@ -599,6 +603,7 @@ internal sealed class ShaderProgramCache
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     WaveSize = info.WaveSize,
+                    EnableExecGuardElision = info.WaveSize != 64 || _host.ExecGuardElisionEnabled,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,

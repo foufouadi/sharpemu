@@ -53,6 +53,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public bool IsNoBlockLeaf { get; }
 
+		// Argument-register-only exports that never block or touch the guest
+		// stack; DispatchImport runs them without the full import bookkeeping.
+		public bool IsTrivialLeaf { get; }
+
 		public bool SuppressStrlenTrace { get; }
 
 		public bool IsLoopGuardBoundary { get; }
@@ -74,6 +78,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Export = export;
 			IsLeaf = isLeaf;
 			IsNoBlockLeaf = isNoBlockLeaf;
+			IsTrivialLeaf = export is not null && IsTrivialLeafImport(nid);
 			SuppressStrlenTrace = suppressStrlenTrace;
 			IsLoopGuardBoundary = isLoopGuardBoundary;
 			NidHash = nidHash;
@@ -661,18 +666,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			finally
 			{
 				GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
+				_workAvailable.Dispose();
+			}
+		}
+
+		public void RequestStop()
+		{
+			lock (_gate)
+			{
+				if (_stopping)
+				{
+					return;
+				}
+				_stopping = true;
+				_workAvailable.Set();
 			}
 		}
 
 		public void Dispose()
 		{
-			_stopping = true;
-			_workAvailable.Set();
+			RequestStop();
 			if (!ReferenceEquals(Thread.CurrentThread, _thread))
 			{
 				_thread.Join(500);
 			}
-			_workAvailable.Dispose();
 		}
 	}
 
@@ -717,6 +734,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private int _readyGuestThreadCount;
 
 	private readonly Dictionary<ulong, GuestThreadState> _guestThreads = new Dictionary<ulong, GuestThreadState>();
+	private readonly Queue<(IVirtualMemory Memory, ulong StackBase, ulong StackSize, ulong TlsBase)> _reusableGuestThreadRegions = new();
 
 	private readonly Dictionary<ulong, ExternalGuestThreadState> _externalGuestThreads = new Dictionary<ulong, ExternalGuestThreadState>();
 
@@ -5342,6 +5360,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_readyGuestThreads.Clear();
 			Interlocked.Exchange(ref _readyGuestThreadCount, 0);
 			_guestThreads.Clear();
+			_reusableGuestThreadRegions.Clear();
 			_externalGuestThreads.Clear();
 			_pendingGuestExceptions.Clear();
 			Volatile.Write(ref _pendingGuestExceptionCount, 0);
@@ -5380,13 +5399,50 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			stackSize = GuestThreadStackSize;
 		}
 
-		if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, stackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out var stackBase, out error))
+		ulong stackBase = 0;
+		ulong tlsBase = 0;
+		lock (_guestThreadGate)
 		{
-			return false;
+			var count = _reusableGuestThreadRegions.Count;
+			for (var i = 0; i < count; i++)
+			{
+				var region = _reusableGuestThreadRegions.Dequeue();
+				if (stackBase == 0 && ReferenceEquals(region.Memory, virtualMemory) && region.StackSize >= stackSize)
+				{
+					stackBase = region.StackBase;
+					stackSize = region.StackSize;
+					tlsBase = region.TlsBase;
+				}
+				else
+				{
+					_reusableGuestThreadRegions.Enqueue(region);
+				}
+			}
 		}
-		if (!TryMapGuestThreadTlsRegion(virtualMemory, out var tlsBase, out error))
+		if (stackBase == 0)
 		{
-			return false;
+			if (!TryMapGuestThreadRegion(virtualMemory, GuestThreadStackBaseAddress, stackSize, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write, out stackBase, out error))
+			{
+				return false;
+			}
+			if (!TryMapGuestThreadTlsRegion(virtualMemory, out tlsBase, out error))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			Span<byte> zero = stackalloc byte[4096];
+			zero.Clear();
+			var start = tlsBase - GuestThreadTlsPrefixSize;
+			for (ulong offset = 0; offset < GuestThreadTlsPrefixSize + GuestThreadTlsSize; offset += (ulong)zero.Length)
+			{
+				if (!virtualMemory.TryWrite(start + offset, zero[..(int)Math.Min((ulong)zero.Length, GuestThreadTlsPrefixSize + GuestThreadTlsSize - offset)]))
+				{
+					error = "failed to reset reused guest TLS";
+					return false;
+				}
+			}
 		}
 
 		var trackedMemory = new TrackedCpuMemory(virtualMemory);
@@ -5599,7 +5655,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static ulong MapGuestThreadAffinity(ulong guestAffinityMask)
 	{
-		if (guestAffinityMask == 0 || guestAffinityMask == ulong.MaxValue)
+		if (guestAffinityMask == 0 || guestAffinityMask == ulong.MaxValue || !GuestAffinityEnabled)
 		{
 			return 0;
 		}
@@ -5659,9 +5715,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 	/// <summary>
-	/// Host lanes kept away from guest threads. Measured on a 16-lane host with
-	/// Demon's Souls: reserving 0/4/6/8 lanes gave 6.08/6.78/7.20/5.62 fps, so
-	/// the useful range is a bit over a third of the machine — too few and the
+	/// Guest affinity is not applied to host threads unless
+	/// SHARPEMU_GUEST_AFFINITY=1. A console title pins one spinning worker per
+	/// dedicated core; on a shared host, pinning traps its renderer and any lock
+	/// holder on a lane next to a busy spinner of equal priority, where it waits
+	/// out whole scheduler quanta. Measured with Demon's Souls on a 16-lane host:
+	/// intro 10.6 → 44.7 fps and menus 11.6 → 47.5 fps with pinning off.
+	/// </summary>
+	private static readonly bool GuestAffinityEnabled =
+		Environment.GetEnvironmentVariable("SHARPEMU_GUEST_AFFINITY") == "1";
+
+	/// <summary>
+	/// Host lanes kept away from pinned guest threads. Measured on a 16-lane host
+	/// with Demon's Souls: reserving 0/4/6/8 lanes gave 6.08/6.78/7.20/5.62 fps,
+	/// so the useful range is a bit over a third of the machine — too few and the
 	/// emulator is crowded out, too many and the guest cannot make progress.
 	/// </summary>
 	private static readonly int EmulatorReservedLanes =
@@ -5850,6 +5917,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				if (TryReleaseGuestThreadExecutorLocked(thread, out var pending))
 				{
 					pendingAfterExecutorRelease = pending;
+				}
+				if (thread.State == GuestThreadRunState.Exited &&
+					TryGetVirtualMemory(thread.Context, out var memory))
+				{
+					_reusableGuestThreadRegions.Enqueue((memory, thread.StackBase, thread.StackSize, thread.Context.FsBase));
+					thread.ExecutionRunner?.RequestStop();
 				}
 			}
 			if (pendingAfterExecutorRelease is { } pendingException &&

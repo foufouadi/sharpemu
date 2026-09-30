@@ -111,6 +111,12 @@ public static class ResourceMaterializer
         return true;
     }
 
+    // Evaluates only the flattened table, laid out as a full materialization lays it out
+    // before specialization; the written device-address slots are left zero for the caller.
+    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table) =>
+        RuntimeValueEvaluator.EvaluateSources(plan, [], inputs, plan.CleanFlatSlots, evaluateTable: true, out _, out table, out _,
+            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount));
+
     // ---- snapshot ----
 
     private static bool MaterializeSnapshot(ShaderResourcePlan plan, ResourceRuntimeInputs inputs,
@@ -1372,6 +1378,35 @@ public static class ResourceMaterializer
                 snapshot.Samplers[target] = snapshot.Samplers[index];
             }
         }
+
+        // ApplyTo appends a depth-compare copy of every sampler shared by ordinary and
+        // depth-reference sampling, after the point samplers; the snapshot needs the same words there.
+        var compareUsage = new byte[ShaderResourceInfo.MaxSamplers];
+        foreach (var pair in info.SampledPairs)
+        {
+            var image = info.Images[(int)pair.Image];
+            var specialized = images[(int)pair.Image];
+            var sampler = RequiresPointSampler(specialized.NumericClass, specialized.ConversionFormat)
+                ? samplerPlan.PointSampler[pair.Sampler]
+                : pair.Sampler;
+            var depthCompare = image.DepthCompare && specialized.EmulatedCompareFunction < 0;
+            compareUsage[sampler] |= depthCompare ? (byte)2 : (byte)1;
+        }
+
+        for (var index = 0; index < snapshot.Samplers.Length && index < compareUsage.Length; index++)
+        {
+            if (compareUsage[index] == 3)
+            {
+                if (snapshot.Samplers.Length >= ShaderResourceInfo.MaxSamplers)
+                {
+                    return Fail("specialized sampler layout exceeds its resource limit");
+                }
+
+                Array.Resize(ref snapshot.Samplers, snapshot.Samplers.Length + 1);
+                snapshot.Samplers[^1] = snapshot.Samplers[index];
+            }
+        }
+
 
         // Bounded runtime V# candidates are appended after the plan's buffers; each draw
         // owns their words and the run-time key mapping sits in the flattened table.

@@ -48,6 +48,7 @@ internal interface IShaderPipelineHost
 
     bool NonUniformImageIndexingEnabled => false;
     bool UsesBindlessImages => false;
+    bool ExecGuardElisionEnabled => true;
     bool PerVertexPixelInputsSupported => true;
 
     RenderHostLimits Limits { get; }
