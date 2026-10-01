@@ -619,6 +619,7 @@ internal sealed class ShaderProgramCache
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),
+                    LocalDataShareDwords = info.LocalDataShareDwords,
                 };
             }
         }
