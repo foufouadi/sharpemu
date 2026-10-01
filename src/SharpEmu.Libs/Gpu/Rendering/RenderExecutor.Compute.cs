@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
@@ -221,6 +222,13 @@ public sealed partial class RenderExecutor
         return BufferDescriptorWords.From(words);
     }
 
+    // The program's packed stride against the descriptor's. With runtime strides the
+    // program carries only the flags and indexes with the descriptor's stride.
+    private static bool StrideMatches(uint programStride, uint descriptorStride) =>
+        (programStride & ~BufferSpecialization.StrideMask) == (descriptorStride & ~BufferSpecialization.StrideMask) &&
+        ((programStride & BufferSpecialization.StrideMask) == 0 ||
+         (programStride & BufferSpecialization.StrideMask) == (descriptorStride & BufferSpecialization.StrideMask));
+
     // A full overwrite of registered metadata by a compute shader becomes a tracked clear.
     private bool TryConsumeMetadataClear(ComputeInputInfo input)
     {
@@ -285,7 +293,7 @@ public sealed partial class RenderExecutor
         var descriptor = BufferDescriptorWords.From(words);
         if (!resource.Formatted || !resource.Written || resource.Read || resource.Atomic || resource.Scalar || resource.MaxByteExtent != ImageClearStride ||
             descriptor.Stride != ImageClearStride || descriptor.Format != BufferDescriptorWords.Format32x4UInt || descriptor.SwizzleEnabled ||
-            descriptor.IndexStride != 0 || descriptor.AddThreadId || resource.PackedStride != descriptor.PackedStride ||
+            descriptor.IndexStride != 0 || descriptor.AddThreadId || !StrideMatches(resource.PackedStride, descriptor.PackedStride) ||
             program.UserDataBase != 0 || resources.UserData.Length != ImageClearUserDataCount)
         {
             return null;

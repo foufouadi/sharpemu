@@ -492,7 +492,8 @@ public sealed partial class ScalarValueGraph
                 case "SGetpcB64":
                 {
                     var address = _graph.Operation(ScalarOperation.IAdd64, ScalarValueType.U64, _graph.ShaderBase(),
-                        _graph.Constant((ulong)instruction.Pc + (ulong)(instruction.Words.Count * sizeof(uint))));
+                        _graph.Constant(unchecked(_program.InstructionAddressOffset(instruction.Pc) +
+                            (ulong)(instruction.Words.Count * sizeof(uint)))));
                     state.WritePair(destinationRegister, Extract(address, 0), Extract(address, 1));
                     return;
                 }
@@ -1553,7 +1554,7 @@ public sealed partial class ScalarValueGraph
             state.WriteVector(destination.Value, _graph.Undefined(ScalarValueType.U32));
             if (!lane.IsConstant)
             {
-                state.ClearLanes(destination.Value);
+                state.ClearLanes(destination.Value, masked: false);
                 return;
             }
 
@@ -1861,10 +1862,12 @@ public sealed partial class ScalarValueGraph
                 return;
             }
 
-            Vectors[register] = value.IsUndefined ? value : _graph.Select(Exec, value, Vectors[register]);
+            Vectors[register] = Exec.IsConstant && !Exec.ConstantBool
+                ? Vectors[register]
+                : value.IsUndefined ? value : _graph.Select(Exec, value, Vectors[register]);
         }
 
-        public void ClearLanes(uint register)
+        public void ClearLanes(uint register, bool masked = true)
         {
             if (Lanes.Count == 0)
             {
@@ -1873,6 +1876,22 @@ public sealed partial class ScalarValueGraph
 
             foreach (var key in Lanes.Keys.Where(key => key.Register == register).ToArray())
             {
+                // Ordinary VGPR writes affect only lanes enabled by EXEC. Writelane
+                // with a dynamic index is unmasked and must invalidate every lane.
+                if (masked)
+                {
+                    // Phi operands still change while the builder converges. Do not
+                    // use the graph's post-build invariant cache here.
+                    var maskValue = Scalars[key.Lane < 32 ? ExecLow : ExecHigh];
+                    var mask = maskValue.Kind == ScalarValueKind.Phi
+                        ? ScalarValueEquivalence.ResolveInvariantPhi(_graph.Memory, maskValue)
+                        : maskValue;
+                    if (mask is { IsConstant: true } &&
+                        (mask.ConstantU32 & (1u << (int)(key.Lane & 31))) == 0)
+                    {
+                        continue;
+                    }
+                }
                 Lanes.Remove(key);
             }
         }

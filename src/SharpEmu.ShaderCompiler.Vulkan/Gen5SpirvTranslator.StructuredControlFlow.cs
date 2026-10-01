@@ -87,10 +87,6 @@ public static partial class Gen5SpirvTranslator
             public required uint BreakLabel;
         }
 
-        // TEMP DIAG: SHARPEMU_TRACE_EMIT_COST=1 logs the SPIR-V size of each buffer instruction.
-        private static readonly bool TraceEmitCost = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_EMIT_COST") == "1";
-        private string _emitPath = string.Empty;
-
         private ControlFlowPlan? _structuredPlan;
         private uint _structuredBody;
         private bool _structuredDry;
@@ -99,9 +95,8 @@ public static partial class Gen5SpirvTranslator
         private int _copyBudget;
         private Dictionary<(NaturalLoop? Region, int Block), MergeTarget>? _mergeCache;
 
-        private bool TryEmitControlFlow(IReadOnlyList<ShaderBlock> blocks, out string error)
+        private void PrepareControlFlow(IReadOnlyList<ShaderBlock> blocks)
         {
-            error = string.Empty;
             var reason = "forced";
             var forced = ForceDispatcher || _request.ForceDispatcher;
             if (!forced && TryPlanStructuredControlFlow(blocks, out var plan, out reason))
@@ -114,17 +109,7 @@ public static partial class Gen5SpirvTranslator
                         $"[SHADER][CFG] structured address=0x{_request.Program.Address:X16} blocks={blocks.Count} loops={plan.LoopsByHeader.Count}");
                 }
 
-                // Out-of-bounds invocations never start the program; the body returns at S_ENDPGM.
-                var active = Load(_boolType, _programActive);
-                var callLabel = _module.AllocateId();
-                var afterLabel = _module.AllocateId();
-                _module.AddStatement(SpirvOp.SelectionMerge, afterLabel, 0);
-                _module.AddStatement(SpirvOp.BranchConditional, active, callLabel, afterLabel);
-                _module.AddLabel(callLabel);
-                _module.AddInstruction(SpirvOp.FunctionCall, _voidType, _structuredBody);
-                _module.AddStatement(SpirvOp.Branch, afterLabel);
-                _module.AddLabel(afterLabel);
-                return true;
+                return;
             }
 
             if (TraceControlFlow)
@@ -133,7 +118,14 @@ public static partial class Gen5SpirvTranslator
                     $"[SHADER][CFG] dispatcher address=0x{_request.Program.Address:X16} blocks={blocks.Count} reason={reason}");
             }
 
-            return TryEmitDispatcher(blocks, out error);
+        }
+
+        private bool TryEmitControlFlow(IReadOnlyList<ShaderBlock> blocks, out string error)
+        {
+            error = string.Empty;
+            if (_structuredPlan is null) return TryEmitDispatcher(blocks, out error);
+            _module.AddInstruction(SpirvOp.FunctionCall, _voidType, _structuredBody);
+            return true;
         }
 
         // Emits the structured body as its own function; call after the entry point is finished.
@@ -147,6 +139,17 @@ public static partial class Gen5SpirvTranslator
 
             _module.BeginFunction(_voidType, _module.TypeFunction(_voidType), _structuredBody);
             _module.AddLabel();
+            if (_functionScopeState) DeclareRegisterFiles();
+            EmitInitialState();
+            // Check bounds after initialization, in the same function as the registers.
+            var active = Load(_boolType, _programActive);
+            var execute = _module.AllocateId();
+            var inactive = _module.AllocateId();
+            _module.AddStatement(SpirvOp.SelectionMerge, execute, 0);
+            _module.AddStatement(SpirvOp.BranchConditional, active, execute, inactive);
+            _module.AddLabel(inactive);
+            _module.AddStatement(SpirvOp.Return);
+            _module.AddLabel(execute);
             _structuredDry = false;
             _structuredEmitted = new bool[plan.Blocks.Count];
             _copiedInstructions = 0;

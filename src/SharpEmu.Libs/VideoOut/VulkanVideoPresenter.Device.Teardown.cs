@@ -36,6 +36,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _imageCache.BindlessImageInvalidator = null;
             }
+            DestroyRuntimeDescriptors();
             _bindlessImageHeap?.Dispose();
             _bindlessImageHeap = null;
             _imageCache?.Dispose();
@@ -43,12 +44,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _bufferCache.AsyncReadback?.Dispose();
             _bufferCache.AsyncReadback = null;
             _bufferCache.Dispose();
-            PerfOverlay.SetGuestCacheStatistics(
-                0,
-                0,
-                0,
-                _deviceInfo.LiveAllocations,
-                _deviceInfo.PeakAllocations);
+            PerfOverlay.SetGuestCacheStatistics(0, 0, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);
             _hostBufferPool.Dispose();
             foreach (var guestImageVersion in _guestImageVersions.Values)
             {
@@ -67,7 +63,6 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_device.Handle != 0)
             {
                 _scheduler.Dispose();
-                _deviceInfo.ImageMemory.ReleaseRetained();
                 _deviceInfo.Slabs.Destroy();
                 if (_pipelineCache.Handle != 0)
                 {

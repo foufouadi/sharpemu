@@ -551,20 +551,6 @@ public static partial class AgcExports
                 TraceAgcAllocationFailure(
                     $"agc.cmd_alloc_callback_no_space buf=0x{commandBufferAddress:X16} need={sizeDwords} " +
                     $"up=0x{cursorUp:X16} down=0x{cursorDown:X16} reserved={reservedDwords}");
-                // TEMP DIAG: guest callback state. 0x8009F5750 chains <= 64 chunks (count at +0x900);
-                // 0x800AB4550 pops 64 KiB chunks from a free list at +0xB8 (mode byte at +0xA8).
-                if (_traceAgcAllocationFailures && userData != 0)
-                {
-                    TryReadUInt32(ctx, userData + 0x900, out var chunkCount);
-                    TryReadUInt64(ctx, userData + 0xB8, out var freeList);
-                    TryReadUInt64(ctx, userData + 0xB0, out var usedList);
-                    var mode = TryReadUInt32(ctx, userData + 0xA8, out var modeWord) ? modeWord & 0xFF : 0xFFu;
-                    TraceAgcAllocationFailure(
-                        $"agc.cmd_alloc_callback_state callback=0x{callback:X16} result=0x{callbackResult:X16} " +
-                        $"userdata=0x{userData:X16} count900={chunkCount} mode_a8={mode} " +
-                        $"free_b8=0x{freeList:X16} used_b0=0x{usedList:X16}");
-                }
-
                 return false;
             }
         }

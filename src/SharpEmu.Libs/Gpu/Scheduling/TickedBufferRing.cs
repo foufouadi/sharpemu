@@ -21,9 +21,6 @@ public sealed class TickedBufferRing
 
     public int Count => _buffers.Count;
 
-    // TEMP DIAG: command buffers allocated by every ring, for the periodic memory report.
-    internal static int DiagAllocatedBuffers;
-
     // Reuse a completed buffer or allocate more buffers. Mark it with the current tick without waiting.
     public nint AcquireBuffer()
     {
@@ -74,7 +71,6 @@ public sealed class TickedBufferRing
     {
         var first = _buffers.Count;
         _buffers.AddRange(_device.AllocateBuffers(GrowStep));
-        Interlocked.Add(ref DiagAllocatedBuffers, GrowStep); // TEMP DIAG
         _ticks.AddRange(new ulong[GrowStep]);
         return first;
     }

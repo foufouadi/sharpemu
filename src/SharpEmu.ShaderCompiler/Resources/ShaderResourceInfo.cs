@@ -165,8 +165,7 @@ public sealed class ShaderResourceInfo
     // which costs far more shader code than a binding. Stages past 32 descriptors bind
     // from a descriptor-heap set instead of push descriptors; the device's per-stage limit
     // is checked when the layout is made.
-    public static readonly int MaxBuffers =
-        Environment.GetEnvironmentVariable("SHARPEMU_DIAG_MAX_BUFFERS") is { } limit ? int.Parse(limit) : 256; // TEMP DIAG override
+    public const int MaxBuffers = 256;
     // Bindless material tables select among many descriptors; the host binds each
     // candidate, and the device's per-stage limits are checked when the layout is made.
     public const int MaxImages = 65536;
@@ -187,6 +186,9 @@ public sealed class ShaderResourceInfo
     public bool HasBitwiseExclusiveOr { get; set; }
     public bool UsesDeviceAddresses { get; set; }
 
+    // Some sampled access reads its descriptors through the runtime descriptor table.
+    public bool UsesRuntimeDescriptors { get; set; }
+
     public ShaderResourceInfo Clone() => new()
     {
         Buffers = Buffers.Select(buffer => buffer.Clone()).ToList(),
@@ -201,6 +203,7 @@ public sealed class ShaderResourceInfo
         InstanceOffsetScalarRegister = InstanceOffsetScalarRegister,
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
+        UsesRuntimeDescriptors = UsesRuntimeDescriptors,
     };
 }
 

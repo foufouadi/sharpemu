@@ -196,6 +196,7 @@ public enum SpirvCapability : uint
     Image1D = 44,
     Float16 = 9,
     DenormPreserve = 4464,
+    SignedZeroInfNanPreserve = 4466,
     RoundingModeRTE = 4467,
     Float64 = 10,
     Int64 = 11,
@@ -248,6 +249,7 @@ public enum SpirvExecutionMode : uint
     DepthReplacing = 12,
     LocalSize = 17,
     DenormPreserve = 4459,
+    SignedZeroInfNanPreserve = 4461,
     RoundingModeRTE = 4462,
 }
 
@@ -362,8 +364,6 @@ public sealed class SpirvModuleBuilder
     private readonly List<uint> _typesConstantsGlobals = [];
     private readonly List<uint> _functions = [];
 
-    // TEMP DIAG: words emitted into function bodies so far.
-    public int FunctionWordCount => _functions.Count;
     private readonly Dictionary<(uint Width, bool Signed), uint> _integerTypes = [];
     private readonly Dictionary<uint, uint> _floatTypes = [];
     private readonly Dictionary<(uint Component, uint Count), uint> _vectorTypes = [];

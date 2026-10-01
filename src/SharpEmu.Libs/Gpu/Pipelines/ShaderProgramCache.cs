@@ -217,9 +217,6 @@ internal sealed class ShaderProgramCache
             ShaderCacheCounters.CountProgram();
         }
 
-        if (DescriptorTableDiag.Enabled) DescriptorTableDiag.Report(source.Hash, entry.Plan, inputs, _host); // TEMP DIAG
-        DescriptorTableDiag.ReportAccesses(source.Hash, entry.Plan, inputs, _host); // TEMP DIAG
-
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
@@ -237,6 +234,14 @@ internal sealed class ShaderProgramCache
                 if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
                     throw new ShaderProgramRejectedException(message);
                 throw SubmissionScheduler.Fatal(message);
+            }
+
+            if (_host.RuntimeBufferStridesEnabled)
+            {
+                for (var index = 0; index < specialization.Buffers.Count; index++)
+                {
+                    specialization.Buffers[index] = specialization.Buffers[index].WithoutRuntimeStride();
+                }
             }
         }
 
@@ -482,7 +487,8 @@ internal sealed class ShaderProgramCache
                 BindingLayout.ReadsShaderBase(program),
                 pushDataCursor,
                 usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
-                usesBindlessImages: _host.UsesBindlessImages);
+                usesBindlessImages: _host.UsesBindlessImages,
+                usesRuntimeBufferStrides: _host.RuntimeBufferStridesEnabled);
         }
         catch (ResourcePlanException exception)
         {

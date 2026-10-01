@@ -106,9 +106,6 @@ public static partial class KernelMemoryCompatExports
     private static readonly object _statCacheGate = new();
     private static readonly object _guestMountGate = new();
     private static readonly DirectMemoryAllocationMap _directAllocations = new(GuestMemoryLayout.DirectBytes);
-
-    // TEMP DIAG: direct memory the game holds, for the periodic memory report.
-    internal static ulong DiagDirectAllocatedBytes => GuestMemoryLayout.DirectBytes - _directAllocations.AvailableBytes;
     private static readonly Dictionary<ulong, LibcHeapAllocation> _libcAllocations = new();
     // Keyed by (and kept sorted on) region base address so VirtualQuery can find a
     // containing/next region with a binary search instead of an O(n) scan. Every

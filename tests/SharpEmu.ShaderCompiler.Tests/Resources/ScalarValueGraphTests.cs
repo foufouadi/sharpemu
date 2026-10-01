@@ -436,6 +436,24 @@ public sealed class ScalarValueGraphTests
         Assert.Equal([0x12345678u], table);
     }
 
+    [Theory]
+    [InlineData(0u, 0u, 2u)]
+    [InlineData(1u, 0u, 2u)]
+    [InlineData(0u, 1u, 40u)]
+    public void InactiveVectorWrite_PreservesSavedLane(uint low, uint high, uint lane)
+    {
+        var program = Program(
+            WriteLane(0, vectorRegister: 18, scalarRegister: 84, lane: lane),
+            MoveScalar(8, 126, low),
+            MoveScalar(16, 127, high),
+            Vop1(24, "VMovB32", 18, Gen5Operand.Scalar(0)),
+            ReadLane(28, scalarRegister: 84, vectorRegister: 18, lane: lane),
+            ScalarLoad(36, 84, destination: 4),
+            EndProgram(44));
+        var plan = Extract(program, userDataBase: 84, userDataCount: 2);
+        Assert.Equal(84u, Assert.Single(plan.TableReads).Value.Operands[0].Operands[0].UserDataRegister);
+    }
+
     [Fact]
     public void FullVectorWrite_InvalidatesSavedLanes()
     {

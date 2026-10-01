@@ -31,16 +31,17 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly IGuestBackedSpace _backing;
     private readonly SlotTable<CachedImage> _slots = new();
     private readonly ImageBackingPool? _backingPool;
+    private readonly OptimalImageMemoryPool _imageMemoryPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
     private readonly Dictionary<NullImageKey, ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
     private readonly HashSet<ResourceSlotIdentifier> _scheduledReadbacks = new();
     private readonly SortedDictionary<ulong, SurfaceMetadata> _surfaceMetadata = new();
     private ulong _totalUsedMemory;
+    private long _retiredImageMemoryBytes;
     private ulong _collectionStartBytes;
     private ulong _memoryPressureBytes;
     private ulong _criticalMemoryBytes;
-    private long _pendingPoolReleaseBytes;
     private ulong _collectionTick;
     private bool _allocationCollectionBlocked;
     private bool _collectionThresholdsOverridden;
@@ -66,11 +67,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
         _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
+        _imageMemoryPool = new OptimalImageMemoryPool(device);
     }
 
+    // Set once, from the VRAM free when the device starts: recomputed later, the budget would
+    // count the cache's own images as used memory and shrink as the cache fills.
     private void RefreshCollectionBudget()
     {
-        _device.RefreshMemoryBudget();
         if (_collectionThresholdsOverridden)
         {
             return;
@@ -124,9 +127,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return imageBudget;
     }
 
-    public ulong TotalUsedMemory => _device.ImageMemory.PlacedBytes;
+    public ulong TotalUsedMemory => _totalUsedMemory + (ulong)Interlocked.Read(ref _retiredImageMemoryBytes);
 
-    public ulong TotalAllocatedMemory => _device.ImageMemory.AllocatedBytes;
+    public bool MemoryUnderPressure => CollectionMemoryBytes >= _memoryPressureBytes;
+
+    public bool RetirementOverBudget => Interlocked.Read(ref _retiredImageMemoryBytes) > 256L * 1024 * 1024 ||
+        (Interlocked.Read(ref _retiredImageMemoryBytes) > 0 && CollectionMemoryBytes >= _criticalMemoryBytes);
+
+    public bool ScratchOverBudget => _tiler.ScratchOverBudget;
 
     public int ImageCount => _slots.Count;
 
@@ -169,6 +177,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _disposed = true;
         _slots.ForEach((_, image) => image.Dispose());
         _backingPool?.Dispose();
+        _imageMemoryPool.ReleaseRetained();
         _tiler.Dispose();
         _blit.Dispose();
     }
@@ -319,6 +328,18 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return image;
     }
 
+    public CachedImage AcquireStencilStorageImage(ResourceSlotIdentifier imageIdentifier, uint width, uint height)
+    {
+        using var held = _lock.Hold();
+        var attachment = _slots[imageIdentifier];
+        TouchImage(attachment);
+        CollectForAllocation((ulong)width * height * attachment.Backing.Layers);
+        var before = attachment.AccountedSize;
+        var storage = attachment.GetOrCreateStencilStorageImage(width, height);
+        _totalUsedMemory += attachment.AccountedSize - before;
+        return storage;
+    }
+
     public ImageView AcquireTextureView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageAcquire);
@@ -451,12 +472,45 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         if (request.Description.HasStencil)
         {
+            if (image.Description.HasStencil && image.Description.Stencil != request.Description.Stencil)
+            {
+                ReleaseStencilPlane(imageIdentifier, image);
+            }
+
             image.Description.Stencil = request.Description.Stencil;
             RefreshStencilPlane(imageIdentifier, image, request.Description.Metadata.StencilCompressed);
         }
 
         TakeGpuOwnership(image);
         return image.GetOrCreateView(request.View);
+    }
+
+    // The depth image holds one guest stencil plane at a time. Before it takes another one (a
+    // title that alternates stencil buffers under one depth buffer), the plane it holds goes
+    // back to guest memory when the GPU changed it, and its association is dropped, so a view
+    // of that plane reads guest memory instead of the depth image's new plane.
+    private void ReleaseStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth)
+    {
+        var plane = depth.Description.Stencil;
+        var associations = new List<ResourceSlotIdentifier>();
+        foreach (var imageIdentifier in FindImagesInRange(plane.Address, plane.Size, pageOverlap: false))
+        {
+            if (_slots.TryGet(imageIdentifier) is { } candidate && candidate.DepthOwner == depthIdentifier)
+            {
+                associations.Add(imageIdentifier);
+            }
+        }
+
+        if (associations.Any(association => _slots[association].IsGpuModified))
+        {
+            WriteBackStencilPlane(depth, plane);
+        }
+
+        foreach (var association in associations)
+        {
+            _slots[association].ClearGpuModified();
+            DeleteImage(association);
+        }
     }
 
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
@@ -575,7 +629,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
         var requiredBytes = (description.Data.Size + 1023) & ~1023UL;
         CollectForAllocation(requiredBytes);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool));
+        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory));
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

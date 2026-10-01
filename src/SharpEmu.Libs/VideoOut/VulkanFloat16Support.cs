@@ -7,7 +7,8 @@ namespace SharpEmu.Libs.VideoOut;
 
 // Whether a device can run f16<->f32 conversions natively with the hardware's results:
 // shaderFloat16, plus round-to-nearest-even and denormal preservation for 16-bit floats
-// (float controls). Shaders then convert with OpFConvert instead of integer sequences.
+// (float controls), including signed zero, infinity and NaN preservation. Shaders can
+// then use both native conversions and fused half arithmetic with explicit float controls.
 public static unsafe class VulkanFloat16Support
 {
     public static bool SupportsExactConversions(Vk vk, PhysicalDevice physical)
@@ -35,6 +36,7 @@ public static unsafe class VulkanFloat16Support
         vk.GetPhysicalDeviceProperties2(physical, &properties);
         return float16Features.ShaderFloat16 &&
             floatControls.ShaderRoundingModeRtefloat16 &&
-            floatControls.ShaderDenormPreserveFloat16;
+            floatControls.ShaderDenormPreserveFloat16 &&
+            floatControls.ShaderSignedZeroInfNanPreserveFloat16;
     }
 }

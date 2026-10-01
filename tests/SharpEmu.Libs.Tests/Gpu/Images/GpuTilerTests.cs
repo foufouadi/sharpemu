@@ -307,13 +307,13 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
             harness.Stream.Commit();
         });
         using var retention = harness.Stream.RetainContents();
-        var baseline = LiveBuffers(harness);
+        var baseline = harness.Device.LiveAllocations;
         harness.Run(() =>
         {
             harness.Tiler.Tile(linear.Handle, 0, linear.Size, tiled.Handle, 0, tiled.Size, [tilerCase.Transfer]);
-            Assert.Equal(baseline + 1, LiveBuffers(harness));
+            Assert.Equal(baseline + 1, harness.Device.LiveAllocations);
             harness.Scheduler.Finish();
-            Assert.Equal(baseline, LiveBuffers(harness));
+            Assert.Equal(baseline, harness.Device.LiveAllocations);
             Assert.False(harness.Stream.Mapped.ContainsAnyExcept((byte)0xA5));
         });
         Assert.Equal(tilerCase.Tiled, harness.ReadBack(tiled.Handle, 0, tiled.Size));
@@ -452,9 +452,4 @@ public sealed class GpuTilerTests : IClassFixture<HeadlessVulkanFixture>
         Assert.Contains(fatal.Messages, message => message.Contains("swap input size is invalid"));
         harness.AssertNoValidationMessages();
     }
-
-    // Driver allocations plus buffers placed in the device's buffer pool, less the pool's
-    // blocks: one per live buffer, however it is backed.
-    private static int LiveBuffers(ImageTestHarness harness) =>
-        (int)harness.Device.LiveAllocations - harness.Device.BufferMemory.Blocks + harness.Device.BufferMemory.Placements;
 }

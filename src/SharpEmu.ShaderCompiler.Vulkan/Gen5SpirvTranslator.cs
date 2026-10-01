@@ -289,9 +289,10 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 var blocks = BuildBasicBlocks(_request.Program.Instructions);
-                // Our structured body runs in its own function, so the register files stay module-scope
-                // Private globals that both main and the body can reach.
-                _functionScopeState = false;
+                // Initialize registers in the function that executes the program.
+                // The title-state diagnostic reads registers from the wrapper as well.
+                _functionScopeState = !(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
+                    _request.Program.Address == 0x0000000500781200ul);
                 DeclareModule();
                 if (blocks.Count == 0)
                 {
@@ -299,12 +300,14 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+                PrepareControlFlow(blocks);
+
 
                 var functionType = _module.TypeFunction(_voidType);
                 var main = _module.BeginFunction(_voidType, functionType);
                 _module.AddName(main, "main");
                 _module.AddLabel();
-                if (_functionScopeState)
+                if (_functionScopeState && _structuredPlan is null)
                 {
                     DeclareRegisterFiles();
                 }
@@ -335,12 +338,14 @@ public static partial class Gen5SpirvTranslator
                     _module.AddStatement(SpirvOp.Return);
                     _module.AddLabel();
                 }
-                EmitInitialState();
+                if (_structuredPlan is null) EmitInitialState();
 
                 if (!TryEmitControlFlow(blocks, out error))
                 {
                     return false;
                 }
+
+                FlushPendingDeviceFaults();
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -412,6 +417,9 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+
+
+
                 var model = _stage switch
                 {
                     Gen5SpirvStage.Vertex => SpirvExecutionModel.Vertex,
@@ -425,6 +433,7 @@ public static partial class Gen5SpirvTranslator
                     // the hardware does.
                     _module.AddExecutionMode(main, SpirvExecutionMode.RoundingModeRTE, 16);
                     _module.AddExecutionMode(main, SpirvExecutionMode.DenormPreserve, 16);
+                    _module.AddExecutionMode(main, SpirvExecutionMode.SignedZeroInfNanPreserve, 16);
                 }
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
@@ -468,6 +477,7 @@ public static partial class Gen5SpirvTranslator
             {
                 _module.AddCapability(SpirvCapability.Float16);
                 _module.AddCapability(SpirvCapability.DenormPreserve);
+                _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
                 _module.AddCapability(SpirvCapability.RoundingModeRTE);
             }
             _module.AddCapability(SpirvCapability.ImageQuery);
@@ -516,7 +526,7 @@ public static partial class Gen5SpirvTranslator
 
             var scalarArrayType = _module.TypeArray(_uintType, ScalarRegisterCount);
             var vectorArrayType = _module.TypeArray(_uintType, VectorRegisterCount);
-            // The register files are variables of main, declared when main begins (see
+            // Register files belong to the function executing the program (see
             // DeclareRegisterFiles). As Private globals, a file the driver fully promotes to
             // registers stays behind as an unused .bss global, and AMD's driver crashes
             // linking two stages that both carry one.
@@ -525,11 +535,21 @@ public static partial class Gen5SpirvTranslator
             var registerStorage = _functionScopeState ? SpirvStorageClass.Function : SpirvStorageClass.Private;
             _functionUintPointer = _module.TypePointer(registerStorage, _uintType);
             _functionVec2Pointer = _module.TypePointer(registerStorage, _vec2Type);
-            // The per-invocation state (SCC, VCC, EXEC, the block dispatcher's counters) also
-            // lives in main: an unused Private global in a fragment shader crashes AMD's
+            // The per-invocation state (SCC, VCC, the block dispatcher's counters) also
+            // lives in that function: an unused Private global in a fragment shader crashes AMD's
             // driver when it links the stages (seen with the dispatcher guard of a shader
             // that no longer needs the dispatcher).
             _functionBoolPointer = _module.TypePointer(registerStorage, _boolType);
+            // Only fragment validity is shared with the entry-point wrapper.
+            var validityPointer = _module.TypePointer(SpirvStorageClass.Private, _boolType);
+            _exec = _module.AddGlobalVariable(validityPointer, SpirvStorageClass.Private, _module.ConstantBool(true));
+            _interfaces.Add(_exec);
+            if (_usesPixelValidMask)
+            {
+                _pixelValidMaskActive = _module.AddGlobalVariable(validityPointer, SpirvStorageClass.Private, _module.ConstantBool(true));
+                _interfaces.Add(_pixelValidMaskActive);
+                _module.AddName(_pixelValidMaskActive, "pixelValidMaskActive");
+            }
             if (!_functionScopeState)
             {
                 DeclareRegisterFiles();
@@ -1513,8 +1533,6 @@ public static partial class Gen5SpirvTranslator
                     }
                 }
 
-                var wordsBefore = _module.FunctionWordCount;
-                _emitPath = string.Empty;
                 _execKnownFull = IsExecKnownFull(instruction.Pc);
                 var emitted = TryEmitInstruction(instruction, out error);
                 _execKnownFull = false;
@@ -1522,14 +1540,6 @@ public static partial class Gen5SpirvTranslator
                 {
                     error = $"pc=0x{instruction.Pc:X} {instruction.Opcode}: {error}";
                     return false;
-                }
-
-                // TEMP DIAG: SPIR-V cost of each buffer instruction and the lowering it took.
-                if (TraceEmitCost && (_emitPath.Length != 0 || _module.FunctionWordCount - wordsBefore >= 200))
-                {
-                    Console.Error.WriteLine(
-                        $"[SHADER][EMIT_COST] program=0x{_request.Program.Address:X} pc=0x{instruction.Pc:X} " +
-                        $"opcode={instruction.Opcode} path={(_emitPath.Length == 0 ? "-" : _emitPath)} words={_module.FunctionWordCount - wordsBefore}");
                 }
 
                 CapturePixelVgprs(instruction);
@@ -1813,37 +1823,11 @@ public static partial class Gen5SpirvTranslator
             return condition != 0;
         }
 
-        // TEMP DIAG: SHARPEMU_DIAG_PROBE="probePc:r0,r1,r2,r3@storePc" (hex PCs, decimal VGPRs).
-        // Before probePc, copies the four VGPRs to v500..v503; before the ImageStore at storePc,
-        // copies them back into v0..v3, so that store writes the probed values.
-        private static readonly string? DiagProbe = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_PROBE");
-
-        private void EmitDiagProbe(Gen5ShaderInstruction instruction)
-        {
-            if (string.IsNullOrEmpty(DiagProbe)) return;
-            var at = DiagProbe.Split('@');
-            var head = at[0].Split(':');
-            var probePc = Convert.ToUInt32(head[0], 16);
-            var storePc = Convert.ToUInt32(at[1], 16);
-            if (!_request.Program.Instructions.Any(i => i.Pc == storePc && i.Opcode == "ImageStore")) return;
-            if (instruction.Pc == probePc)
-            {
-                var registers = head[1].Split(',').Select(uint.Parse).ToArray();
-                for (var i = 0; i < 4; i++) StoreV(500u + (uint)i, LoadV(registers[i]), guardWithExec: false);
-            }
-
-            if (instruction.Pc == storePc)
-            {
-                for (var i = 0u; i < 4; i++) StoreV(i, LoadV(500u + i), guardWithExec: false);
-            }
-        }
-
         private bool TryEmitInstruction(
             Gen5ShaderInstruction instruction,
             out string error)
         {
             error = string.Empty;
-            EmitDiagProbe(instruction); // TEMP DIAG
             // No shader trap handler is installed, so S_TRAP has no effect.
             if (instruction.Opcode == "STrap")
             {
@@ -2805,12 +2789,6 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (control.Typed && instruction.Opcode.Contains("D16", StringComparison.Ordinal))
-            {
-                error = $"unsupported buffer opcode {instruction.Opcode}";
-                return false;
-            }
-
             if (_stage == Gen5SpirvStage.Vertex &&
                 _vertexInputsByPc.TryGetValue(instruction.Pc, out var vertexInput))
             {
@@ -2819,7 +2797,6 @@ public static partial class Gen5SpirvTranslator
 
             if (_request.Memory.Find(instruction.Pc) is { DeviceDescriptor: true })
             {
-                _emitPath = "device-descriptor";
                 return TryEmitDeviceDescriptorBufferMemory(instruction, control, out error);
             }
 
@@ -2832,7 +2809,6 @@ public static partial class Gen5SpirvTranslator
                     // shader.  Its descriptor is supplied by the continuation
                     // object and is intentionally absent from this plan; keep
                     // the dead linear instruction side-effect free.
-                    _emitPath = "planning-only";
                     return true;
                 }
 
@@ -2843,15 +2819,11 @@ public static partial class Gen5SpirvTranslator
                     ?? BufferLoweringStrategy.NativeBinding;
                 if (strategy == BufferLoweringStrategy.PhysicalStorageBuffer)
                 {
-                    _emitPath = "physical";
                     return TryEmitPhysicalStorageBufferMemory(instruction, control, out error);
                 }
 
                 if (strategy == BufferLoweringStrategy.BoundedCandidateTable)
                 {
-                    _emitPath = _request.BufferCandidateTableByMemoryIndex.TryGetValue(accessMemoryIndex, out var traced)
-                        ? $"candidates:{traced.CandidateCount}"
-                        : "candidates:none";
                     return TryEmitBoundedCandidateTableMemory(instruction, control, accessMemoryIndex, out error);
                 }
             }
@@ -2862,7 +2834,6 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            _emitPath = "binding";
             return EmitResolvedBufferMemory(instruction, control, bindingIndex, out error);
         }
 
@@ -2884,7 +2855,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var specialized = info.Buffers[bindingIndex];
-            var stride = UInt(specialized.PackedStride & 0x3FFF);
+            var stride = control.IndexEnabled ? BufferStride(bindingIndex, specialized.PackedStride) : UInt(0);
             var descriptorFormat = specialized.DescriptorFormat;
             var descriptorWord3 = UInt((specialized.DescriptorFormat << 12) | (specialized.DescriptorSwizzle & 0xFFF));
 
@@ -3042,8 +3013,7 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode is "BufferStoreFormatX" or "BufferStoreFormatXy" or
-                "BufferStoreFormatXyz" or "BufferStoreFormatXyzw" or "BufferStoreFormatD16HiX")
+            if (instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
             {
                 if (descriptorFormat == 0)
                 {
@@ -3146,7 +3116,8 @@ public static partial class Gen5SpirvTranslator
                             descriptorFormat,
                             specialized.DescriptorSwizzle & 0xFFF,
                             control.VectorData,
-                            control.DwordCount);
+                            control.ComponentCount,
+                            control.PackedD16);
                         return true;
                     }
 
@@ -3155,7 +3126,8 @@ public static partial class Gen5SpirvTranslator
                         byteAddress,
                         descriptorWord3,
                         control.VectorData,
-                        control.DwordCount);
+                        control.ComponentCount,
+                        control.PackedD16);
                     return true;
                 }
 
@@ -3191,20 +3163,12 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             if (!_request.BufferCandidateTableByMemoryIndex.TryGetValue(memoryIndex, out var table))
             {
-                // A formatted load needs a statically known Vulkan view format.  Most
-                // runtime V#s prove a bounded SRT candidate set above, but a few Yotei
-                // material-lookup paths merge descriptors through control flow and have
-                // no finite, safe candidate table.  Do not reinterpret an arbitrary
-                // device address with a guessed format: a null read is the defined
-                // fallback, matching the bindless-image fallback in ResourceTracker.
+                // Untyped formatted loads carry their complete format and swizzle
+                // in the runtime V#. Decode those exact words through the page table
+                // when no bounded native candidate set exists.
                 if (instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal))
                 {
-                    for (uint index = 0; index < control.DwordCount; index++)
-                    {
-                        StoreV(control.VectorData + index, UInt(0));
-                    }
-
-                    return true;
+                    return TryEmitDeviceDescriptorBufferMemory(instruction, control, out error);
                 }
 
                 error = $"runtime buffer descriptor has no candidate table for {instruction.Opcode}";
@@ -3313,13 +3277,6 @@ public static partial class Gen5SpirvTranslator
             byteAddress = IAdd(byteAddress, vectorOffset);
             byteAddress = IAdd(byteAddress, _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
 
-            // TEMP DIAG: measures the compile cost of these loads by leaving them out.
-            if (IsFormatBufferLoad(instruction.Opcode) && Environment.GetEnvironmentVariable("SHARPEMU_DIAG_SKIP_DEVICE_FORMAT_LOADS") == "1")
-            {
-                for (uint index = 0; index < control.DwordCount; index++) StoreV(control.VectorData + index, LoadDeviceBufferWord(baseAddress, size, byteAddress));
-                return true;
-            }
-
             if (IsFormatBufferLoad(instruction.Opcode))
             {
                 EmitDeviceBufferFormatLoad(
@@ -3328,12 +3285,12 @@ public static partial class Gen5SpirvTranslator
                     byteAddress,
                     descriptorWord3,
                     control.VectorData,
-                    control.DwordCount);
+                    control.ComponentCount,
+                    control.PackedD16);
                 return true;
             }
 
-            if (instruction.Opcode is "BufferStoreFormatX" or "BufferStoreFormatXy" or
-                "BufferStoreFormatXyz" or "BufferStoreFormatXyzw" or "BufferStoreFormatD16HiX")
+            if (instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
             {
                 var storeHighHalf = instruction.Opcode == "BufferStoreFormatD16HiX";
                 EmitExecConditional(() => EmitDeviceBufferFormatStore(baseAddress, size, byteAddress, descriptorWord3, control, storeHighHalf));
@@ -3533,8 +3490,19 @@ public static partial class Gen5SpirvTranslator
             Gen5BufferMemoryControl control,
             bool d16High = false)
         {
+            // Each runtime format only encodes the element into the store scratch; the masked
+            // writes, with their page walks and atomic merges, are emitted once for all formats.
+            // Emitting them inside every format's branch multiplied them by the ~90 formats, and
+            // the driver's compile time grows with that many atomic loops (minutes per shader).
             var unifiedFormat = BitwiseAnd(ShiftRightLogical(descriptorWord3, UInt(12)), UInt(0x7F));
             var elementAddress = And64(IAdd64(baseAddress, Widen(byteAddress)), ULong(DeviceAddressMask));
+            for (var index = 0; index < _deviceStoreMaskScratch.Length; index++)
+            {
+                Store(_deviceStoreMaskScratch[index], UInt(0));
+            }
+
+            Store(_deviceStoreBytesScratch, UInt(0));
+            var maxDwords = 0;
             for (uint format = 1; format <= 0x7F; format++)
             {
                 if (!Gfx10UnifiedFormat.TryDecode(format, out var dataFormat, out var numberFormat))
@@ -3542,17 +3510,23 @@ public static partial class Gen5SpirvTranslator
                     continue;
                 }
 
-                var componentCount = Math.Min(control.DwordCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
+                var componentCount = Math.Min(control.ComponentCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
                 if (componentCount == 0)
                 {
                     continue;
                 }
 
                 var elementBytes = Gfx10UnifiedFormat.GetAccessByteSize(dataFormat, componentCount);
+                var elementDwords = (int)((elementBytes + 3) / 4);
+                if (elementDwords > _deviceStoreMaskScratch.Length)
+                {
+                    throw new InvalidOperationException($"A typed buffer element spans {elementDwords} dwords.");
+                }
+
+                maxDwords = Math.Max(maxDwords, elementDwords);
                 EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, unifiedFormat, UInt(format)), () =>
                 {
-                    var allowed = IsDeviceBufferByteRangeInRange(size, byteAddress, elementBytes);
-                    var element = new (uint Value, uint Mask)[(elementBytes + 3) / 4];
+                    var element = new (uint Value, uint Mask)[elementDwords];
                     for (var index = 0; index < element.Length; index++)
                     {
                         element[index] = (UInt(0), 0);
@@ -3561,7 +3535,7 @@ public static partial class Gen5SpirvTranslator
                     for (uint component = 0; component < componentCount; component++)
                     {
                         Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out var bitOffset, out var bitCount);
-                        var encoded = EncodeGfx10BufferComponent(StoreFormatRegister(LoadV(control.VectorData + component), numberFormat, d16High), bitCount, numberFormat, dataFormat);
+                        var encoded = EncodeGfx10BufferComponent(LoadFormatStoreComponent(control, component, numberFormat, d16High), bitCount, numberFormat, dataFormat);
                         var dword = (int)(byteOffset / 4);
                         var bit = ((byteOffset & 3) * 8) + bitOffset;
                         var componentMask = bitCount == 32 ? uint.MaxValue : ((1u << (int)bitCount) - 1) << (int)bit;
@@ -3571,34 +3545,44 @@ public static partial class Gen5SpirvTranslator
 
                     for (var index = 0; index < element.Length; index++)
                     {
-                        if (element[index].Mask != 0)
-                        {
-                            StoreDeviceMaskedBits(
-                                index == 0 ? elementAddress : IAdd64(elementAddress, ULong((ulong)index * sizeof(uint))),
-                                element[index].Value,
-                                element[index].Mask,
-                                allowed);
-                        }
+                        Store(_deviceStoreValueScratch[index], BitwiseAnd(element[index].Value, UInt(element[index].Mask)));
+                        Store(_deviceStoreMaskScratch[index], UInt(element[index].Mask));
                     }
+
+                    Store(_deviceStoreBytesScratch, UInt(elementBytes));
                 });
+            }
+
+            // An unknown format stores nothing: its byte count stays zero.
+            var bytes = Load(_uintType, _deviceStoreBytesScratch);
+            var allowed = LogicalAnd(
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, bytes, UInt(0)),
+                ULessThan64(IAdd64(Widen(byteAddress), Widen(_module.AddInstruction(SpirvOp.ISub, _uintType, bytes, UInt(1)))), size));
+            for (var index = 0; index < maxDwords; index++)
+            {
+                StoreDeviceMaskedBits(
+                    index == 0 ? elementAddress : IAdd64(elementAddress, ULong((ulong)index * sizeof(uint))),
+                    Load(_uintType, _deviceStoreValueScratch[index]),
+                    Load(_uintType, _deviceStoreMaskScratch[index]),
+                    allowed);
             }
         }
 
         // Writes the masked bits of one element dword at a byte address that need not be
-        // dword aligned; bits past the aligned dword carry into the next one.
-        private void StoreDeviceMaskedBits(uint address64, uint value, uint mask, uint allowed)
+        // dword aligned, with a mask known only at run time; `value` holds no bits outside it.
+        private void StoreDeviceMaskedBits(uint address64, uint value, uint maskValue, uint allowed)
         {
             var alignment = Narrow(And64(address64, ULong(3)));
             var aligned = And64(address64, ULong(~3ul));
             var shift = ShiftLeftLogical(alignment, UInt(3));
-            var maskedValue = BitwiseAnd(value, UInt(mask));
-            StoreDeviceMaskedWord(aligned, ShiftLeftLogical(maskedValue, shift), ShiftLeftLogical(UInt(mask), shift), allowed);
+            StoreDeviceMaskedWord(aligned, ShiftLeftLogical(value, shift), ShiftLeftLogical(maskValue, shift), allowed);
             var unaligned = _module.AddInstruction(SpirvOp.INotEqual, _boolType, alignment, UInt(0));
             var carryShift = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(32), shift);
-            var carryValue = _module.AddInstruction(SpirvOp.Select, _uintType, unaligned, ShiftRightLogical(maskedValue, carryShift), UInt(0));
-            var carryMask = _module.AddInstruction(SpirvOp.Select, _uintType, unaligned, ShiftRightLogical(UInt(mask), carryShift), UInt(0));
+            var carryValue = _module.AddInstruction(SpirvOp.Select, _uintType, unaligned, ShiftRightLogical(value, carryShift), UInt(0));
+            var carryMask = _module.AddInstruction(SpirvOp.Select, _uintType, unaligned, ShiftRightLogical(maskValue, carryShift), UInt(0));
             StoreDeviceMaskedWord(IAdd64(aligned, ULong(4)), carryValue, carryMask, allowed);
         }
+
 
         private void EmitDeviceBufferFormatLoad(
             uint baseAddress,
@@ -3606,15 +3590,14 @@ public static partial class Gen5SpirvTranslator
             uint byteAddress,
             uint descriptorWord3,
             uint vectorData,
-            uint componentCount)
+            uint componentCount,
+            bool packedD16 = false)
         {
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
                 UInt(0x7F));
             var (dataFormat, numberFormat) = DecodeGfx10BufferFormat(unifiedFormat);
 
-            // The element spans at most 16 bytes; read its aligned dwords once and take
-            // every component from them instead of reading memory per component byte.
             // The element spans at most 16 bytes; read its aligned dwords once and take
             // every component from them instead of reading memory per component byte.
             var window = new uint[5];
@@ -3624,6 +3607,32 @@ public static partial class Gen5SpirvTranslator
                 window[index] = LoadDeviceBufferWord(baseAddress, size, index == 0 ? alignedStart : IAdd(alignedStart, UInt((uint)index * sizeof(uint))));
             }
 
+            // For a partial vector, select its source layout before conversion. A
+            // dynamic swizzle does not require converting the unrequested channels.
+            if (componentCount < 4)
+            {
+                var values = new uint[componentCount];
+                var constants = new uint[componentCount];
+                var allInBounds = _module.ConstantBool(true);
+                var oneValue = Gfx10FormatOne(numberFormat);
+                for (uint destination = 0; destination < componentCount; destination++)
+                {
+                    var selector = BitwiseAnd(ShiftRightLogical(descriptorWord3, UInt(destination * 3)), UInt(7));
+                    var component = BitwiseAnd(selector, UInt(3));
+                    var isMemory = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, selector, UInt(4));
+                    var value = LoadGfx10DeviceBufferFormatComponent(window, size, byteAddress,
+                        dataFormat, numberFormat, component, out var selectedInBounds);
+                    constants[destination] = SelectUInt(selector, 1, oneValue, UInt(0));
+                    values[destination] = _module.AddInstruction(SpirvOp.Select, _uintType,
+                        isMemory, value, constants[destination]);
+                    allInBounds = LogicalAnd(allInBounds, _module.AddInstruction(SpirvOp.Select,
+                        _boolType, isMemory, selectedInBounds, _module.ConstantBool(true)));
+                }
+                for (uint destination = 0; destination < componentCount; destination++)
+                    StoreFormattedBufferComponent(vectorData, destination, _module.AddInstruction(SpirvOp.Select,
+                        _uintType, allInBounds, values[destination], constants[destination]), numberFormat, packedD16);
+                return;
+            }
             var canonical = new uint[4];
             var componentBounds = new uint[4];
             for (var component = 0; component < canonical.Length; component++)
@@ -3634,7 +3643,7 @@ public static partial class Gen5SpirvTranslator
                     byteAddress,
                     dataFormat,
                     numberFormat,
-                    component,
+                    UInt((uint)component),
                     out componentBounds[component]);
             }
 
@@ -3670,9 +3679,8 @@ public static partial class Gen5SpirvTranslator
                 value = SelectUInt(selector, 5, canonical[1], value);
                 value = SelectUInt(selector, 6, canonical[2], value);
                 value = SelectUInt(selector, 7, canonical[3], value);
-                StoreV(
-                    vectorData + destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant));
+                StoreFormattedBufferComponent(vectorData, destination,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant), numberFormat, packedD16);
             }
         }
 
@@ -3682,26 +3690,11 @@ public static partial class Gen5SpirvTranslator
             uint elementAddress,
             uint dataFormat,
             uint numberFormat,
-            int component,
+            uint component,
             out uint componentInBounds)
         {
-            var byteOffset = UInt(0);
-            var bitOffset = UInt(0);
-            var bitCount = UInt(0);
+            var (byteOffset, bitOffset, bitCount) = DecodeGfx10ComponentLayout(dataFormat, component);
 
-            void SetLayout(uint format, uint bytes, uint bits, uint count)
-            {
-                var matches = _module.AddInstruction(SpirvOp.IEqual, _boolType, dataFormat, UInt(format));
-                byteOffset = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(bytes), byteOffset);
-                bitOffset = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(bits), bitOffset);
-                bitCount = _module.AddInstruction(SpirvOp.Select, _uintType, matches, UInt(count), bitCount);
-            }
-
-            foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
-            {
-                if (layout.Component == (uint)component)
-                    SetLayout(layout.DataFormat, layout.ByteOffset, layout.BitOffset, layout.BitCount);
-            }
 
             var componentAddress = IAdd(elementAddress, byteOffset);
             var componentBytes = ShiftRightLogical(IAdd(IAdd(bitOffset, bitCount), UInt(7)), UInt(3));
@@ -3742,7 +3735,7 @@ public static partial class Gen5SpirvTranslator
                 _uintType,
                 valid,
                 converted,
-                component == 3 ? Gfx10FormatOne(numberFormat) : UInt(0));
+                SelectUInt(component, 3, Gfx10FormatOne(numberFormat), UInt(0)));
         }
 
         private void EmitBufferFormatLoad(
@@ -3750,7 +3743,8 @@ public static partial class Gen5SpirvTranslator
             uint byteAddress,
             uint descriptorWord3,
             uint vectorData,
-            uint componentCount)
+            uint componentCount,
+            bool packedD16 = false)
         {
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
@@ -3800,9 +3794,8 @@ public static partial class Gen5SpirvTranslator
                 value = SelectUInt(selector, 5, canonical[1], value);
                 value = SelectUInt(selector, 6, canonical[2], value);
                 value = SelectUInt(selector, 7, canonical[3], value);
-                StoreV(
-                    vectorData + destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant));
+                StoreFormattedBufferComponent(vectorData, destination,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant), numberFormat, packedD16);
             }
         }
 
@@ -3815,7 +3808,8 @@ public static partial class Gen5SpirvTranslator
             uint unifiedFormat,
             uint swizzle,
             uint vectorData,
-            uint componentCount)
+            uint componentCount,
+            bool packedD16 = false)
         {
             Gfx10UnifiedFormat.TryDecode(unifiedFormat & 0x7F, out var dataFormat, out var numberFormat);
             var one = UInt(numberFormat is 4 or 5 ? 1u : 0x3F800000u);
@@ -3843,8 +3837,27 @@ public static partial class Gen5SpirvTranslator
                 var value = selector >= 4
                     ? _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, canonical[selector - 4], constant)
                     : constant;
-                StoreV(vectorData + destination, value);
+                StoreFormattedBufferComponent(vectorData, destination, value, UInt(numberFormat), packedD16);
             }
+        }
+
+        private void StoreFormattedBufferComponent(uint vectorData, uint component, uint value, uint numberFormat, bool packedD16)
+        {
+            if (!packedD16)
+            {
+                StoreV(vectorData + component, value);
+                return;
+            }
+            var integer = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(4)),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(5)));
+            var pair = _module.AddInstruction(SpirvOp.CompositeConstruct, _vec2Type,
+                Bitcast(_floatType, value), Float(0));
+            var half = _module.AddInstruction(SpirvOp.Select, _uintType, integer,
+                BitwiseAnd(value, UInt(0xFFFF)), BitwiseAnd(Ext(58, _uintType, pair), UInt(0xFFFF)));
+            var register = vectorData + component / 2;
+            StoreV(register, (component & 1) == 0 ? half
+                : BitwiseOr(BitwiseAnd(LoadV(register), UInt(0xFFFF)), ShiftLeftLogical(half, UInt(16))));
         }
 
         // LoadGfx10BufferFormatComponent for a known data and number format.
@@ -3961,10 +3974,10 @@ public static partial class Gen5SpirvTranslator
                 IsBufferElementInRange(
                     bindingIndex,
                     byteAddress,
-                    UInt(Gfx10UnifiedFormat.GetAccessByteSize(dataFormat, control.DwordCount) - 1)));
+                    UInt(Gfx10UnifiedFormat.GetAccessByteSize(dataFormat, control.ComponentCount) - 1)));
             var dataFormatId = UInt(dataFormat);
             var numberFormatId = UInt(numberFormat);
-            for (uint destination = 0; destination < control.DwordCount; destination++)
+            for (uint destination = 0; destination < control.ComponentCount; destination++)
             {
                 var value = destination >= componentCount ? UInt(0)
                     : _request.ForceGenericBufferFormats
@@ -3976,9 +3989,8 @@ public static partial class Gen5SpirvTranslator
                             (int)destination,
                             out _)
                         : LoadStaticBufferFormatComponent(bindingIndex, byteAddress, dataFormat, numberFormat, destination, out _);
-                StoreV(
-                    control.VectorData + destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, valid, value, UInt(0)));
+                StoreFormattedBufferComponent(control.VectorData, destination,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, valid, value, UInt(0)), numberFormatId, control.PackedD16);
             }
 
             return true;
@@ -3999,7 +4011,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var componentCount = Math.Min(control.DwordCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
+            var componentCount = Math.Min(control.ComponentCount, Gfx10UnifiedFormat.ComponentCount(dataFormat));
             if (componentCount == 0)
             {
                 return false;
@@ -4023,7 +4035,7 @@ public static partial class Gen5SpirvTranslator
                         StoreBufferWord(
                             bindingIndex,
                             byteOffset == 0 ? dwordAddress : IAdd(dwordAddress, UInt(byteOffset / 4)),
-                            StoreFormatRegister(LoadV(control.VectorData + component), numberFormat, d16High));
+                            LoadFormatStoreComponent(control, component, numberFormat, d16High));
                     }
 
                     return;
@@ -4039,7 +4051,7 @@ public static partial class Gen5SpirvTranslator
                 {
                     Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, component, out var byteOffset, out var bitOffset, out var bitCount);
                     var encoded = EncodeGfx10BufferComponent(
-                        StoreFormatRegister(LoadV(control.VectorData + component), numberFormat, d16High),
+                        LoadFormatStoreComponent(control, component, numberFormat, d16High),
                         bitCount,
                         numberFormat,
                         dataFormat);
@@ -4058,14 +4070,21 @@ public static partial class Gen5SpirvTranslator
 
         // A D16_HI store takes its component from the register's high half: a half float
         // for float and normalized formats, a 16-bit integer otherwise.
-        private uint StoreFormatRegister(uint register, uint numberFormat, bool d16High)
+        private uint LoadFormatStoreComponent(Gen5BufferMemoryControl control, uint component, uint numberFormat, bool d16High)
         {
-            if (!d16High)
+            var register = control.VectorData + (control.PackedD16 ? component / 2 : component);
+            return StoreFormatRegister(LoadV(register), numberFormat,
+                control.PackedD16 ? (component & 1) != 0 : d16High, control.PackedD16);
+        }
+
+        private uint StoreFormatRegister(uint register, uint numberFormat, bool d16High, bool packedD16 = false)
+        {
+            if (!d16High && !packedD16)
             {
                 return register;
             }
 
-            var half = ShiftRightLogical(register, UInt(16));
+            var half = d16High ? ShiftRightLogical(register, UInt(16)) : BitwiseAnd(register, UInt(0xFFFF));
             return numberFormat switch
             {
                 4 => half,
@@ -4282,6 +4301,38 @@ public static partial class Gen5SpirvTranslator
                     UInt(0xFF)));
         }
 
+        private uint _gfx10ComponentLayoutTable;
+
+        // Decoded GFX10 data formats occupy four bits. Keep component selection dynamic
+        // without expanding the entire format catalogue at every load instruction.
+        private (uint ByteOffset, uint BitOffset, uint BitCount) DecodeGfx10ComponentLayout(uint dataFormat, int component)
+            => DecodeGfx10ComponentLayout(dataFormat, UInt((uint)component));
+
+        private (uint ByteOffset, uint BitOffset, uint BitCount) DecodeGfx10ComponentLayout(uint dataFormat, uint component)
+        {
+            if (_gfx10ComponentLayoutTable == 0)
+            {
+                var values = new uint[16 * 4];
+                foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
+                    values[layout.DataFormat * 4 + layout.Component] =
+                        layout.ByteOffset | (layout.BitOffset << 8) | (layout.BitCount << 16);
+                var entries = values.Select(UInt).ToArray();
+                var type = _module.TypeArray(_uintType, (uint)entries.Length);
+                _gfx10ComponentLayoutTable = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, type), SpirvStorageClass.Private,
+                    _module.ConstantComposite(type, entries));
+                _module.AddName(_gfx10ComponentLayoutTable, "gfx10ComponentLayouts");
+                _interfaces.Add(_gfx10ComponentLayoutTable);
+            }
+            var index = IAdd(ShiftLeftLogical(dataFormat, UInt(2)), component);
+            var pointer = _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer,
+                _gfx10ComponentLayoutTable, index);
+            var entry = Load(_uintType, pointer);
+            return (BitwiseAnd(entry, UInt(255)),
+                BitwiseAnd(ShiftRightLogical(entry, UInt(8)), UInt(255)),
+                ShiftRightLogical(entry, UInt(16)));
+        }
+
         private uint LoadGfx10BufferFormatComponent(
             int bindingIndex,
             uint elementAddress,
@@ -4290,45 +4341,8 @@ public static partial class Gen5SpirvTranslator
             int component,
             out uint componentInBounds)
         {
-            var byteOffset = UInt(0);
-            var bitOffset = UInt(0);
-            var bitCount = UInt(0);
+            var (byteOffset, bitOffset, bitCount) = DecodeGfx10ComponentLayout(dataFormat, component);
 
-            void SetLayout(uint format, uint bytes, uint bits, uint count)
-            {
-                var matches = _module.AddInstruction(
-                    SpirvOp.IEqual,
-                    _boolType,
-                    dataFormat,
-                    UInt(format));
-                byteOffset = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(bytes),
-                    byteOffset);
-                bitOffset = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(bits),
-                    bitOffset);
-                bitCount = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    matches,
-                    UInt(count),
-                    bitCount);
-            }
-
-            // The layout is selected at run time from the descriptor's data format.
-            foreach (var layout in Gfx10UnifiedFormat.ComponentLayouts)
-            {
-                if (layout.Component == (uint)component)
-                {
-                    SetLayout(layout.DataFormat, layout.ByteOffset, layout.BitOffset, layout.BitCount);
-                }
-            }
 
             var packed = LoadUnalignedBufferWord(
                 bindingIndex,
@@ -4743,11 +4757,8 @@ public static partial class Gen5SpirvTranslator
                 EmitConditional(
                     full,
                     () => Store(pointer, value),
-                    () => EmitAtomicWordUpdate(
-                        pointer,
-                        observed => BitwiseOr(
-                            BitwiseAnd(observed, _module.AddInstruction(SpirvOp.Not, _uintType, mask)),
-                            value)));
+                    () => EmitAtomicWordUpdate(pointer, observed => BitwiseOr(
+                        BitwiseAnd(observed, _module.AddInstruction(SpirvOp.Not, _uintType, mask)), value)));
             });
         }
 
@@ -4936,6 +4947,12 @@ public static partial class Gen5SpirvTranslator
             uint imageObject;
             uint dstSelect;
             uint mipLevel;
+            if (_request.Memory.TryGetIndex(instruction.Pc, 0, out var runtimeMemoryIndex) &&
+                _request.Memory[runtimeMemoryIndex] is { RuntimeDescriptor: true } runtimeEntry)
+            {
+                return TryEmitRuntimeDescriptorImage(instruction, image, runtimeEntry, out error);
+            }
+
             {
                 if (TryGetImageElementCases(instruction, image, out var selector, out var elements, out error) &&
                     TryGetDynamicImageElement(selector, elements, out var dynamicElement, out var dynamicCase))
@@ -7451,6 +7468,20 @@ public static partial class Gen5SpirvTranslator
                 UInt(0));
         }
 
+        // A buffer's element stride: from shader data when the host writes it there
+        // (BindingLayout.UsesRuntimeBufferStrides), else compiled from the specialization.
+        private uint BufferStride(int binding, uint packedStride)
+        {
+            var layout = _request.Bindings;
+            if (!layout.UsesRuntimeBufferStrides || (packedStride & BufferSpecialization.SwizzleEnabledBit) != 0)
+            {
+                return UInt(packedStride & BufferSpecialization.StrideMask);
+            }
+
+            var packed = LoadShaderDataDword(UInt(layout.BufferStrideDword + (uint)binding / 2));
+            return BitwiseAnd(ShiftRightLogical(packed, UInt(((uint)binding % 2) * 16)), UInt(BufferSpecialization.StrideMask));
+        }
+
         private uint ApplyGuestBufferByteBias(int binding, uint byteAddress)
         {
             {
@@ -7500,14 +7531,12 @@ public static partial class Gen5SpirvTranslator
         private uint _functionVec2Pointer;
         private uint _functionBoolPointer;
 
-        // True when main has no dispatcher loop: the register files and state then live in
-        // main (see DeclareModule). A shader that keeps the dispatcher keeps them as Private
-        // globals, which the driver leaves in memory instead of promoting 600-odd registers
-        // across the loop (that promotion makes pipeline compiles take minutes).
+        // Register files and state live in the function executing the program.
+        // The title-state diagnostic alone needs them shared with the entry-point wrapper.
         private bool _functionScopeState;
 
-        // Declares the register files and the per-invocation state: in main's first block
-        // (Function variables must open it) or as Private globals.
+        // Declare variables in the executing function's first block, or as Private globals
+        // when the title-state diagnostic needs to inspect them from the wrapper.
         private void DeclareRegisterFiles()
         {
             uint Variable(uint valueType, uint initializer)
@@ -7537,13 +7566,7 @@ public static partial class Gen5SpirvTranslator
 
             _scc = Variable(_boolType, _module.ConstantBool(false));
             _vcc = Variable(_boolType, _module.ConstantBool(false));
-            _exec = Variable(_boolType, _module.ConstantBool(true));
             _reachedPixelExport = Variable(_boolType, _module.ConstantBool(false));
-            if (_usesPixelValidMask)
-            {
-                _pixelValidMaskActive = Variable(_boolType, _module.ConstantBool(true));
-                _module.AddName(_pixelValidMaskActive, "pixelValidMaskActive");
-            }
 
             _programCounter = Variable(_uintType, _module.Constant(_uintType, 0));
             _programActive = Variable(_boolType, _module.ConstantBool(true));
@@ -7678,6 +7701,7 @@ public static partial class Gen5SpirvTranslator
 
         private void StoreVDynamic(uint registerIndex, uint value)
         {
+
             var pointer = DynamicVectorPointer(registerIndex);
             if (_execKnownFull)
             {
@@ -7728,6 +7752,7 @@ public static partial class Gen5SpirvTranslator
         private void StoreS(uint register, uint value)
         {
             Store(ScalarPointer(register), value);
+
             if (register is 106 or 107)
             {
                 Store(_vcc, IsWaveMaskActive(LoadS64(106)));
@@ -7774,6 +7799,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             Store(VectorPointer(register), value);
+
         }
 
         private void StorePackedHalf(uint register, uint value)

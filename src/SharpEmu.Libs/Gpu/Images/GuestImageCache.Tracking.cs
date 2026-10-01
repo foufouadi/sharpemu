@@ -70,15 +70,16 @@ public sealed partial class GuestImageCache
     }
 
     // Removes the image and its stencil associations; the slot is freed after the current tick.
-    private void DeleteImage(ResourceSlotIdentifier imageIdentifier)
+    private int DeleteImage(ResourceSlotIdentifier imageIdentifier)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
         if (image == null || !image.Registered)
         {
-            return;
+            return 0;
         }
 
+        var retiredImages = 1;
         if (!image.DepthOwner.IsValid)
         {
             var associations = new List<ResourceSlotIdentifier>();
@@ -97,7 +98,7 @@ public sealed partial class GuestImageCache
                     associated.ClearGpuModified();
                 }
 
-                DeleteImage(association);
+                retiredImages += DeleteImage(association);
             }
         }
 
@@ -106,9 +107,10 @@ public sealed partial class GuestImageCache
             throw SubmissionScheduler.Fatal($"A GPU-modified image cannot be deleted before its contents are resolved: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X}.");
         }
 
-        if (image.Views.Count != 0)
+        if (BindlessImageInvalidator is { } invalidate)
         {
-            BindlessImageInvalidator?.Invoke(image.Views.Select(static view => view.View).ToArray());
+            var views = image.GetOwnedViews().ToArray();
+            if (views.Length != 0) invalidate(views);
         }
 
         _scheduledReadbacks.Remove(imageIdentifier);
@@ -117,28 +119,22 @@ public sealed partial class GuestImageCache
             _surfaceMetadata.Remove(image.Description.Metadata.Range.Address);
         }
 
+        var retiredBytes = checked((long)image.AccountedSize);
         RemoveFromIndex(imageIdentifier);
         if (_scheduler.Active)
         {
-            var pendingRelease = image.AccountedSize;
-            if (pendingRelease != 0)
-            {
-                Interlocked.Add(ref _pendingPoolReleaseBytes, checked((long)pendingRelease));
-            }
-
+            Interlocked.Add(ref _retiredImageMemoryBytes, retiredBytes);
             _scheduler.QueueCompletionAction(() =>
             {
                 _slots.Erase(imageIdentifier);
-                if (pendingRelease != 0)
-                {
-                    Interlocked.Add(ref _pendingPoolReleaseBytes, -checked((long)pendingRelease));
-                }
+                Interlocked.Add(ref _retiredImageMemoryBytes, -retiredBytes);
             });
         }
         else
         {
             _slots.Erase(imageIdentifier);
         }
+        return retiredImages;
     }
 
     private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)

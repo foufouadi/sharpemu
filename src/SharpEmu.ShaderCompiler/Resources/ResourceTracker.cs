@@ -355,6 +355,7 @@ public sealed partial class ResourceTracker
         {
             var current = _bufferCandidateTables[existing];
             if (!_graph.Equivalent(current.SrtHandle, table.SrtHandle) ||
+                current.BaseOffset != table.BaseOffset ||
                 !_graph.Equivalent(current.OffsetExpression, table.OffsetExpression))
             {
                 continue;
@@ -380,19 +381,6 @@ public sealed partial class ResourceTracker
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
         handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword) &&
             !DependsOnLoopCarriedRead(dword));
-
-    // TEMP DIAG: the previous rule, which kept every scalar-buffer-loaded V# on the device path.
-    private static readonly bool KeepShaderLoadedBuffersOnDevice =
-        Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DEVICE_LOADED_BUFFERS") == "1";
-
-    // TEMP DIAG (SHARPEMU_TRACE_DEVICE_REASON=1): which rule sent an access to the device path.
-    private static readonly bool TraceDeviceReasons = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DEVICE_REASON") == "1";
-
-    private void TraceDeviceReason(MemoryAccessInfo memory, string reason)
-    {
-        if (TraceDeviceReasons)
-            Console.Error.WriteLine($"[DIAG][DEVICE_REASON] hash=0x{_plan.Hash:X16} pc=0x{memory.Pc:X} opcode={memory.Opcode} kind={memory.Kind} reason={reason}");
-    }
 
     private bool IsDeviceLoadedBufferHandle(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
@@ -565,7 +553,7 @@ public sealed partial class ResourceTracker
         return $"{value.Kind}#{value.Id}";
     }
 
-    // An image descriptor read from a scalar buffer must be one contiguous record.
+    // An image descriptor read from a scalar buffer must be made of contiguous four-dword runs.
     private bool IsContiguousScalarBufferRecord(DescriptorSource source)
     {
         if (!source.Dwords.Any(dword => dword.Kind == ScalarValueKind.ScalarBufferWord))
@@ -573,15 +561,17 @@ public sealed partial class ResourceTracker
             return true;
         }
 
-        var first = ScalarReadMemory(source.Dwords[0], out _);
+        // Each dword is evaluated on its own, so a record may be assembled from several
+        // four-dword loads of the same buffer (an 8-dword T# built by two s_buffer_load_x4).
         for (var dword = 0; dword < source.Dwords.Length; dword++)
         {
             var read = source.Dwords[dword];
+            var first = ScalarReadMemory(source.Dwords[dword & ~3], out _);
             var memory = ScalarReadMemory(read, out _);
             if (first is null || memory is null ||
-                memory.Offset != first.Offset + (uint)dword * sizeof(uint) ||
-                !_graph.Equivalent(read.Operands[0], source.Dwords[0].Operands[0]) ||
-                !_graph.Equivalent(read.Operands[1], source.Dwords[0].Operands[1]))
+                memory.Offset != first.Offset + (uint)(dword & 3) * sizeof(uint) ||
+                !_graph.Equivalent(read.Operands[0], source.Dwords[dword & ~3].Operands[0]) ||
+                !_graph.Equivalent(read.Operands[1], source.Dwords[dword & ~3].Operands[1]))
             {
                 return false;
             }
@@ -986,7 +976,6 @@ public sealed partial class ResourceTracker
                 if (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle))
                 {
                     memory.DeviceDescriptor = true;
-                    TraceDeviceReason(memory, "unvalidated-shader-loaded"); // TEMP DIAG
                     _info.UsesDeviceAddresses = true;
                     return;
                 }
@@ -1005,10 +994,9 @@ public sealed partial class ResourceTracker
             // that stays unknown at dispatch reads through its registers on the device.
             if ((memory.Kind == MemoryResourceKind.ScalarBuffer && !IsHostBufferHandle(access.Handle)) ||
                 (memory.Kind == MemoryResourceKind.Buffer && IsDeviceLoadedBufferHandle(access.Handle) &&
-                 (KeepShaderLoadedBuffersOnDevice || !IsHostBufferHandle(access.Handle))))
+                 !IsHostBufferHandle(access.Handle)))
             {
                 memory.DeviceDescriptor = true;
-                TraceDeviceReason(memory, "scalar-buffer-or-shader-loaded"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }
@@ -1022,7 +1010,6 @@ public sealed partial class ResourceTracker
                  access.Handle.Operands.Any(DependsOnLoopCarriedRead)))
             {
                 memory.DeviceDescriptor = true;
-                TraceDeviceReason(memory, "control-dependent-or-loop-carried"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }
@@ -1047,7 +1034,6 @@ public sealed partial class ResourceTracker
                 }
 
                 memory.DeviceDescriptor = true;
-                TraceDeviceReason(memory, "binding-budget"); // TEMP DIAG
                 _info.UsesDeviceAddresses = true;
                 return;
             }
@@ -1106,14 +1092,32 @@ public sealed partial class ResourceTracker
         }
 
         uint imageSource;
-        var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
-        if (indirect is not null)
+        uint samplerSource = 0;
+        try
         {
-            imageSource = indirect.Source;
+            var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
+            imageSource = indirect is not null
+                ? indirect.Source
+                : GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc);
+            if (memory.NeedsSampler)
+            {
+                if (access.SamplerHandle is null)
+                {
+                    throw Failure(memory.Pc, "sampled image operation has no sampler handle");
+                }
+
+                var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
+                samplerSource = !sampleAdjust && TryMakePointerTableSampler(access.SamplerHandle, memory.Pc, out var pointerSampler)
+                    ? pointerSampler
+                    : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
+            }
         }
-        else
+        catch (ResourcePlanException) when (CanReadDescriptorsAtRuntime(memory, access))
         {
-            imageSource = GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc);
+            // No plan-time source: the shader reads both descriptors from its registers.
+            memory.RuntimeDescriptor = true;
+            _info.UsesRuntimeDescriptors = true;
+            return;
         }
 
         var image = AddImage(imageSource, memory, memory.Pc);
@@ -1125,15 +1129,6 @@ public sealed partial class ResourceTracker
         uint sampler = 0;
         if (memory.NeedsSampler)
         {
-            if (access.SamplerHandle is null)
-            {
-                throw Failure(memory.Pc, "sampled image operation has no sampler handle");
-            }
-
-            var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
-            var samplerSource = !sampleAdjust && TryMakePointerTableSampler(access.SamplerHandle, memory.Pc, out var pointerSampler)
-                ? pointerSampler
-                : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
             sampler = AddSampler(samplerSource, memory.Pc);
             if (sampler == DescriptorConstants.NoIndex)
             {
@@ -1145,6 +1140,17 @@ public sealed partial class ResourceTracker
 
         AddMemoryPatch(index, image, sampler, memory.NeedsSampler, memory.Pc);
     }
+
+    // A plain sampled access of a float view the host can create from the words alone.
+    // Depth compares, the adjusted (LOD-biased) sampler forms and cube views keep their
+    // planned path.
+    private bool CanReadDescriptorsAtRuntime(MemoryAccessInfo memory, MemoryAccessBinding access) =>
+        memory.ImageClass == ImageResourceClass.Sampled && memory.NeedsSampler && access.SamplerHandle is not null &&
+        (memory.ImageSampleFlags & (ImageSampleFlags.Compare | ImageSampleFlags.Adjust)) == 0 &&
+        RuntimeDescriptorTable.SupportsRuntimeView(memory.ImageDimension) &&
+        _graph.Program.Instructions.FirstOrDefault(instruction => instruction.Pc == memory.Pc)?.Control is Gen5ImageControl { Dimension: not CubeDimension };
+
+    private const uint CubeDimension = 3;
 
     private void LinkImageAliases()
     {

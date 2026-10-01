@@ -305,9 +305,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             owner = _registry.GetBuffer(FindBuffer(guestAddress, size));
         }
 
-        if (owner != null && !cpuModified && (!gpuModified || hasDirtyBufferSource))
+        if (owner != null && (!gpuModified || hasDirtyBufferSource))
         {
             TouchBuffer(owner);
+            if (cpuModified)
+            {
+                // Tracking clears complete pages, even for a subpage image. The regular
+                // uploader stages those complete runs; staging only the image would copy
+                // unprepared bytes over neighbouring textures and mark them clean.
+                _ = SynchronizeBuffer(owner, guestAddress, size, isWritten: false, isTexelBuffer: true,
+                    preserveCpuWriteHotPages: false, readImageBacking: true);
+            }
             return (owner, owner.Offset(guestAddress));
         }
 
@@ -344,16 +352,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         TouchBuffer(owner);
-        var uploads = new List<(ulong Address, ulong Size)>();
-        _tracker.ForEachUploadRange(guestAddress, size, false, (address, uploadSize) => uploads.Add((address, uploadSize)), () =>
-        {
-            foreach (var (address, uploadSize) in uploads)
-            {
-                owner.CopyFrom(_scheduler.Current, _staging, stageOffset + address - guestAddress, owner.Offset(address), uploadSize, AccessFlags.HostWriteBit);
-            }
-        });
+        _ = SynchronizeBuffer(owner, guestAddress, size, isWritten: false, isTexelBuffer: true,
+            preserveCpuWriteHotPages: false, readImageBacking: true);
         return (owner, owner.Offset(guestAddress));
     }
+
+    // Image acquisition already holds the image-cache lock. Read CPU-owned backing
+    // directly instead of faulting through guest memory and reentering that cache.
+    private bool TryReadImageSource(ulong address, Span<byte> destination) =>
+        _backing.TryReadBacking(address, destination) ||
+        KernelMemoryCompatExports.TryReadPrtBacking(_backing, address, destination) ||
+        TryReadResidentImagePages(address, destination);
 
     public void WriteHostMemory(ulong guestAddress, ReadOnlySpan<byte> data)
     {
@@ -897,55 +906,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void Unregister(ResourceSlotIdentifier bufferIdentifier) => UpdateRegistration(bufferIdentifier, insert: false);
 
-    // TEMP DIAG (SHARPEMU_DIAG_PAGE_TABLE=1): a CPU mirror of the device-address page table.
-    // It reports a clear that wipes another buffer's entries, and a buffer destroyed while
-    // entries still point into it (the GPU could then write through a freed address).
-    private static readonly bool DiagPageTable = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_PAGE_TABLE") == "1";
-    private static readonly Dictionary<ulong, ulong> DiagPageOwner = [];
-    private static readonly Dictionary<ulong, long> DiagOwnerPages = [];
-    private static int _diagPageTableReports;
-
-    private static void DiagMirrorPageTable(GpuBuffer buffer, ulong first, ulong sizePages, bool insert)
-    {
-        if (!DiagPageTable) return;
-        lock (DiagPageOwner)
-        {
-            GpuBuffer.DiagOnDispose ??= DiagCheckDisposed;
-            var device = buffer.DeviceAddress;
-            for (ulong page = first; page < first + sizePages; page++)
-            {
-                if (DiagPageOwner.TryGetValue(page, out var owner))
-                {
-                    DiagOwnerPages[owner]--;
-                    if (!insert && owner != device && _diagPageTableReports++ < 20)
-                        Console.Error.WriteLine($"[DIAG][PAGE_TABLE] clear of buffer va=0x{device:X} cpu=0x{buffer.CpuAddress:X} wipes page 0x{page:X} owned by va=0x{owner:X}");
-                    DiagPageOwner.Remove(page);
-                }
-
-                if (insert)
-                {
-                    DiagPageOwner[page] = device;
-                    DiagOwnerPages[device] = DiagOwnerPages.GetValueOrDefault(device) + 1;
-                }
-            }
-        }
-    }
-
-    private static void DiagCheckDisposed(GpuBuffer buffer)
-    {
-        lock (DiagPageOwner)
-        {
-            if (DiagOwnerPages.TryGetValue(buffer.DeviceAddress, out var pages) && pages > 0 && _diagPageTableReports++ < 40)
-            {
-                var sample = DiagPageOwner.Where(pair => pair.Value == buffer.DeviceAddress).Take(4).Select(pair => $"0x{pair.Key:X}");
-                Console.Error.WriteLine(
-                    $"[DIAG][PAGE_TABLE] buffer va=0x{buffer.DeviceAddress:X} cpu=0x{buffer.CpuAddress:X} size=0x{buffer.Size:X} destroyed with {pages} page-table entries still pointing into it: pages {string.Join(',', sample)}" + Environment.NewLine + Environment.StackTrace);
-            }
-
-            DiagOwnerPages.Remove(buffer.DeviceAddress);
-        }
-    }
-
     private void UpdateRegistration(ResourceSlotIdentifier bufferIdentifier, bool insert)
     {
         var buffer = _registry.GetBuffer(bufferIdentifier);
@@ -958,7 +918,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (GuestGpuMemoryHook.Traces(buffer.CpuAddress, buffer.Size))
             GuestGpuMemoryHook.Trace(buffer.CpuAddress, buffer.Size,
                 $"device-address-registration insert={insert} buffer={bufferIdentifier} submission_tick={_scheduler.CurrentTick} collection_tick={_retirementPolicy.CurrentTick}");
-        DiagMirrorPageTable(buffer, first, sizePages, insert); // TEMP DIAG
         if (insert)
         {
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
@@ -1118,12 +1077,6 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The download ring could not map the batch.");
         }
 
-        if (baseOffset + packedSize + 0x10000 > _download.Size) // TEMP DIAG: writes that end near the ring end
-        {
-            Console.Error.WriteLine($"[DIAG][RING_END] buffer-batch base=0x{baseOffset:X} packed=0x{packedSize:X} end=0x{baseOffset + packedSize:X} ring=0x{_download.Size:X} copies={batch.Count} " +
-                string.Join(",", batch.Select(copy => $"dst=0x{copy.Placement.DestinationOffset:X}+0x{copy.Placement.TransferSize:X}")));
-        }
-
         foreach (var copy in batch)
         {
             var placement = copy.Placement;
@@ -1217,7 +1170,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,
-        bool preserveCpuWriteHotPages = true)
+        bool preserveCpuWriteHotPages = true, bool readImageBacking = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -1240,7 +1193,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 copies.Add(new BufferCopy(totalSize, buffer.Offset(address), bytes));
                 totalSize += bytes;
             },
-            () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(copies), totalSize, guestAddress, size),
+            () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(copies), totalSize, guestAddress, size,
+                readImageBacking ? TryReadImageSource : null),
             preserveCpuWriteHotPages);
         if (source != null)
         {
@@ -1286,7 +1240,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
         }
 
-        if (isTexelBuffer)
+        if (isTexelBuffer && !readImageBacking)
         {
             var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
             if (copiedFromImage)

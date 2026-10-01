@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.ShaderCompiler.Vulkan;
+using System.Runtime.InteropServices;
+using System.Text;
 using Xunit;
 using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
@@ -12,6 +14,31 @@ namespace SharpEmu.ShaderCompiler.Tests;
 // through the buffer V# in s4..s7. Every instruction takes one 4-byte slot.
 public sealed class Gen5StructuredControlFlowTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RegisterFiles_BelongToTheFunctionExecutingTheProgram(bool forceDispatcher)
+    {
+        var code = Compile(NestedIfSharedMerge(), forceDispatcher);
+        var words = MemoryMarshal.Cast<byte, uint>(code.AsSpan()).ToArray();
+        var names = new Dictionary<uint, string>();
+        var variables = new Dictionary<uint, uint>();
+        for (var index = 5; index < words.Length; index += (int)(words[index] >> 16))
+        {
+            var length = (int)(words[index] >> 16);
+            var opcode = (SpirvOp)(words[index] & 0xFFFF);
+            if (opcode == SpirvOp.Name)
+                names[words[index + 1]] = Encoding.UTF8.GetString(code.AsSpan((index + 2) * 4, (length - 2) * 4)).TrimEnd('\0');
+            if (opcode == SpirvOp.Variable) variables[words[index + 2]] = words[index + 3];
+        }
+        foreach (var name in new[] { "sgpr", "vgpr" })
+        {
+            var id = Assert.Single(names, entry => entry.Value == name).Key;
+            Assert.Equal((uint)SpirvStorageClass.Function, variables[id]);
+        }
+        Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(code);
+    }
+
     private static Gen5Operand S(uint register) => Gen5Operand.Scalar(register);
 
     private static Gen5ShaderInstruction Store(uint pc, uint vector, int offset) =>

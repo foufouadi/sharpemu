@@ -152,11 +152,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             PerfOverlay.SetGuestCacheStatistics(
-                _bufferCache.TotalUsedMemory,
-                _deviceInfo.ImageMemoryPlacedBytes,
-                _deviceInfo.ImageMemoryAllocatedBytes,
-                _deviceInfo.LiveAllocations,
-                _deviceInfo.PeakAllocations);
+                _bufferCache.TotalUsedMemory, _imageCache.TotalUsedMemory, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);
             CollectAbandonedGuestImageVersions();
 
             using var preparationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PresentationPreparation);

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
@@ -245,11 +246,11 @@ public sealed unsafe partial class GuestImageCache
         image.UploadFromBuffer(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(copies), linear.Buffer, linear.Offset, linear.Size);
     }
 
-    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    // The layout of a depth image's guest stencil plane at `plane`: one byte per texel.
+    private static ImageDescription StencilPlaneLayout(CachedImage depth, GuestSpan plane, string operation)
     {
-        var destination = _slots[association.DepthOwner];
-        var info = destination.Description;
-        info.Data = association.Description.Data;
+        var info = depth.Description;
+        info.Data = plane;
         info.GuestFormat = GuestPixelFormat.Bits8UInt;
         info.BytesPerBlock = 1;
         if (info.IsTiled)
@@ -257,12 +258,78 @@ public sealed unsafe partial class GuestImageCache
             info.Pitch = TileGeometry.DepthPitch(info.Extent.Width, 1);
         }
 
-        if (info.Samples != 1 || destination.Backing.Samples != 1 || info.Resources.Layers == 0 || info.Data.Size % info.Resources.Layers != 0)
+        if (info.Samples != 1 || depth.Backing.Samples != 1 || info.Resources.Layers == 0 || info.Data.Size % info.Resources.Layers != 0)
         {
             throw SubmissionScheduler.Fatal(
-                $"The stencil upload is invalid: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} layers={info.Resources.Layers} samples={info.Samples} backingSamples={destination.Backing.Samples}.");
+                $"The stencil {operation} is invalid: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} layers={info.Resources.Layers} samples={info.Samples} backingSamples={depth.Backing.Samples}.");
         }
 
+        return info;
+    }
+
+    // Writes the stencil aspect back to its guest plane once the current tick completes.
+    private void WriteBackStencilPlane(CachedImage depth, GuestSpan plane)
+    {
+        var info = StencilPlaneLayout(depth, plane, "write-back");
+        var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
+        if (!download.TryMap(plane.Size, out var offset, 4))
+        {
+            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the stencil plane: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+        }
+
+        download.Commit();
+        var fullSliceSize = info.Data.Size / info.Resources.Layers;
+        var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
+        if (info.IsTiled)
+        {
+            // Tiling fills only the plane's texels: the padding keeps its guest bytes.
+            if (!_backing.TryReadBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+            {
+                throw SubmissionScheduler.Fatal($"The stencil plane cannot be read from guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+            }
+
+            download.Flush(offset, plane.Size);
+            var tiles = DepthTileTransfers(info, DepthBlock(info), fullSliceSize);
+            _tiler.TileImage(depth, copies, download.Handle, offset, plane.Size, plane.Size, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tiles));
+        }
+        else
+        {
+            for (var index = 0; index < copies.Length; index++)
+            {
+                copies[index].BufferOffset += offset;
+            }
+
+            depth.DownloadToBuffer(copies, download.Handle, offset, plane.Size);
+        }
+
+        var barrier = new BufferMemoryBarrier2
+        {
+            SType = StructureType.BufferMemoryBarrier2,
+            SrcAccessMask = AccessFlags2.MemoryWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.ShaderWriteBit,
+            DstAccessMask = AccessFlags2.HostReadBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = download.Handle,
+            Offset = offset,
+            Size = plane.Size,
+        };
+        _scheduler.EndRendering();
+        VulkanSynchronization.PipelineBarrier(_device.Vk, new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
+        var backing = _backing;
+        _scheduler.QueuePriorityCompletionAction(() =>
+        {
+            download.Invalidate(offset, plane.Size);
+            if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+            {
+                throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+            }
+        });
+    }
+
+    private void UploadStencilPlane(CachedImage association, GpuBuffer source, ulong sourceOffset)
+    {
+        var destination = _slots[association.DepthOwner];
+        var info = StencilPlaneLayout(destination, association.Description.Data, "upload");
         var fullSliceSize = info.Data.Size / info.Resources.Layers;
         var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
         var linear = new TilerBufferSpan(source.Handle, sourceOffset, source.Size - sourceOffset);
@@ -783,24 +850,31 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var range = image.Description.Data;
-        var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
-        if (!download.TryMap(range.Size, out var offset, Math.Max(image.Description.BytesPerBlock, 4u)))
+        var ring = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
+        GpuBuffer? temporary = null;
+        GpuBuffer download;
+        ulong offset;
+        if (range.Size > ring.Size)
         {
-            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the image: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+            // An image can exceed the fixed utility ring. Its readback owns exact
+            // storage until the completion callback publishes the guest contents.
+            temporary = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, range.Size);
+            download = temporary;
+            offset = 0;
         }
-
-        download.Commit();
-        if (offset + range.Size + 0x10000 > download.Size) // TEMP DIAG: writes that end near the ring end
+        else if (ring.TryMap(range.Size, out offset, Math.Max(image.Description.BytesPerBlock, 4u)))
         {
-            var path = plan.Depth ? "depth" : plan.Color.Tiled ? "tiled" : plan.Color.SwapBgra16 ? "swap" : "linear";
-            Console.Error.WriteLine(
-                $"[DIAG][RING_END] image-readback path={path} offset=0x{offset:X} size=0x{range.Size:X} end=0x{offset + range.Size:X} ring=0x{download.Size:X} " +
-                $"image=0x{range.Address:X} format={image.Backing.Format} extent={image.Description.Extent.Width}x{image.Description.Extent.Height} " +
-                $"layers={image.Description.Resources.Layers} mips={image.Description.Resources.Levels} tile={image.Description.TileMode}");
+            ring.Commit();
+            download = ring;
+        }
+        else
+        {
+            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the image: address=0x{range.Address:X16} size=0x{range.Size:X} ring_size=0x{ring.Size:X}.");
         }
 
         if (!_backing.TryReadBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
         {
+            temporary?.Dispose();
             return false;
         }
 
@@ -822,11 +896,15 @@ public sealed unsafe partial class GuestImageCache
         var backing = _backing;
         _scheduler.QueuePriorityCompletionAction(() =>
         {
-            download.Invalidate(offset, range.Size);
-            if (!backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
+            try
             {
-                throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+                download.Invalidate(offset, range.Size);
+                if (!backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
+                {
+                    throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+                }
             }
+            finally { temporary?.Dispose(); }
         });
         return true;
     }

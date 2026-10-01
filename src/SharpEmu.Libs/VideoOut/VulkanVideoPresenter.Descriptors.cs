@@ -38,6 +38,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public BufferView GlobalDataShare;
             public BufferView FlattenedTable;
             public BufferView ShaderData;
+            public BufferView RuntimeTable;
+            public BufferView RuntimeMisses;
         }
 
         private sealed class PreparedStageBindings(ShaderStageResources stage, ShaderProgramInfo program) : IPreparedBindings
@@ -56,7 +58,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public uint[] ShaderData { get; set; } = [];
 
-            public TextureResource[] Textures => Descriptors.Images;
+            // The registered runtime-descriptor images the draw samples through the heap; they
+            // take the same transitions as the bound images but no binding of their own.
+            public List<TextureResource> RuntimeImages { get; } = [];
+
+            public List<RuntimeImageEntry> RuntimeEntries { get; } = [];
+
+            public TextureResource[] Textures => RuntimeImages.Count == 0 ? Descriptors.Images : [.. Descriptors.Images, .. RuntimeImages];
         }
 
         private static ShaderStage StageOf(ShaderProgramInfo program) => program.Stage switch
@@ -352,6 +360,11 @@ internal static unsafe partial class VulkanVideoPresenter
                             : ResolveImageBinding(info.Images[index], snapshot.Images[index], program, index);
             }
 
+            if (layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+            {
+                PrepareRuntimeDescriptors(prepared);
+            }
+
             descriptors.Samplers = new Sampler[info.Samplers.Count];
             for (var index = 0; index < info.Samplers.Count; index++)
             {
@@ -500,6 +513,11 @@ internal static unsafe partial class VulkanVideoPresenter
             BindBuffers(stage);
             ObtainDeviceAddressRanges(stage);
             BindImages(stage);
+            if (stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+            {
+                BindRuntimeDescriptors(stage);
+            }
+
             BindFlattenedResourceTable(stage);
         }
 
@@ -583,6 +601,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 var dword = layout.MemoryOffsetDword + (uint)index / 4;
                 var shift = ((uint)index % 4) * 8;
                 shaderData[dword] |= memoryOffset << (int)shift;
+            }
+
+            if (layout.UsesRuntimeBufferStrides)
+            {
+                Array.Clear(shaderData, (int)layout.BufferStrideDword, (int)layout.BufferStrideDwordCount);
+                for (var index = 0; index < views.Length; index++)
+                {
+                    var stride = prepared.BufferSources[index].Descriptor.Stride;
+                    shaderData[layout.BufferStrideDword + (uint)index / 2] |= stride << ((index % 2) * 16);
+                }
             }
 
             prepared.Descriptors.Buffers = views;
@@ -805,6 +833,12 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
             var preparation = RequirePreparation();
             var entry = RequirePipelineEntry(in pipeline);
+            foreach (var prepared in stages)
+            {
+                var stage = (PreparedStageBindings)prepared;
+                if (stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
+                    CommitRuntimeDescriptorBuffers(stage);
+            }
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
             if (entry.UsesBindlessImages)
@@ -965,11 +999,15 @@ internal static unsafe partial class VulkanVideoPresenter
                                 case DescriptorBindingKind.FlattenedResourceTable:
                                 case DescriptorBindingKind.ShaderData:
                                 case DescriptorBindingKind.GlobalDataShare:
+                                case DescriptorBindingKind.RuntimeDescriptorTable:
+                                case DescriptorBindingKind.RuntimeDescriptorMisses:
                                 {
                                     var view = binding.Kind switch
                                     {
                                         DescriptorBindingKind.FlattenedResourceTable => descriptors.FlattenedTable,
                                         DescriptorBindingKind.ShaderData => descriptors.ShaderData,
+                                        DescriptorBindingKind.RuntimeDescriptorTable => descriptors.RuntimeTable,
+                                        DescriptorBindingKind.RuntimeDescriptorMisses => descriptors.RuntimeMisses,
                                         _ => descriptors.GlobalDataShare,
                                     };
                                     if (view.Buffer.Handle == 0)

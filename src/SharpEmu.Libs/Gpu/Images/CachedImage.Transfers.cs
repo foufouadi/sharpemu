@@ -231,7 +231,6 @@ public sealed unsafe partial class CachedImage
 
     public void DownloadToBuffer(ReadOnlySpan<BufferImageCopy> copies, VkBuffer buffer, ulong offset, ulong size)
     {
-        DiagCheckDownloadFootprint(copies, offset, size); // TEMP DIAG
         var command = BeginTransfer(copies, buffer, size);
         var bufferBarrier = BufferBarrier(buffer, offset, size, MemoryAccess, AccessFlags.TransferWriteBit);
         var (imageBarriers, sourceStages) = GetBarriers(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, PipelineStageFlags.TransferBit, null);
@@ -243,44 +242,6 @@ public sealed unsafe partial class CachedImage
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit, 0, null, 1, &bufferBarrier, 0, null);
-    }
-
-    // TEMP DIAG: reports a copy region whose buffer footprint (Vulkan addressing rules) ends past
-    // offset + size. Transfer writes are not covered by robustness, so such a copy overruns.
-    private static int _diagFootprintReports;
-
-    private void DiagCheckDownloadFootprint(ReadOnlySpan<BufferImageCopy> copies, ulong offset, ulong size)
-    {
-        var block = Description.BlockExtent;
-        var blockWidth = Math.Max(block.Width, 1u);
-        var blockHeight = Math.Max(block.Height, 1u);
-        var bytesPerBlock = (ulong)Math.Max(Description.BytesPerBlock, 1u);
-        for (var index = 0; index < copies.Length; index++)
-        {
-            var copy = copies[index];
-            var rowTexels = copy.BufferRowLength != 0 ? copy.BufferRowLength : copy.ImageExtent.Width;
-            var heightTexels = copy.BufferImageHeight != 0 ? copy.BufferImageHeight : copy.ImageExtent.Height;
-            var rowPitch = (rowTexels + blockWidth - 1) / blockWidth * bytesPerBlock;
-            var slicePitch = (heightTexels + blockHeight - 1) / blockHeight * rowPitch;
-            var rows = (copy.ImageExtent.Height + blockHeight - 1) / blockHeight;
-            var lastRow = (copy.ImageExtent.Width + blockWidth - 1) / blockWidth * bytesPerBlock;
-            var slices = (ulong)Math.Max(copy.ImageExtent.Depth, 1u) * Math.Max(copy.ImageSubresource.LayerCount, 1u);
-            if (rows == 0 || lastRow == 0)
-            {
-                continue;
-            }
-
-            var end = copy.BufferOffset + (slices - 1) * slicePitch + (rows - 1) * rowPitch + lastRow;
-            if (end > offset + size && Interlocked.Increment(ref _diagFootprintReports) <= 20)
-            {
-                Console.Error.WriteLine(
-                    $"[DIAG][DOWNLOAD_OVERRUN] image=0x{Description.Data.Address:X}+0x{Description.Data.Size:X} format={Backing.Format} " +
-                    $"guest={Description.GuestFormat} bpb={bytesPerBlock} block={blockWidth}x{blockHeight} region={index}/{copies.Length} " +
-                    $"bufferOffset=0x{copy.BufferOffset:X} rowLength={copy.BufferRowLength} imageHeight={copy.BufferImageHeight} " +
-                    $"extent={copy.ImageExtent.Width}x{copy.ImageExtent.Height}x{copy.ImageExtent.Depth} layers={copy.ImageSubresource.LayerCount} " +
-                    $"mip={copy.ImageSubresource.MipLevel} end=0x{end:X} limit=0x{offset + size:X} over=0x{end - (offset + size):X}");
-            }
-        }
     }
 
     private static (uint SourceLayers, uint DestinationLayers) SanitizeCopyLayers(CachedImage source, CachedImage destination, uint depth)
@@ -478,22 +439,27 @@ public sealed unsafe partial class CachedImage
     }
 
     // A storage image holds the stencil bytes while the shader runs; the attachment stays the owner.
-    public CachedImage CreateStencilStorageImage()
+    // `width` x `height` is the storage view the shader binds, which can cover only the top-left
+    // part of the attachment (a dynamic-resolution pass): the shader then sees that size.
+    public CachedImage CreateStencilStorageImage(uint width, uint height)
     {
         if ((ViewFormatRules.FullAspects(Backing.Format) & ImageAspectFlags.StencilBit) == 0 ||
-            Backing.ImageType != ImageType.Type2D || Backing.Samples != 1 || Backing.MipLevels != 1)
+            Backing.ImageType != ImageType.Type2D || Backing.Samples != 1 || Backing.MipLevels != 1 ||
+            width == 0 || height == 0 || width > Backing.Extent.Width || height > Backing.Extent.Height)
         {
-            throw SubmissionScheduler.Fatal("Stencil storage needs a single-sample, single-level 2D stencil image.");
+            throw SubmissionScheduler.Fatal(
+                $"Stencil storage needs a single-sample, single-level 2D stencil image covering the view: " +
+                $"view={width}x{height} attachment={Backing.Extent.Width}x{Backing.Extent.Height} mips={Backing.MipLevels} samples={Backing.Samples}.");
         }
 
         var description = ImageDescription.Create();
         description.PixelFormat = Format.R8Uint;
         description.GuestFormat = GuestPixelFormat.Bits8UInt;
-        description.Extent = Backing.Extent;
+        description.Extent = new Extent3D(width, height, 1);
         description.Resources = new SubresourceCount(1, Backing.Layers);
-        description.Pitch = Backing.Extent.Width;
+        description.Pitch = width;
         description.BytesPerBlock = 1;
-        return new CachedImage(_device, _scheduler, _guestBacking, description);
+        return new CachedImage(_device, _scheduler, _guestBacking, description, memoryPool: _memoryPool);
     }
 
     public void CopyStencilStorage(CachedImage storage, GpuBuffer buffer, bool writeBack)
@@ -502,11 +468,12 @@ public sealed unsafe partial class CachedImage
             Backing.ImageType != ImageType.Type2D || Backing.Samples != 1 || Backing.MipLevels != 1 ||
             storage.Backing.Format != Format.R8Uint || storage.Backing.ImageType != ImageType.Type2D ||
             storage.Backing.Samples != 1 || storage.Backing.MipLevels != 1 || storage.Backing.Layers != Backing.Layers ||
-            storage.Backing.Extent.Width != Backing.Extent.Width || storage.Backing.Extent.Height != Backing.Extent.Height)
+            storage.Backing.Extent.Width > Backing.Extent.Width || storage.Backing.Extent.Height > Backing.Extent.Height)
         {
             throw SubmissionScheduler.Fatal("The stencil storage image does not match its attachment.");
         }
 
+        // Only the storage's region moves: the rest of the plane keeps its stencil values.
         if (writeBack)
             CopyThroughBuffer(storage, buffer, ImageAspectFlags.ColorBit, ImageAspectFlags.StencilBit);
         else
@@ -541,10 +508,11 @@ public sealed unsafe partial class CachedImage
         var command = new CommandBuffer(_scheduler.Current.Handle);
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+        // The copy covers the region both images have, from their top-left corner.
         for (uint level = 0; level < levels; level++)
         {
-            var width = Math.Max(source.Backing.Extent.Width >> (int)level, 1);
-            var height = Math.Max(source.Backing.Extent.Height >> (int)level, 1);
+            var width = Math.Max(Math.Min(source.Backing.Extent.Width, Backing.Extent.Width) >> (int)level, 1);
+            var height = Math.Max(Math.Min(source.Backing.Extent.Height, Backing.Extent.Height) >> (int)level, 1);
             var sourceDepth = source.Backing.ImageType == ImageType.Type3D ? Math.Max(source.Backing.Extent.Depth >> (int)level, 1) : source.Backing.Layers;
             var destinationDepth = Backing.ImageType == ImageType.Type3D ? Math.Max(Backing.Extent.Depth >> (int)level, 1) : Backing.Layers;
             var slices = Math.Min(sourceDepth, destinationDepth);

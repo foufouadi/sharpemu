@@ -1,5 +1,6 @@
 // Offline pipeline-compile benchmark: times vkCreateComputePipelines for dumped SPIR-V modules.
-// Usage: pipebench <file.spv> [more.spv ...]   (needs "<file>.json" from spirv-cross --reflect next to each file)
+// Usage: pipebench [--disable-optimization] <file.spv> [more.spv ...]
+// Needs "<file>.json" from spirv-cross --reflect next to each file.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -41,7 +42,8 @@ unsafe
     var devInfo = new DeviceCreateInfo { SType = StructureType.DeviceCreateInfo, PNext = &f2, QueueCreateInfoCount = 1, PQueueCreateInfos = &queueInfo };
     Check(vk.CreateDevice(physical, &devInfo, null, out var device), "device");
 
-    foreach (var path in args)
+    var disableOptimization = args.Contains("--disable-optimization");
+    foreach (var path in args.Where(arg => arg != "--disable-optimization"))
     {
         var code = File.ReadAllBytes(path);
         // A random generator word makes every module unique, so the driver's disk cache never hits.
@@ -75,6 +77,7 @@ unsafe
         var ci = new ComputePipelineCreateInfo
         {
             SType = StructureType.ComputePipelineCreateInfo,
+            Flags = disableOptimization ? (PipelineCreateFlags)0x1 : PipelineCreateFlags.None, // VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT
             Stage = new PipelineShaderStageCreateInfo { SType = StructureType.PipelineShaderStageCreateInfo, Stage = ShaderStageFlags.ComputeBit, Module = module, PName = entry },
             Layout = layout,
         };

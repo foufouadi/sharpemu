@@ -34,9 +34,20 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
     [MemberData(nameof(Operands))]
     public void PackedArithmeticIsCorrectlyRoundedForEveryHalf(uint multiplier, uint addend)
     {
+        CheckPackedArithmetic(multiplier, addend, fmac: false);
+        CheckPackedArithmetic(multiplier, addend, fmac: true);
+    }
+
+    private void CheckPackedArithmetic(uint multiplier, uint addend, bool fmac)
+    {
         var vulkan = fixture.Vulkan;
-        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true) || !vulkan.ExactFloat16Conversions) return;
-        var output = Run(vulkan, multiplier, addend, native: true);
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        if (!vulkan.ExactFloat16Conversions)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "The required gate needs exact native float16 support.");
+            return;
+        }
+        var output = Run(vulkan, multiplier, addend, native: true, fmac);
         var failures = new List<string>();
         for (var value = 0; value < 0x10000; value++)
         {
@@ -109,21 +120,24 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
         return Narrow(sum);
     }
 
-    private static byte[] Run(HeadlessVulkan vulkan, uint multiplier, uint addend, bool native)
+    private static byte[] Run(HeadlessVulkan vulkan, uint multiplier, uint addend, bool native, bool fmac)
     {
         // v2 = s8 + v0 (the f16 value), v3 = that f16 in both lanes;
         // v4 = v3 * s9, v5 = fma(v3, s9, s10), v6 = v3 * v3; stored at v2 * 16.
-        var program = Program(
+        var fusedInstructions = fmac
+            ? new[] { MoveVectorFromScalar(24, 5, 10), Vop2(28, "VPkFmacF16", 5, Gen5Operand.Vector(3), Gen5Operand.Scalar(9)) }
+            : new[] { PackedF16(24, op: 0x0E, destination: 5, source0: 256 + 3, source1: 9, source2: 10) };
+        var program = Program([
             MoveVectorFromScalar(0, 2, 8),
             Vop2(4, "VAddU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(2)),
             Vop2(8, "VLshlrevB32", 3, Operand(16), Gen5Operand.Vector(2)),
             Vop2(12, "VOrB32", 3, Gen5Operand.Vector(3), Gen5Operand.Vector(2)),
             PackedF16(16, op: 0x10, destination: 4, source0: 256 + 3, source1: 9, source2: 0),
-            PackedF16(24, op: 0x0E, destination: 5, source0: 256 + 3, source1: 9, source2: 10),
+            .. fusedInstructions,
             PackedF16(32, op: 0x10, destination: 6, source0: 256 + 3, source1: 256 + 3, source2: 0),
             Vop2(40, "VLshlrevB32", 1, Operand(4), Gen5Operand.Vector(2)),
             BufferAccess(44, "BufferStoreDwordx3", 4, dwords: 3, vectorData: 4, offsetEnabled: true, vectorAddress: 1),
-            EndProgram(52));
+            EndProgram(52)]);
         var (plan, resources, layout) = Prepare(program);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {

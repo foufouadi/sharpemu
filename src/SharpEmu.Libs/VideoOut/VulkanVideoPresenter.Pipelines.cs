@@ -93,12 +93,10 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
-        bool IShaderPipelineHost.ExactFloat16ConversionsEnabled => ExactFloat16ConversionsEnabled &&
-            Environment.GetEnvironmentVariable("SHARPEMU_DIAG_NO_NATIVE_F16") != "1"; // TEMP DIAG
-        bool IShaderPipelineHost.DiagGpuWroteBytes(ulong address, ulong size) => // TEMP DIAG
-            _bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size);
+        bool IShaderPipelineHost.ExactFloat16ConversionsEnabled => ExactFloat16ConversionsEnabled;
 
         bool IShaderPipelineHost.NonUniformImageIndexingEnabled => NonUniformImageIndexingEnabled;
+        bool IShaderPipelineHost.RuntimeBufferStridesEnabled => true;
         bool IShaderPipelineHost.UsesBindlessImages => BindlessImageHeapEnabled;
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
         bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
@@ -423,6 +421,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _maxUpdateAfterBindStorageImages,
                 _maxUpdateAfterBindDescriptors);
             _imageCache.BindlessImageInvalidator = _bindlessImageHeap.InvalidateViews;
+            _bindlessImageHeap.SetDefaultSampler(_samplerStore.GetSampler(new SamplerDescriptorWords(stackalloc uint[4]), integerView: false));
         }
 
         // The set is pushed when its descriptors fit the device limit, else it comes from the heap.
@@ -854,7 +853,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Layout = layout,
                     };
                       var createStart = Stopwatch.GetTimestamp();
-                      Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline), "vkCreateGraphicsPipelines(rendering)");
+                      Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline),
+                          $"vkCreateGraphicsPipelines(rendering) vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
                       Console.Error.WriteLine(
                           $"[PERF] vkCreateGraphicsPipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
                           $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
@@ -910,13 +910,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     Stage = stageInfo,
                     Layout = layout,
                 };
-                  var createStart = Stopwatch.GetTimestamp();
-                  // TEMP DIAG: names the pipeline being compiled if the driver dies in it.
-                  Console.Error.WriteLine($"[PERF] vkCreateComputePipelines begin cs=0x{description.Stage.Hash:X16} working_set_mb={Environment.WorkingSet >> 20}");
-                  Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
-                  Console.Error.WriteLine(
-                      $"[PERF] vkCreateComputePipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
-                      $"cs=0x{description.Stage.Hash:X16}");
+                var createStart = Stopwatch.GetTimestamp();
+                Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
+                Console.Error.WriteLine(
+                    $"[PERF] vkCreateComputePipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
+                    $"cs=0x{description.Stage.Hash:X16}");
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");

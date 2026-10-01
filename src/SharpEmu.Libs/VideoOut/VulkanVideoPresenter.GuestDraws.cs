@@ -96,7 +96,9 @@ internal static unsafe partial class VulkanVideoPresenter
             (5, 4, _) => Format.R16G16Uint,
             (5, 5, _) => Format.R16G16Sint,
             (5, 7, _) => Format.R16G16Sfloat,
-            (6, 7, _) or (7, 7, _) => Format.B10G11R11UfloatPack32,
+            // 11_11_10 holds unsigned floats whatever the number type; the image path maps its
+            // UNORM variant to the same host format (GuestPixelFormats.HostFormats).
+            (6, 7, _) or (7, 7, _) or (6, 0, _) => Format.B10G11R11UfloatPack32,
             (9, _, 1) => Format.A2R10G10B10UnormPack32,
             (9, _, _) => Format.A2B10G10R10UnormPack32,
             (10, 4, _) => Format.R8G8B8A8Uint,

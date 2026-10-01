@@ -75,16 +75,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     foreach (var (attachment, storage) in stencilImages)
                     {
-                        try
-                        {
-                            if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
-                                StencilStorageWriteBackImages.Contains(attachment))
-                                attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
-                        }
-                        finally
-                        {
-                            owner._scheduler.QueueCompletionAction(storage.Dispose);
-                        }
+                        if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
+                            StencilStorageWriteBackImages.Contains(attachment))
+                            attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
                     }
                 }
 
@@ -179,6 +172,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void RunPendingOperations()
         {
+            // Start of a draw or dispatch: nothing is bound yet, so the tick can end here.
+            if (_imageCache.MemoryUnderPressure && !_scheduler.InsideTickCallback)
+            {
+                // A slow frame can materialize many draws' textures before the next flip.
+                // Advance collection here, while no new draw bindings can be invalidated.
+                _imageCache.RunGarbageCollector();
+            }
+            if ((_imageCache.ScratchOverBudget || _imageCache.RetirementOverBudget) && !_scheduler.InsideTickCallback)
+            {
+                _scheduler.Finish();
+                if (_imageCache.MemoryUnderPressure)
+                    _imageCache.ReleaseUnusedMemory();
+            }
+
             RunPendingCommands();
         }
 

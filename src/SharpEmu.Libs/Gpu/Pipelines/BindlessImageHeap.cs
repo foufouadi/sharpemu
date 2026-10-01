@@ -14,7 +14,11 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // shader permutation.
 public sealed unsafe class BindlessImageHeap : IDisposable
 {
-    private const uint BindingCount = 2;
+    // Sampled images, storage images, and the samplers runtime-descriptor accesses index
+    // (BindingLayout.BindlessSamplerBinding).
+    private const uint BindingCount = 3;
+    private const uint SamplerBinding = BindingLayout.BindlessSamplerBinding;
+    private const uint SamplerCapacity = 4096;
     // NVIDIA reports maxUpdateAfterBindDescriptorsInAllPools as UINT_MAX. Keep
     // the persistent layout bounded even when that device-wide limit is not
     // useful, while retaining the full capacity on devices with lower limits.
@@ -92,7 +96,8 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     private readonly DescriptorSet _set;
     private readonly Dictionary<SlotKey, uint> _slots = new();
     private readonly Dictionary<ulong, HashSet<SlotKey>> _slotsByView = new();
-    private readonly List<uint>[] _free = [[], []];
+    private readonly List<uint>[] _free = [[], [], []];
+    private readonly Dictionary<ulong, uint> _samplerSlots = new();
     private readonly uint[] _next = new uint[BindingCount];
     private readonly uint[] _capacity = new uint[BindingCount];
     private readonly DescriptorSetLayout _layout;
@@ -136,6 +141,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
 
         _capacity[0] = (uint)sampledCapacity;
         _capacity[1] = (uint)storageCapacity;
+        _capacity[SamplerBinding] = SamplerCapacity;
         _device = device;
         Console.Error.WriteLine(
             $"[LOADER][INFO] Vulkan bindless heap sampled={sampledCapacity}/{sampledLimit} " +
@@ -148,7 +154,12 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             bindings[index] = new DescriptorSetLayoutBinding
             {
                 Binding = index,
-                DescriptorType = index == 0 ? DescriptorType.SampledImage : DescriptorType.StorageImage,
+                DescriptorType = index switch
+                {
+                    0 => DescriptorType.SampledImage,
+                    1 => DescriptorType.StorageImage,
+                    _ => DescriptorType.Sampler,
+                },
                 DescriptorCount = _capacity[index],
                 StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
             };
@@ -180,6 +191,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
         var poolSizes = new List<DescriptorPoolSize>();
         poolSizes.Add(new DescriptorPoolSize(DescriptorType.SampledImage, _capacity[0]));
         poolSizes.Add(new DescriptorPoolSize(DescriptorType.StorageImage, _capacity[1]));
+        poolSizes.Add(new DescriptorPoolSize(DescriptorType.Sampler, _capacity[SamplerBinding]));
         fixed (DescriptorPoolSize* poolPointer = poolSizes.ToArray())
         {
             var poolInfo = new DescriptorPoolCreateInfo
@@ -191,7 +203,6 @@ public sealed unsafe class BindlessImageHeap : IDisposable
                 PPoolSizes = poolPointer,
             };
             Check(device.Vk.CreateDescriptorPool(device.Device, &poolInfo, null, out var pool), "vkCreateDescriptorPool(bindless)");
-            System.Threading.Interlocked.Increment(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
             var setLayout = _layout;
             var allocate = new DescriptorSetAllocateInfo
             {
@@ -204,8 +215,53 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             _pool = pool;
         }
 
-        // Slot zero is deliberately left as the null descriptor. A draw never maps
-        // an image to it unless the descriptor was rejected before residency.
+        // Slot zero is the null descriptor. A draw maps an image to it only when the descriptor
+        // was rejected before residency, or a runtime lookup has not found it yet.
+        WriteNullDescriptor(0, 0);
+        WriteNullDescriptor(1, 0);
+    }
+
+    // Samplers have no null descriptor: slot zero, which a missed runtime lookup reads, holds
+    // the host's default sampler.
+    public void SetDefaultSampler(Sampler sampler) => WriteSampler(0, sampler);
+
+    public uint GetOrCreateSamplerSlot(Sampler sampler)
+    {
+        if (sampler.Handle == 0)
+        {
+            throw SubmissionScheduler.Fatal("A bindless sampler slot needs a sampler.");
+        }
+
+        if (_samplerSlots.TryGetValue(sampler.Handle, out var existing))
+        {
+            return existing;
+        }
+
+        var slot = ++_next[SamplerBinding];
+        if (slot >= _capacity[SamplerBinding])
+        {
+            throw SubmissionScheduler.Fatal($"The bindless sampler heap is full: capacity={_capacity[SamplerBinding]}.");
+        }
+
+        WriteSampler(slot, sampler);
+        _samplerSlots.Add(sampler.Handle, slot);
+        return slot;
+    }
+
+    private void WriteSampler(uint slot, Sampler sampler)
+    {
+        var info = new DescriptorImageInfo { Sampler = sampler };
+        var write = new WriteDescriptorSet
+        {
+            SType = StructureType.WriteDescriptorSet,
+            DstSet = _set,
+            DstBinding = SamplerBinding,
+            DstArrayElement = slot,
+            DescriptorCount = 1,
+            DescriptorType = DescriptorType.Sampler,
+            PImageInfo = &info,
+        };
+        _device.Vk.UpdateDescriptorSets(_device.Device, 1, &write, 0, null);
     }
 
     private DescriptorPool _pool;
@@ -329,7 +385,6 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     public void Dispose()
     {
         if (_pool.Handle != 0) _device.Vk.DestroyDescriptorPool(_device.Device, _pool, null);
-        System.Threading.Interlocked.Decrement(ref SharpEmu.Libs.Gpu.MemoryReportDiag.LiveDescriptorPools); // TEMP DIAG
         if (_layout.Handle != 0) _device.Vk.DestroyDescriptorSetLayout(_device.Device, _layout, null);
         _slots.Clear();
         _slotsByView.Clear();

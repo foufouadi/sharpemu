@@ -47,6 +47,10 @@ internal interface IShaderPipelineHost
     bool ExactFloat16ConversionsEnabled => false;
 
     bool NonUniformImageIndexingEnabled => false;
+
+    // The host writes buffer strides into shader data (BindingLayout.UsesRuntimeBufferStrides),
+    // so the stride leaves the permutation key.
+    bool RuntimeBufferStridesEnabled => false;
     bool UsesBindlessImages => false;
     bool ExecGuardElisionEnabled => true;
     bool PerVertexPixelInputsSupported => true;
@@ -68,9 +72,6 @@ internal interface IShaderPipelineHost
     // may own the range (or, for a clean read, when a clean word read would be refused);
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
-
-    // TEMP DIAG: whether the GPU wrote any byte of the range (byte granular, no page rounding).
-    bool DiagGpuWroteBytes(ulong address, ulong size) => false;
 
     // Creates the host module of one compiled permutation and returns its handle.
     ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId);

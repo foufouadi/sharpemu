@@ -44,12 +44,12 @@ public sealed class Gen5TypedBufferLoadSpirvTests
     }
 
     [Fact]
-    public void TypedD16Load_IsRejected()
+    public void TypedD16Load_Compiles()
     {
+        // Packed D16 loads are translated; PackedD16BufferTests checks their results on the device.
         var request = CreateCompileRequest("TBufferLoadFormatD16Xy", typed: true, typedFormat: 64, dwordCount: 1);
 
-        Assert.False(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error));
-        Assert.Contains("TBufferLoadFormatD16Xy", error, StringComparison.Ordinal);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
     }
 
     [Fact]

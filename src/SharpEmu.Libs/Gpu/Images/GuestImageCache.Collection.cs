@@ -8,14 +8,28 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Garbage collection by recency and memory pressure, and the scheduled readback flush.
 public sealed partial class GuestImageCache
 {
-    private ulong CollectionMemoryBytes
+    // Cached images allocate their own device memory (see CachedImage), so the pressure
+    // includes retired images until GPU completion actually releases their memory.
+    private ulong CollectionMemoryBytes => TotalUsedMemory +
+        _imageMemoryPool.UnusedBytes + (_backingPool?.PooledBytes ?? 0);
+
+    // Allocation failure runs with the cache lock already held. Enumerate only
+    // on failure, so these diagnostics add no per-draw walk or logging traffic.
+    private string DescribeImageMemory()
     {
-        get
+        var registered = 0;
+        ulong cleanBytes = 0, modifiedLinearBytes = 0, modifiedTiledBytes = 0;
+        _slots.ForEach((_, image) =>
         {
-            var allocated = _device.ImageMemory.AllocatedBytes;
-            var pending = (ulong)Math.Max(Volatile.Read(ref _pendingPoolReleaseBytes), 0);
-            return allocated > pending ? allocated - pending : 0;
-        }
+            if (!image.Registered) return;
+            registered++;
+            if (!image.IsGpuModified) cleanBytes += image.AccountedSize;
+            else if (image.Description.IsTiled) modifiedTiledBytes += image.AccountedSize;
+            else modifiedLinearBytes += image.AccountedSize;
+        });
+        return $"registered_images={registered} clean_image_bytes={cleanBytes} gpu_modified_linear_bytes={modifiedLinearBytes} " +
+            $"gpu_modified_tiled_bytes={modifiedTiledBytes} retired_image_bytes={Interlocked.Read(ref _retiredImageMemoryBytes)} " +
+            $"retained_backing_bytes={_backingPool?.PooledBytes ?? 0} collection_bytes={CollectionMemoryBytes} critical_bytes={_criticalMemoryBytes}";
     }
 
     // Allocation-time pressure is deliberately separate from the periodic sweep:
@@ -24,7 +38,7 @@ public sealed partial class GuestImageCache
     // action, so no image is freed while the current tick can reference it.
     private void CollectForAllocation(ulong requiredBytes)
     {
-        RefreshCollectionBudget();
+        FinishRetiredImagesForAllocation(requiredBytes);
         // A burst can contain only newly touched images. Once the recency walk finds
         // no evictable image, retrying it for every allocation in the same tick is
         // pure repeated work; the next tick will make older images eligible.
@@ -41,11 +55,13 @@ public sealed partial class GuestImageCache
 
         var target = _criticalMemoryBytes - requiredBytes;
         var blocked = false;
-        while (CollectionMemoryBytes > target)
+        // Retired images still occupy memory until completion. Do not retire
+        // the entire old working set merely because that completion is pending.
+        while (CollectionMemoryBytes - (ulong)Interlocked.Read(ref _retiredImageMemoryBytes) > target)
         {
-            var before = CollectionMemoryBytes;
+            var before = _totalUsedMemory;
             Collect(_collectionTick, allowAggressive: true);
-            if (CollectionMemoryBytes == before)
+            if (_totalUsedMemory == before)
             {
                 blocked = true;
                 break;
@@ -53,14 +69,38 @@ public sealed partial class GuestImageCache
         }
 
         _allocationCollectionBlocked = blocked;
+        FinishRetiredImagesForAllocation(requiredBytes);
+    }
+
+    private void FinishRetiredImagesForAllocation(ulong requiredBytes)
+    {
+        var retired = Interlocked.Read(ref _retiredImageMemoryBytes);
+        if (retired == 0 || !_scheduler.Active || _scheduler.InsideTickCallback)
+            return;
+        var resident = CollectionMemoryBytes;
+        if (!RetirementOverBudget && requiredBytes <= _criticalMemoryBytes &&
+            resident <= _criticalMemoryBytes - requiredBytes)
+            return;
+
+        // Completion can call back into the cache. Never wait while holding its
+        // region lock. Images touched by this preparation remain registered;
+        // only previously retired objects are destroyed by these callbacks.
+        _lock.Exit();
+        try { _scheduler.Finish(); }
+        finally { _lock.Enter(); }
+        ReleaseUnusedMemoryCore();
+        _allocationCollectionBlocked = false;
     }
 
     public void RunGarbageCollector()
     {
         using var held = _lock.Hold();
-        RefreshCollectionBudget();
         var tick = _collectionTick++;
         _allocationCollectionBlocked = false;
+        if (MemoryUnderPressure)
+            ReleaseUnusedMemoryCore();
+        else
+            _imageMemoryPool.ReleaseRetained();
         if (CollectionMemoryBytes < _collectionStartBytes)
         {
             return;
@@ -73,33 +113,45 @@ public sealed partial class GuestImageCache
         }
     }
 
+    public void ReleaseUnusedMemory()
+    {
+        using var held = _lock.Hold();
+        ReleaseUnusedMemoryCore();
+    }
+
+    private void ReleaseUnusedMemoryCore()
+    {
+        // Release retained image objects before trimming the allocator blocks
+        // containing them. Neither operation touches a registered image.
+        _backingPool?.ReleaseRetained();
+        _imageMemoryPool.ReleaseRetained();
+    }
+
     private void Collect(ulong tick, bool allowAggressive)
     {
-        // Under pressure the pool's retained free memory goes back before any image is evicted.
-        if (CollectionMemoryBytes >= _memoryPressureBytes)
-        {
-            _device.ImageMemory.ReleaseRetained();
-        }
-
         var pressured = CollectionMemoryBytes >= _memoryPressureBytes;
         var aggressive = allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes;
-        var age = Math.Min(aggressive ? 160UL : pressured ? 80UL : 16UL, tick);
+        // Under pressure, retain the current collection interval's bindings only.
+        // Recorded GPU references are protected by deferred destruction in DeleteImage;
+        // waiting more frames as memory fills prevents reclamation in slow titles.
+        var age = Math.Min(pressured ? 1UL : 16UL, tick);
         var deletions = aggressive ? 40 : pressured ? 20 : 10;
         var candidates = new List<ResourceSlotIdentifier>(deletions);
         // Deleting a depth image also deletes its stencil association, so the recency walk ends first.
         _recencyQueue.ForEachItemAtOrBeforeTick(tick - age, imageIdentifier =>
         {
             candidates.Add(imageIdentifier);
-            return candidates.Count == deletions;
+            // A protected prefix must not hide older reclaimable images behind it.
+            // Stop after successful retirements below, not after visiting candidates.
+            return false;
         });
         foreach (var imageIdentifier in candidates)
         {
-            if (deletions == 0)
+            if (deletions <= 0)
             {
                 break;
             }
 
-            deletions--;
             var owner = _slots.TryGet(imageIdentifier);
             if (owner == null || !owner.Registered || owner.DepthOwner.IsValid)
             {
@@ -109,11 +161,6 @@ public sealed partial class GuestImageCache
             if (owner.IsGpuModified)
             {
                 var safe = CanReadBack(owner);
-                if (safe && owner.Description.IsTiled)
-                {
-                    continue;
-                }
-
                 if (safe && !pressured)
                 {
                     continue;
@@ -127,7 +174,7 @@ public sealed partial class GuestImageCache
                 owner.ClearGpuModified();
             }
 
-            DeleteImage(imageIdentifier);
+            deletions -= DeleteImage(imageIdentifier);
             if (CollectionMemoryBytes < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;

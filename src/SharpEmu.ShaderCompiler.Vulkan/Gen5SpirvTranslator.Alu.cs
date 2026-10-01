@@ -1888,6 +1888,16 @@ public static partial class Gen5SpirvTranslator
             Gen5Vop3pControl control,
             bool highLane)
         {
+            if (instruction.Opcode == "VPkFmaF16" && _request.SupportsExactFloat16Conversions &&
+                instruction.Sources.All(source => source.Kind != Gen5OperandKind.EncodedConstant))
+            {
+                var select = highLane ? control.OpSelHiMask : control.OpSelMask;
+                var negate = highLane ? control.NegHiMask : control.NegLoMask;
+                uint Operand(int index) => ReadNativePackedHalf(GetRawSource(instruction, index),
+                    ((select >> index) & 1) != 0, ((negate >> index) & 1) != 0);
+                return EmitNativePackedHalfFma(Operand(0), Operand(1), Operand(2), control.Clamp);
+            }
+
             var left = EmitPackedF16Operand(instruction, control, 0, highLane);
             var right = EmitPackedF16Operand(instruction, control, 1, highLane);
             uint value;
@@ -1934,6 +1944,12 @@ public static partial class Gen5SpirvTranslator
             uint accumulator,
             bool highLane)
         {
+            if (_request.SupportsExactFloat16Conversions)
+                return EmitNativePackedHalfFma(
+                    ReadNativePackedHalf(GetRawSource(instruction, 0), highLane),
+                    ReadNativePackedHalf(GetRawSource(instruction, 1), highLane),
+                    ReadNativePackedHalf(accumulator, highLane), clamp: false);
+
             var left = EmitPackedF16Half(GetRawSource(instruction, 0), highLane);
             var right = EmitPackedF16Half(GetRawSource(instruction, 1), highLane);
             var addend = EmitPackedF16Half(accumulator, highLane);
@@ -1959,6 +1975,26 @@ public static partial class Gen5SpirvTranslator
             var belowOne = _module.AddInstruction(SpirvOp.FOrdLessThan, _boolType, lowerBounded, Float(1));
             var clamped = _module.AddInstruction(SpirvOp.Select, _floatType, belowOne, lowerBounded, Float(1));
             return Bitcast(_uintType, clamped);
+        }
+
+        // Keep packed operands in half until the fused operation, avoiding widening,
+        // software NaN reconstruction and narrowing at every input. Inline f32 constants
+        // use the original path because they need not be exactly representable in half.
+        private uint ReadNativePackedHalf(uint raw, bool highLane, bool negate = false)
+        {
+            var bits = highLane ? ShiftRightLogical(raw, UInt(16)) : raw;
+            if (negate) bits = BitwiseXor(bits, UInt(0x8000));
+            return _module.AddInstruction(SpirvOp.CompositeExtract, _halfType, Bitcast(_half2Type, bits), 0);
+        }
+
+        private uint EmitNativePackedHalfFma(uint left, uint right, uint addend, bool clamp)
+        {
+            var fused = Ext(50, _halfType, left, right, addend);
+            _module.AddDecoration(fused, SpirvDecoration.NoContraction);
+            var bits = Bitcast(_uintType, _module.AddInstruction(SpirvOp.FConvert, _floatType, fused));
+            if (clamp) bits = EmitClampToUnitInterval(bits);
+            // Preserve the common output NaN canonicalization and packing rules.
+            return EmitFloatToHalf(bits);
         }
 
         // Fused f16 multiply-add with a single rounding, emulated in f32 without the
@@ -2694,7 +2730,8 @@ public static partial class Gen5SpirvTranslator
                     var (baseLow, baseHigh) = LoadShaderBase();
                     var next = IAdd64(
                         Pair64(baseLow, baseHigh),
-                        ULong(instruction.Pc + (ulong)(instruction.Words.Count * sizeof(uint))));
+                        ULong(unchecked(_request.Program.InstructionAddressOffset(instruction.Pc) +
+                            (ulong)(instruction.Words.Count * sizeof(uint)))));
                     StoreS(destination, Narrow(next));
                     StoreS(destination + 1, Narrow(ShiftRightLogical64(next, ULong(32))));
                     return true;
