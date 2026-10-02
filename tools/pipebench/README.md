@@ -1,3 +1,8 @@
+<!--
+Copyright (C) 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # pipebench
 
 Times `vkCreateComputePipelines` on dumped SPIR-V, without running a game.

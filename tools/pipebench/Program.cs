@@ -1,3 +1,6 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Offline pipeline-compile benchmark: times vkCreateComputePipelines for dumped SPIR-V modules.
 // Usage: pipebench [--disable-optimization] <file.spv> [more.spv ...]
 // Needs "<file>.json" from spirv-cross --reflect next to each file.

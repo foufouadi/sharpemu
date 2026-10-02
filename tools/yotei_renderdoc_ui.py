@@ -1,3 +1,6 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Inspect the existing Yotei capture's final UI pass inside qrenderdoc."""
 import os
 import traceback

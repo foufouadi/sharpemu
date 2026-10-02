@@ -1,3 +1,6 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Locate the tree's scene attachments and sample them before post-processing."""
 import os
 import traceback

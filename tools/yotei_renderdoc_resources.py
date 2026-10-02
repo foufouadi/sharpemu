@@ -1,3 +1,6 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Inspect captured image creation and backing resources without launching the game."""
 import os
 import traceback
