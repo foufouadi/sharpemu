@@ -1285,16 +1285,17 @@ internal static unsafe partial class VulkanVideoPresenter
             var persistentCacheEnabled =
                 !string.Equals(cacheMode, "0", StringComparison.Ordinal);
             _pipelineCachePath = persistentCacheEnabled ? GetPipelineCachePath() : null;
-            byte[] initialData = [];
+            byte* initialData = null;
+            ulong initialLength = 0;
             try
             {
                 if (_pipelineCachePath is not null && File.Exists(_pipelineCachePath))
                 {
-                    if (!PipelineCacheSignature.TryUnwrap(DriverCacheSignature(), File.ReadAllBytes(_pipelineCachePath), out initialData))
+                    using var file = File.OpenRead(_pipelineCachePath);
+                    if (!PipelineCacheSignature.TryReadFrom(file, DriverCacheSignature(), out initialData, out initialLength))
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][INFO] Vulkan pipeline cache invalidated: path={_pipelineCachePath} reason=signature-or-hash-mismatch");
-                        initialData = [];
                     }
                 }
             }
@@ -1304,12 +1305,20 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"[LOADER][WARN] Vulkan pipeline cache read failed: {exception.Message}");
             }
 
-            var result = TryCreatePipelineCache(initialData, out _pipelineCache);
-            if (result != Result.Success && initialData.Length != 0)
+            Result result;
+            try
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] Vulkan pipeline cache rejected ({result}); rebuilding it.");
-                result = TryCreatePipelineCache([], out _pipelineCache);
+                result = TryCreatePipelineCache(initialData, initialLength, out _pipelineCache);
+                if (result != Result.Success && initialLength != 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan pipeline cache rejected ({result}); rebuilding it.");
+                    result = TryCreatePipelineCache(null, 0, out _pipelineCache);
+                }
+            }
+            finally
+            {
+                System.Runtime.InteropServices.NativeMemory.Free(initialData);
             }
 
             if (result != Result.Success)
@@ -1337,7 +1346,7 @@ internal static unsafe partial class VulkanVideoPresenter
             else
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialData.Length} bytes");
+                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialLength} bytes");
             }
         }
 
@@ -1354,22 +1363,19 @@ internal static unsafe partial class VulkanVideoPresenter
             return PipelineCacheSignature.Build(properties.VendorID, properties.DeviceID, properties.DriverVersion, uuid);
         }
 
-        private Result TryCreatePipelineCache(byte[] initialData, out PipelineCache pipelineCache)
+        private Result TryCreatePipelineCache(byte* initialData, ulong initialLength, out PipelineCache pipelineCache)
         {
-            fixed (byte* initialDataPointer = initialData)
+            var createInfo = new PipelineCacheCreateInfo
             {
-                var createInfo = new PipelineCacheCreateInfo
-                {
-                    SType = StructureType.PipelineCacheCreateInfo,
-                    InitialDataSize = (nuint)initialData.Length,
-                    PInitialData = initialData.Length == 0 ? null : initialDataPointer,
-                };
-                return _vk.CreatePipelineCache(
-                    _device,
-                    &createInfo,
-                    null,
-                    out pipelineCache);
-            }
+                SType = StructureType.PipelineCacheCreateInfo,
+                InitialDataSize = (nuint)initialLength,
+                PInitialData = initialLength == 0 ? null : initialData,
+            };
+            return _vk.CreatePipelineCache(
+                _device,
+                &createInfo,
+                null,
+                out pipelineCache);
         }
 
         private static string GetPipelineCachePath()
@@ -1438,48 +1444,51 @@ internal static unsafe partial class VulkanVideoPresenter
                     _pipelineCache,
                     &size,
                     null);
-                if (result != Result.Success || size == 0 || size > (nuint)int.MaxValue)
+                if (result != Result.Success || size == 0)
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] Vulkan pipeline cache query failed: result={result} size={size}");
                     return;
                 }
 
-                var data = new byte[checked((int)size)];
-                fixed (byte* dataPointer = data)
+                // Native memory: large titles' caches pass the 2 GiB a .NET array can hold.
+                var data = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc(size);
+                try
                 {
                     result = _vk.GetPipelineCacheData(
                         _device,
                         _pipelineCache,
                         &size,
-                        dataPointer);
-                }
+                        data);
+                    if (result != Result.Success)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] Vulkan pipeline cache export failed: {result}");
+                        return;
+                    }
 
-                if (result != Result.Success)
+                    var directory = Path.GetDirectoryName(_pipelineCachePath);
+                    if (!string.IsNullOrWhiteSpace(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
+                    var temporaryPath = _pipelineCachePath + $".{Environment.ProcessId}.tmp";
+                    using (var file = File.Create(temporaryPath))
+                    {
+                        PipelineCacheSignature.WriteTo(file, DriverCacheSignature(), data, size);
+                    }
+
+                    File.Move(temporaryPath, _pipelineCachePath, overwrite: true);
+                }
+                finally
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER][WARN] Vulkan pipeline cache export failed: {result}");
-                    return;
+                    System.Runtime.InteropServices.NativeMemory.Free(data);
                 }
-
-                if (size != (nuint)data.Length)
-                {
-                    Array.Resize(ref data, checked((int)size));
-                }
-
-                var directory = Path.GetDirectoryName(_pipelineCachePath);
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
-                var temporaryPath = _pipelineCachePath + $".{Environment.ProcessId}.tmp";
-                File.WriteAllBytes(temporaryPath, PipelineCacheSignature.Wrap(DriverCacheSignature(), data));
-                File.Move(temporaryPath, _pipelineCachePath, overwrite: true);
                 _pipelineCacheDirty = false;
                 _lastPipelineCacheSaveTick = Environment.TickCount64;
                 Console.Error.WriteLine(
-                    $"[LOADER][INFO] Vulkan pipeline cache saved: path={_pipelineCachePath} bytes={data.Length}");
+                    $"[LOADER][INFO] Vulkan pipeline cache saved: path={_pipelineCachePath} bytes={size}");
             }
             catch (Exception exception)
             {
