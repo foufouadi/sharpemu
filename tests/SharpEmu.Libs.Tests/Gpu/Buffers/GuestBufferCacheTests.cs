@@ -245,8 +245,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
             Assert.Equal(replacementIdentifier, harness.Cache.FindBuffer(address, Page));
             Assert.Same(original, harness.Cache.GetBuffer(originalIdentifier));
             Assert.NotEqual(0UL, original.Handle.Handle);
-            Assert.Equal(2 * Page, harness.Cache.TotalUsedMemory);
+            Assert.Equal(3 * Page, harness.Cache.TotalUsedMemory);
             harness.Scheduler.Finish();
+            Assert.Equal(2 * Page, harness.Cache.TotalUsedMemory);
             Assert.Equal(0UL, original.Handle.Handle);
             Assert.NotEqual(0UL, harness.Cache.GetBuffer(replacementIdentifier).Handle.Handle);
         });

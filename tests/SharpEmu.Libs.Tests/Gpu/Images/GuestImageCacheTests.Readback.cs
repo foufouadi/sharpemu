@@ -153,6 +153,51 @@ public sealed partial class GuestImageCacheTests
     }
 
     [Fact]
+    public void Pressure_CompletesTiledReadbackBatchesBeforeAllocatingMoreScratch()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const ulong size = 0x10000;
+        const uint clear = 0x3f200000, stale = 0xdeadbeef;
+        var address = harness.MapBacked(3 * size, ReadWrite);
+        harness.Write(address, Bytes(Enumerable.Repeat(stale, (int)(3 * size / 4)).ToArray()));
+        harness.Images.SetCollectionThresholds(ulong.MaxValue, ulong.MaxValue, ulong.MaxValue, 1);
+        var images = new List<ResourceSlotIdentifier>();
+        for (var index = 0; index < 3; index++)
+        {
+            var imageAddress = address + (ulong)index * size;
+            var request = AsDepthTarget(LinearRequest(imageAddress, size, Format.D32Sfloat,
+                GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(3, 2, 1), 1, 4, 1), Format.D32Sfloat);
+            request.Description.Pitch = 4;
+            request.Description.TileMode = GuestTileMode.Depth;
+            request.Description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size, Pitch = 4, Height = 2 };
+            images.Add(harness.Find(ref request));
+            harness.Worker.Run(() => Assert.True(harness.Images.TryClearImageFromBuffer(imageAddress, size, clear)));
+        }
+        harness.Worker.Run(() =>
+        {
+            harness.Images.TilerForTest.OutstandingScratchBudget = 1;
+            harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 2);
+            harness.Images.ResetRecency(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(images), 2);
+            var tick = harness.Scheduler.CurrentTick;
+            harness.Images.RunGarbageCollector();
+            Assert.True(harness.Scheduler.CurrentTick > tick);
+            Assert.All(images, image => Assert.False(harness.Images.Contains(image)));
+            Assert.Equal(0UL, harness.Images.TilerForTest.PooledScratchBytes);
+        });
+        // Earlier batches have already published; the final batch may be pending.
+        Assert.Contains(clear, harness.Read(address, (int)size).Chunk(4).Select(bytes => BitConverter.ToUInt32(bytes)));
+        harness.Finish();
+        for (var index = 0; index < 3; index++)
+        {
+            var words = harness.Read(address + (ulong)index * size, (int)size).Chunk(4).Select(bytes => BitConverter.ToUInt32(bytes)).ToArray();
+            Assert.Equal(6, words.Count(word => word == clear));
+            Assert.Equal(words.Length - 6, words.Count(word => word == stale));
+        }
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void ProtectedStencilProxies_DoNotHideLaterEvictableImages()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

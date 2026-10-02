@@ -57,7 +57,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         Slabs = new GpuMemorySlabs(this);
     }
 
-    // Shared chunks the small buffers are carved from; freed at device teardown.
+    // Shared chunks for small buffers; idle chunks can be returned under pressure.
     internal GpuMemorySlabs Slabs { get; }
 
     public Vk Vk { get; }

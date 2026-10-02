@@ -125,6 +125,8 @@ public sealed partial class GuestImageCache
         // containing them. Neither operation touches a registered image.
         _backingPool?.ReleaseRetained();
         _imageMemoryPool.ReleaseRetained();
+        _device.Slabs.ReleaseUnused();
+        _tiler.ReleaseUnusedScratch();
     }
 
     private void Collect(ulong tick, bool allowAggressive)
@@ -150,6 +152,18 @@ public sealed partial class GuestImageCache
             if (deletions <= 0)
             {
                 break;
+            }
+
+            if (pressured && _scheduler.Active && !_scheduler.InsideTickCallback &&
+                _tiler.ScratchOverBudget)
+            {
+                // Readback scratch and retired images are still resident until
+                // completion. Bound the batch before allocating the next copy.
+                // Completion publishes guest data and can re-enter this cache.
+                _lock.Exit();
+                try { _scheduler.Finish(); }
+                finally { _lock.Enter(); }
+                ReleaseUnusedMemoryCore();
             }
 
             var owner = _slots.TryGet(imageIdentifier);

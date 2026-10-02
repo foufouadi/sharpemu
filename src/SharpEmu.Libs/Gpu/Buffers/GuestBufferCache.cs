@@ -97,7 +97,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public GpuBuffer FaultBuffer => _faults.FaultBuffer;
 
-    public ulong TotalUsedMemory => _registry.RegisteredBytes;
+    public ulong TotalUsedMemory => _registry.RegisteredBytes + _registry.RetiredBytes;
+
+    public bool RetirementOverBudget => _registry.RetiredBytes > 256UL * MiB;
 
     public int BufferCount => _registry.RegisteredCount;
 
@@ -643,7 +645,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         using var foreignRead = _device.Slabs.BeginForeignRead();
         ProcessPendingFaultBuffer();
-        if (!_retirementPolicy.TryBeginCollection(_registry.RegisteredBytes, out var retirement))
+        if (!_retirementPolicy.TryBeginCollection(TotalUsedMemory, out var retirement))
         {
             return;
         }

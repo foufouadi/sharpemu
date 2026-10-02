@@ -179,7 +179,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 // Advance collection here, while no new draw bindings can be invalidated.
                 _imageCache.RunGarbageCollector();
             }
-            if ((_imageCache.ScratchOverBudget || _imageCache.RetirementOverBudget) && !_scheduler.InsideTickCallback)
+            if ((_imageCache.ScratchOverBudget || _imageCache.RetirementOverBudget || _bufferCache.RetirementOverBudget) && !_scheduler.InsideTickCallback)
             {
                 _scheduler.Finish();
                 if (_imageCache.MemoryUnderPressure)

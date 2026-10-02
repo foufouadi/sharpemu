@@ -201,10 +201,24 @@ public sealed unsafe class GpuTiler : IDisposable
 
     // Scratches only return when their tick completes, so one long tick full of uploads
     // (a streaming burst) holds all of them; past this budget the next draw ends the tick.
-    private const ulong OutstandingScratchBudget = 256UL << 20;
+    internal ulong OutstandingScratchBudget { get; set; } = 256UL << 20;
     private ulong _outstandingScratch;
 
     public bool ScratchOverBudget => Interlocked.Read(ref _outstandingScratch) > OutstandingScratchBudget;
+    internal ulong OutstandingScratchBytes => Interlocked.Read(ref _outstandingScratch);
+    internal ulong PooledScratchBytes { get { lock (_scratchGate) return _scratchPooledBytes; } }
+
+    public void ReleaseUnusedScratch()
+    {
+        lock (_scratchGate)
+        {
+            // Only completion callbacks return these buffers. Pending GPU uses
+            // remain outside the pool, so trimming cannot invalidate them.
+            foreach (var pooled in _scratchPool.Values)
+                while (pooled.TryPop(out var buffer)) buffer.Dispose();
+            _scratchPooledBytes = 0;
+        }
+    }
 
     // The scratch stays alive through the current tick; the caller sees exactly `size` bytes.
     private TilerBufferSpan AllocateScratch(ulong size)
