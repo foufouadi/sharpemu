@@ -79,6 +79,9 @@ internal static unsafe partial class VulkanVideoPresenter
         // other compute translation maps a guest wave to 32-lane host subgroups, and a 64-lane host
         // subgroup (AMD's default) left lanes 32..63 inactive: a wave64 8x8x8 group lost rows 4..7.
         private const uint RdnaSubgroupSize = 32;
+
+        // Pipeline creations at least this slow are logged; cached ones take well under 1 ms.
+        private const double SlowPipelineMilliseconds = 500;
         private bool _canRequireComputeSubgroup32;
         private uint _maxComputeWorkgroupSubgroups;
 
@@ -852,12 +855,16 @@ internal static unsafe partial class VulkanVideoPresenter
                         PDynamicState = &dynamicState,
                         Layout = layout,
                     };
-                      var createStart = Stopwatch.GetTimestamp();
-                      Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline),
-                          $"vkCreateGraphicsPipelines(rendering) vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
-                      Console.Error.WriteLine(
-                          $"[PERF] vkCreateGraphicsPipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
-                          $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
+                    var createStart = Stopwatch.GetTimestamp();
+                    Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline),
+                        $"vkCreateGraphicsPipelines(rendering) vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
+                    var createMilliseconds = Stopwatch.GetElapsedTime(createStart).TotalMilliseconds;
+                    if (createMilliseconds >= SlowPipelineMilliseconds)
+                    {
+                        Console.Error.WriteLine(
+                            $"[PERF] vkCreateGraphicsPipelines ms={createMilliseconds:F1} " +
+                            $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
+                    }
                     MarkPipelineCacheDirty();
                     Interlocked.Increment(ref _perfPipelineCreations);
                     SetDebugName(
@@ -912,9 +919,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
                 var createStart = Stopwatch.GetTimestamp();
                 Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
-                Console.Error.WriteLine(
-                    $"[PERF] vkCreateComputePipelines ms={Stopwatch.GetElapsedTime(createStart).TotalMilliseconds:F1} " +
-                    $"cs=0x{description.Stage.Hash:X16}");
+                var createMilliseconds = Stopwatch.GetElapsedTime(createStart).TotalMilliseconds;
+                if (createMilliseconds >= SlowPipelineMilliseconds)
+                {
+                    Console.Error.WriteLine(
+                        $"[PERF] vkCreateComputePipelines ms={createMilliseconds:F1} cs=0x{description.Stage.Hash:X16}");
+                }
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
