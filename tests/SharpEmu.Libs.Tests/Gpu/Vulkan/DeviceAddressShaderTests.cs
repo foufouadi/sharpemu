@@ -345,18 +345,20 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         const uint Uint32x4 = 75;
         var element = GuestBase + PageSize - 8;
 
-        var both = new Run(vulkan, FormatLoadProgram());
+        var both = FormatLoadRun(vulkan);
         var first = both.MapPage(GuestBase, Pattern((int)PageSize, seed: 11));
         var second = both.MapPage(GuestBase + PageSize, Pattern(64, seed: 12));
-        both.Dispatch(GuestBase, extraRegisters: FormatLoadRegisters(GuestBase, PageSize + 64, Uint32x4, (uint)(element - GuestBase)));
+        both.MapPage(DescriptorPage, BufferDescriptorBytes(GuestBase, (uint)(PageSize + 64), Uint32x4));
+        both.Dispatch(DescriptorPage, extraRegisters: new Dictionary<int, uint> { [13] = (uint)(element - GuestBase) });
         Assert.Equal(ReadWord(first, (int)PageSize - 8), both.ResultWord(0));
         Assert.Equal(ReadWord(first, (int)PageSize - 4), both.ResultWord(4));
         Assert.Equal(ReadWord(second, 0), both.ResultWord(8));
         Assert.Equal(ReadWord(second, 4), both.ResultWord(12));
 
-        var missingSecond = new Run(vulkan, FormatLoadProgram());
+        var missingSecond = FormatLoadRun(vulkan);
         var only = missingSecond.MapPage(GuestBase, Pattern((int)PageSize, seed: 13));
-        missingSecond.Dispatch(GuestBase, extraRegisters: FormatLoadRegisters(GuestBase, PageSize + 64, Uint32x4, (uint)(element - GuestBase)));
+        missingSecond.MapPage(DescriptorPage, BufferDescriptorBytes(GuestBase, (uint)(PageSize + 64), Uint32x4));
+        missingSecond.Dispatch(DescriptorPage, extraRegisters: new Dictionary<int, uint> { [13] = (uint)(element - GuestBase) });
         Assert.Equal(ReadWord(only, (int)PageSize - 8), missingSecond.ResultWord(0));
         Assert.Equal(ReadWord(only, (int)PageSize - 4), missingSecond.ResultWord(4));
         Assert.Equal(0u, missingSecond.ResultWord(8));
@@ -365,9 +367,10 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
 
         // num_records ends inside the element: the whole element reads as zero, and the
         // unmapped page past the end is never walked, so it records no fault.
-        var cut = new Run(vulkan, FormatLoadProgram());
+        var cut = FormatLoadRun(vulkan);
         cut.MapPage(GuestBase, Pattern((int)PageSize, seed: 14));
-        cut.Dispatch(GuestBase, extraRegisters: FormatLoadRegisters(GuestBase, PageSize - 4, Uint32x4, (uint)(element - GuestBase)));
+        cut.MapPage(DescriptorPage, BufferDescriptorBytes(GuestBase, (uint)(PageSize - 4), Uint32x4));
+        cut.Dispatch(DescriptorPage, extraRegisters: new Dictionary<int, uint> { [13] = (uint)(element - GuestBase) });
         for (uint component = 0; component < 4; component++)
         {
             Assert.Equal(0u, cut.ResultWord(component * 4));
@@ -378,9 +381,10 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         // 8_8_8_8 UNORM inside one page: each byte converts to byte / 255 (within one ulp;
         // the conversion multiplies by 1/255).
         const uint Unorm8x4 = 56;
-        var unorm = new Run(vulkan, FormatLoadProgram());
+        var unorm = FormatLoadRun(vulkan);
         var bytes = unorm.MapPage(GuestBase, Pattern((int)PageSize, seed: 15));
-        unorm.Dispatch(GuestBase, extraRegisters: FormatLoadRegisters(GuestBase, PageSize, Unorm8x4, 36));
+        unorm.MapPage(DescriptorPage, BufferDescriptorBytes(GuestBase, (uint)(PageSize), Unorm8x4));
+        unorm.Dispatch(DescriptorPage, extraRegisters: new Dictionary<int, uint> { [13] = 36 });
         for (var component = 0; component < 4; component++)
         {
             var expected = BitConverter.SingleToUInt32Bits(bytes[36 + component] / 255f);
@@ -743,41 +747,30 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         BufferAccess(52, "BufferStoreFormatXyzw", 16, dwords: 4, vectorData: 4, offsetEnabled: true, vectorAddress: OffsetRegister),
         EndProgram(60));
 
-    // s[8:11] = s[16:19], or s[20:23] when s12 == 0: a V# chosen by control flow, which the
-    // load reads from its SGPRs through the page table. v4..v7 = format_load(s[8:11], s13);
-    // result[0..3] = v4..v7.
-    private static Gen5ShaderProgram FormatLoadProgram() => Program(
-        MoveScalarRegister(0, 8, 16),
-        MoveScalarRegister(4, 9, 17),
-        MoveScalarRegister(8, 10, 18),
-        MoveScalarRegister(12, 11, 19),
-        Sopc(16, "SCmpLgU32", Gen5Operand.Scalar(12), Operand(0)),
-        Branch(20, "SCbranchScc1", 4),
-        MoveScalarRegister(24, 8, 20),
-        MoveScalarRegister(28, 9, 21),
-        MoveScalarRegister(32, 10, 22),
-        MoveScalarRegister(36, 11, 23),
-        MoveVectorFromScalar(40, OffsetRegister, 13),
-        BufferAccess(44, "BufferLoadFormatXyzw", 8, 0, 4, vectorData: 4, offsetEnabled: true, vectorAddress: OffsetRegister),
-        BufferAccess(52, "BufferStoreDwordx4", ResultRegister, 0, 4, vectorData: 4),
-        EndProgram(60));
+    // The V# sits on its own page, which the GPU reads to find the formatted buffer.
+    private const ulong DescriptorPage = GuestBase + 4 * PageSize;
 
-    // Both V# candidates describe the same buffer: base, num_records bytes, the unified
-    // format and an identity swizzle.
-    private static Dictionary<int, uint> FormatLoadRegisters(ulong baseAddress, ulong numRecords, uint format, uint offset)
+    // A formatted load reads through the page table only when its V# is unknown until the
+    // shader runs; a descriptor read by the GPU is one, so the program loads it that way.
+    private Run FormatLoadRun(HeadlessVulkan vulkan)
     {
-        var word3 = 4u | (5u << 3) | (6u << 6) | (7u << 9) | (format << 12);
-        var registers = new Dictionary<int, uint> { [12] = 1, [13] = offset };
-        foreach (var first in new[] { 16, 20 })
-        {
-            registers[first] = (uint)baseAddress;
-            registers[first + 1] = (uint)(baseAddress >> 32) & 0xFFFF;
-            registers[first + 2] = (uint)numRecords;
-            registers[first + 3] = word3;
-        }
-
-        return registers;
+        var run = new Run(vulkan, GpuDescriptorLoadProgram());
+        Assert.Contains(run.Request.Memory.Entries, memory => memory.DeviceDescriptor);
+        return run;
     }
+
+    // s[16:19] = the V# at s[8:9] + v0, read by the GPU; v4..v7 = format_load(s[16:19], s13);
+    // result[0..3] = v4..v7.
+    private static Gen5ShaderProgram GpuDescriptorLoadProgram() => Program(
+        MoveVectorFromScalar(0, 8, AddressLow),
+        Vop2(4, "VAddU32", 8, Gen5Operand.Vector(8), Gen5Operand.Vector(0)),
+        ReadFirstLane(8, 8, 8), MoveScalarRegister(12, 9, AddressHigh),
+        MoveScalar(16, 10, 16), MoveScalar(20, 11, 0),
+        ScalarBufferLoad(24, 8, destination: 16, count: 4),
+        MoveVectorFromScalar(32, OffsetRegister, 13),
+        BufferAccess(36, "BufferLoadFormatXyzw", 16, 0, 4, vectorData: 4, offsetEnabled: true, vectorAddress: OffsetRegister),
+        BufferAccess(44, "BufferStoreDwordx4", ResultRegister, 0, 4, vectorData: 4),
+        EndProgram(52));
 
     // v3 = 0; v1 = load(s[0:1] + v3 + offset); result[0] = v1.
     private static Gen5ShaderProgram LoadProgram(string opcode, int offset) => Program(
