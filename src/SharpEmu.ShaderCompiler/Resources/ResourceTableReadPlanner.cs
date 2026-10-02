@@ -148,9 +148,10 @@ public sealed class ResourceTableReadPlanner
             return;
         }
 
-        // An address carried by a loop phi is the loop's current pointer: the host sees one
-        // value per draw, the shader one per iteration, so the shader performs the read.
-        if (DependsOnPhi(value.Operands[0]))
+        // An address carried by a loop phi that changes per iteration is the loop's current
+        // pointer: the host sees one value per draw, the shader one per iteration, so the
+        // shader performs the read. A phi that only merges one value with itself is that value.
+        if (DependsOnVaryingPhi(value.Operands[0]))
         {
             return;
         }
@@ -169,7 +170,7 @@ public sealed class ResourceTableReadPlanner
         _patches.Add((value, newSlot));
     }
 
-    private static bool DependsOnPhi(ScalarValue value)
+    private bool DependsOnVaryingPhi(ScalarValue value)
     {
         var pending = new Stack<ScalarValue>();
         var visited = new HashSet<ScalarValue>();
@@ -179,7 +180,13 @@ public sealed class ResourceTableReadPlanner
             if (!visited.Add(current))
                 continue;
             if (current.Kind == ScalarValueKind.Phi)
-                return true;
+            {
+                if (_graph.ResolveInvariantPhi(current) is not { } invariant || invariant.Kind == ScalarValueKind.Phi)
+                    return true;
+                pending.Push(invariant);
+                continue;
+            }
+
             foreach (var operand in current.Operands)
                 pending.Push(operand);
         }
