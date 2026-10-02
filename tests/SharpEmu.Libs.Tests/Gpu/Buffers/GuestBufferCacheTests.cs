@@ -1222,4 +1222,51 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         Assert.All(harness.ReadBack(harness.Cache.FaultBuffer, word * 4, 4), value => Assert.Equal(0, value));
         harness.Shutdown();
     }
+
+    // An async readback waits only for the buffer's last recorded writer, and work submitted
+    // after it can still reach the buffer through the device-address page table. Collection
+    // must keep the buffer alive until that work completes: destroying it at once let a
+    // Ghost of Yotei dispatch write into freed memory (VK_ERROR_DEVICE_LOST, WriteInvalid).
+    [Fact]
+    public void GarbageCollector_KeepsAnAsyncDownloadedBufferUntilSubmittedWorkCompletes()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        var dirty = harness.MapBacked(0x10000, ReadWrite);
+        var buffer = harness.Worker.Run(() =>
+        {
+            var (written, offset) = harness.Cache.ObtainBuffer(dirty, 0x100, isWritten: true);
+            written.Fill(offset, 0x100, 0x0BADF00D);
+            return written;
+        });
+        harness.Cache.AsyncReadback = new ImmediateReadback();
+        harness.Cache.SetCollectionThresholds(1, 1);
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.RunGarbageCollector();
+            Assert.Equal(0, harness.Cache.BufferCount);
+            Assert.NotEqual(0UL, buffer.Handle.Handle);
+            harness.Scheduler.Finish();
+        });
+        Assert.Equal(0UL, buffer.Handle.Handle);
+        harness.Cache.AsyncReadback = null;
+        harness.Shutdown();
+    }
+
+    // Hands back zeroed bytes at once, without waiting for the main queue.
+    private sealed class ImmediateReadback : SharpEmu.Libs.Gpu.Vulkan.IBufferReadback
+    {
+        public void Read(ReadOnlySpan<SharpEmu.Libs.Gpu.Vulkan.ReadbackPiece> pieces, ulong waitTick,
+            SharpEmu.Libs.Gpu.Vulkan.VulkanAsyncReadback.ReadbackConsumer consume)
+        {
+            for (var index = 0; index < pieces.Length; index++)
+            {
+                consume(index, new byte[pieces[index].Size]);
+            }
+        }
+
+        public void Dispose()
+        {
+        }
+    }
 }

@@ -665,11 +665,12 @@ public static class ResourceMaterializer
         {
             var candidate = new uint[8];
             var heapOffset = key << 5;
-            for (uint dword = 0; dword < 8; dword++)
+            if (!ScalarBufferRangeRead.TryRead(heap.Dwords, heapOffset, 0, inputs, candidate))
             {
-                if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
+                for (uint dword = 0; dword < 8; dword++)
                 {
-                    return false;
+                    if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
+                        return false;
                 }
             }
 
@@ -905,10 +906,13 @@ public static class ResourceMaterializer
         {
             var candidate = new uint[8];
             var descriptorOffset = (ulong)indirect.TableOffset + ((ulong)key << 5);
-            for (uint dword = 0; dword < candidate.Length; dword++)
+            if (!ScalarBufferRangeRead.TryReadAddress(baseAddress, descriptorOffset, inputs, candidate))
             {
-                if (!TryReadCleanWord(baseAddress, descriptorOffset + dword * sizeof(uint), inputs, out candidate[dword]))
-                    return false;
+                for (uint dword = 0; dword < candidate.Length; dword++)
+                {
+                    if (!TryReadCleanWord(baseAddress, descriptorOffset + dword * sizeof(uint), inputs, out candidate[dword]))
+                        return false;
+                }
             }
 
             if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) || !ReservedImageBitsClear(candidate))
@@ -1733,5 +1737,45 @@ public static class ResourceMaterializer
         }
 
         return new SpecializedResourceInfo { Info = info, SamplerByMemoryIndex = samplerByMemory };
+    }
+}
+
+internal static class ScalarBufferRangeRead
+{
+    internal static bool TryReadAddress(ulong baseAddress, ulong offset,
+        ResourceRuntimeInputs inputs, Span<uint> words)
+    {
+        const ulong addressMask = 0x0000_FFFF_FFFF_FFFFul;
+        var length = (ulong)words.Length * sizeof(uint);
+        return inputs.ReadCleanWords is not null && length != 0 && baseAddress <= addressMask &&
+            offset <= addressMask - baseAddress && length - 1 <= addressMask - baseAddress - offset &&
+            inputs.ReadCleanWords(baseAddress + offset, words);
+    }
+
+    // Use one clean read only when every scalar load is in bounds and contiguous.
+    // A refusal leaves the caller's original word reads and OOB handling intact.
+    internal static bool TryRead(ReadOnlySpan<uint> descriptor, uint dynamicOffset,
+        uint immediateOffset, ResourceRuntimeInputs inputs, Span<uint> words)
+    {
+        if (inputs.ReadCleanWords is null || descriptor.Length != 4 || words.IsEmpty)
+            return false;
+
+        var lastImmediate = (ulong)immediateOffset + (ulong)(words.Length - 1) * sizeof(uint);
+        if (lastImmediate > uint.MaxValue)
+            return false;
+
+        const ulong addressMask = 0x0000_FFFF_FFFF_FFFFul;
+        var stride = (descriptor[1] >> 16) & 0x3FFF;
+        var size = stride == 0 ? descriptor[2] : (ulong)stride * descriptor[2];
+        var offset = ((ulong)dynamicOffset + immediateOffset) & ~3ul;
+        var length = (ulong)words.Length * sizeof(uint);
+        if (offset > size || length > size - offset)
+            return false;
+
+        var baseAddress = ((descriptor[0] | ((ulong)descriptor[1] << 32)) & addressMask) & ~3ul;
+        if (offset > addressMask - baseAddress || length - 1 > addressMask - baseAddress - offset)
+            return false;
+
+        return inputs.ReadCleanWords(baseAddress + offset, words);
     }
 }

@@ -215,6 +215,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             for (var index = 0; index < counts.AddressInfoCount; index++)
             {
                 text.Append($" address[{index}]={addresses[index].AddressType}:0x{addresses[index].ReportedAddress:X}/0x{addresses[index].AddressPrecision:X}");
+                text.Append(SharpEmu.Libs.Gpu.Buffers.GpuBufferAddressBook.Describe(addresses[index].ReportedAddress));
             }
 
             for (var index = 0; index < counts.VendorInfoCount; index++)
