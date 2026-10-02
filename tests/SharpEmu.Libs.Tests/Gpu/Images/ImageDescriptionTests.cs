@@ -112,7 +112,7 @@ public sealed class ImageDescriptionTests
     }
 
     [Fact]
-    public void DisplayFormats_DecodeTheSixPixelFormats()
+    public void DisplayFormats_DecodeSupportedPixelFormats()
     {
         Assert.True(DisplayFormatRule.TryDecode(0x8000000022000000, out var rgba));
         Assert.Equal((Format.R8G8B8A8Srgb, GuestPixelFormat.Bits8_8_8_8Srgb, 4u, false), (rgba.HostFormat, rgba.GuestFormat, rgba.BytesPerElement, rgba.Bgra16));
