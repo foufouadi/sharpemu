@@ -769,6 +769,34 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         harness.Shutdown();
     }
 
+    // A shader can follow a pointer into ordinary guest memory outside the GPU mappings.
+    // The fault that reveals it registers the buffer, and preparation must keep touching
+    // it: otherwise it ages out while in use, faults again, and Ghost of Yotei re-created
+    // tens of thousands of such buffers, reading zeros in between.
+    [Fact]
+    public void DeviceAddressPreparationKeepsFaultedBuffersOutsideTheMappingsResident()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var mapped = harness.MapBacked(0x20000, ReadWrite);
+        var pointed = harness.MapBacked(0x20000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.RunGarbageCollector();
+            harness.Cache.NoteDeviceAddressFault(pointed, 0x8000);
+            _ = harness.Cache.FindBuffer(pointed, 0x8000);
+            harness.Cache.SetCollectionThresholds(1, ulong.MaxValue);
+            for (var collection = 0; collection < 170; collection++)
+            {
+                harness.Cache.PrepareBda([new GuestSpan(mapped, 0x20000)]);
+                harness.Cache.RunGarbageCollector();
+                Assert.True(harness.Cache.IsRegionRegistered(pointed, 0x8000));
+                harness.Scheduler.Finish();
+            }
+        });
+        harness.Shutdown();
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
