@@ -31,9 +31,10 @@ public sealed class ShaderPlanningDumpTests
             using var fatalScope = new FatalScope();
             var guest = new PipelineTestGuest();
             // A lane-derived offset reads the descriptor of an image store without a material-table
-            // selector; only plan-time descriptors can bind a store.
+            // selector; only plan-time descriptors can bind a store. Adding one to its first word
+            // keeps an empty source buffer from proving a null descriptor.
             guest.RegisterProgram(codeAddress, PipelineTestGuest.MemoryBase + 0x8000,
-                [0x7E100500, 0xF42C0402, 0x10000000, 0xF0200108, 0x00040000, 0xBF810000]);
+                [0x7E100500, 0xF42C0402, 0x10000000, 0x80108110, 0xF0200108, 0x00040000, 0xBF810000]);
             var source = guest.Source(codeAddress, ShaderStage.Compute, new uint[8]);
             var cursor = 0u;
             var failure = Assert.Throws<SchedulerFatalException>(() =>

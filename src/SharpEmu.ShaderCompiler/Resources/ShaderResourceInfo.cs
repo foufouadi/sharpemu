@@ -262,6 +262,9 @@ public sealed class DescriptorSource
 
     // For a sampler: Dwords are the table V#, and every record's sampler must be the same.
     public PointerTableSelector? PointerTable { get; init; }
+    // Scalar loads from an empty buffer return zero regardless of the offset.
+    // Materialization must recheck the source extent before using these words.
+    public uint? ZeroExtentBufferSource { get; init; }
 }
 
 // One immediate-offset scalar read the host evaluates into the flattened table.
