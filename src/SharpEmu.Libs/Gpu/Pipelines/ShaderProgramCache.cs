@@ -708,6 +708,7 @@ internal sealed class ShaderProgramCache
                     NativeHalfConversionExact = nativeHalfConversion,
                     ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
                     PixelOutputs = options.PixelOutputs,
+                    EarlyFragmentTests = info.EarlyDepth,
                     PixelInputEnable = options.PixelInputEnable,
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
                     SupportsPerVertexPixelInputs = _host.PerVertexPixelInputsSupported,
