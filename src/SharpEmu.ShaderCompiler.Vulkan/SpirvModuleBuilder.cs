@@ -280,6 +280,7 @@ public enum SpirvDecoration : uint
     BuiltIn = 11,
     NoPerspective = 13,
     Flat = 14,
+    Sample = 17,
     PerVertexKhr = 5285,
     Patch = 15,
     Location = 30,
