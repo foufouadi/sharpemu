@@ -43,6 +43,8 @@ public sealed class AudioOut2PortGetStateExportsTests
         Assert.Equal(1, BinaryPrimitives.ReadUInt16LittleEndian(state));
         Assert.Equal(1, state[2]);
         Assert.Equal(2, state[3]);
+        Assert.Equal(-1, BinaryPrimitives.ReadInt16LittleEndian(state[4..]));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state[8..]));
         // Bytes past sizeof(SceAudioOut2PortState), 0x40, must remain untouched.
         Assert.Equal(0xAB, state[0x40]);
         Assert.Equal(0xAB, state[0x7F]);
