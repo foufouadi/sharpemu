@@ -40,6 +40,30 @@ public sealed unsafe partial class RenderHostDeviceTests
     public void Tessellation_SuccessiveBatchesReuseTheFactorRingAfterThePreviousDraw() =>
         RenderTessellationPatch(0, true, true, patchCount: 2);
 
+    // With the guest's off-chip configuration, hull groups that fit run in one dispatch, each
+    // writing its factors to its own run of the ring, and one draw consumes them all.
+    [Fact]
+    public void Tessellation_GroupsInFlightWriteTheirOwnFactorRuns()
+    {
+        TessellationOffchip.Configure(0xFF);
+        try
+        {
+            RenderTessellationPatch(0, true, true, patchCount: 2, ringPatches: 2);
+        }
+        finally
+        {
+            TessellationOffchip.Reset();
+        }
+    }
+
+    [Fact]
+    public void TessellationOffchip_DecodesTheBufferCountAndGranularity()
+    {
+        Assert.Equal((256u, 32u * 1024), TessellationOffchip.Decode(0xFF));
+        Assert.Equal((1u, 64u * 1024), TessellationOffchip.Decode(1u << 10));
+        Assert.Equal((1024u, 256u * 1024), TessellationOffchip.Decode(0x3FFu | (3u << 10)));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -47,7 +71,7 @@ public sealed unsafe partial class RenderHostDeviceTests
         RenderTessellationPatch(0, false, true, verifyOffset: true, indexed: indexed);
 
     private void RenderTessellationPatch(float firstOuter, bool visible, bool computeFactors, uint patchCount = 1,
-        bool verifyOffset = false, bool indexed = false)
+        bool verifyOffset = false, bool indexed = false, uint ringPatches = 1)
     {
         Assert.True(Ready(), "This test requires a Vulkan device with dynamic rendering.");
         using var presenter = new PresenterUnderTest(_vulkan!);
@@ -64,7 +88,7 @@ public sealed unsafe partial class RenderHostDeviceTests
         var words = RegisterWords.Color(target, Size, Size);
         var executor = new RenderExecutor(presenter.RenderHost,
             new TessellationProgramProvider((IShaderPipelineHost)presenter.Instance, factors.DeviceAddress, guestFactors, firstOuter,
-                patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u));
+                patchCount > 1 || verifyOffset, verifyOffset ? 2u : 0u, 24 * ringPatches));
         GuestGpuMemoryHook.Attach(harness.Gpu);
         try
         {
@@ -99,13 +123,22 @@ public sealed unsafe partial class RenderHostDeviceTests
             var image = harness.ReadImageBytes(TargetImage(presenter, words));
             Assert.Equal(visible ? Red : 0u, Pixel(image, Size / 2, Size / 2));
             Assert.Equal(visible ? Red : 0u, Pixel(image, 2, 2));
+            if (ringPatches > 1)
+            {
+                // Patch 0 wrote its zero factor at the start of the ring; patch 1 wrote its
+                // own factors one patch further instead of over patch 0's.
+                var host = (IShaderPipelineHost)presenter.Instance;
+                uint Factor(ulong address) => presenter.Run(() => host.TryReadGuestWord(address, out var word) ? word : uint.MaxValue);
+                Assert.Equal(0u, Factor(guestFactors));
+                Assert.Equal(BitConverter.SingleToUInt32Bits(1), Factor(guestFactors + 24));
+            }
         }
         finally { GuestGpuMemoryHook.Attach(null); }
         harness.Shutdown();
     }
 
     private sealed class TessellationProgramProvider(IShaderPipelineHost host, ulong factorAddress, ulong guestFactors, float firstOuter,
-        bool useAbsolutePatchId, uint factorSourceRegister) : IShaderPipelineProvider
+        bool useAbsolutePatchId, uint factorSourceRegister, uint factorRingBytes) : IShaderPipelineProvider
     {
         private ShaderProgram _vertex, _control, _domain, _pixel;
         private ShaderProgramInfo _domainInfo = null!;
@@ -192,11 +225,11 @@ public sealed unsafe partial class RenderHostDeviceTests
             };
             var data = new uint[20];
             data[12] = BitConverter.SingleToUInt32Bits(firstOuter);
-            data[16] = (uint)guestFactors; data[17] = (uint)(guestFactors >> 32); data[18] = 24;
+            data[16] = (uint)guestFactors; data[17] = (uint)(guestFactors >> 32); data[18] = factorRingBytes;
             var input = new ComputeInputInfo
             {
                 ThreadsX = 64, ThreadsY = 1, ThreadsZ = 1, WaveSize = 64,
-                Stage = new(info, new ResourceSnapshot { UserData = data, Buffers = [[(uint)guestFactors, (uint)(guestFactors >> 32), 24, 0]] }),
+                Stage = new(info, new ResourceSnapshot { UserData = data, Buffers = [[(uint)guestFactors, (uint)(guestFactors >> 32), factorRingBytes, 0]] }),
             };
             return new() { Input = input, Program = new(5, host.CreateShaderModule(new VulkanCompiledGuestShader(shader.Spirv), ShaderStage.Compute, Hash, 5)) };
         }

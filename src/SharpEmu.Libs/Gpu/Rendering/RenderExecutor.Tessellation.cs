@@ -66,9 +66,16 @@ public sealed partial class RenderExecutor
             throw _host.Fatal("The tessellation factor buffer is missing from the hull resources.");
         var descriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[factorIndex]);
         var factorSize = descriptor.Footprint() ?? throw _host.Fatal("The tessellation factor-ring footprint overflows.");
-        var factorBytes = Math.Min(patches, layout.PatchesPerGroup) * Gen5TessellationBridge.FactorCount(tessellation.Configuration.Domain) * 4;
+        var patchFactorBytes = Gen5TessellationBridge.FactorCount(tessellation.Configuration.Domain) * 4;
+        var groupFactorBytes = layout.PatchesPerGroup * patchFactorBytes;
+        var factorBytes = Math.Min(patches, layout.PatchesPerGroup) * patchFactorBytes;
         if (descriptor.Address == 0 || factorSize < factorBytes || descriptor.SwizzleEnabled || descriptor.AddThreadId)
             throw _host.Fatal("The tessellation factor ring has an invalid address, extent or addressing mode.");
+        // Groups that run together take their own off-chip buffer and their own run of the
+        // factor ring. Without the guest's off-chip configuration, one group runs at a time.
+        var (offchipBuffers, offchipSlotBytes) = Gpu.TessellationOffchip.Configuration;
+        var groupsPerBatch = offchipBuffers == 0 ? 1u : (uint)Math.Clamp(Math.Min(offchipBuffers, factorSize / groupFactorBytes), 1, uint.MaxValue);
+        var batchCapacity = groupsPerBatch * layout.PatchesPerGroup;
         var originalHullStage = input.Stage;
         var originalDomainStage = state.Programs.VertexInput.Stage;
         var pipeline = _pipelines.CreateComputePipeline(input, hull.Program);
@@ -78,14 +85,18 @@ public sealed partial class RenderExecutor
             for (uint instance = 0; instance < instances; instance++)
                 for (uint firstPatch = 0; firstPatch < patches;)
                 {
-                    var batchPatches = Math.Min(layout.PatchesPerGroup, patches - firstPatch);
+                    var batchPatches = Math.Min(batchCapacity, patches - firstPatch);
+                    var groups = (batchPatches + layout.PatchesPerGroup - 1) / layout.PatchesPerGroup;
                     var data = new uint[Gen5TessellationData.DwordCount];
                     data[Gen5TessellationData.FirstPatch] = firstPatch;
                     data[Gen5TessellationData.PatchCount] = batchPatches;
                     data[Gen5TessellationData.VertexOffset] = unchecked((uint)vertexOffset);
                     data[Gen5TessellationData.InstanceId] = checked(firstInstance + instance);
                     data[Gen5TessellationData.IndexSize] = indexSize;
-                    data[Gen5TessellationData.FactorBytes] = batchPatches * Gen5TessellationBridge.FactorCount(tessellation.Configuration.Domain) * 4;
+                    data[Gen5TessellationData.FactorBytes] = batchPatches * patchFactorBytes;
+                    data[Gen5TessellationData.GroupPatches] = offchipBuffers == 0 ? 0 : layout.PatchesPerGroup;
+                    data[Gen5TessellationData.OffchipSlotBytes] = offchipSlotBytes;
+                    data[Gen5TessellationData.FactorGroupBytes] = groupFactorBytes;
                     data[Gen5TessellationData.MinimumLevel] = banks.Context.ShaderInterface.MinTessellationLevel;
                     data[Gen5TessellationData.MaximumLevel] = banks.Context.ShaderInterface.MaxTessellationLevel;
                     using (_host.BeginPreparation())
@@ -120,7 +131,7 @@ public sealed partial class RenderExecutor
                         _host.BindResources(bindings);
                         _host.CommitBindings(PipelineBindPoint.Compute, pipeline, [bindings]);
                         _host.BindPipeline(PipelineBindPoint.Compute, pipeline);
-                        _host.Dispatch(1, 1, 1);
+                        _host.Dispatch(groups, 1, 1);
                         _host.ShaderWriteBarrier(PipelineStageFlags.ComputeShaderBit);
                     }
                     state.Programs.VertexInput.Stage = originalDomainStage with { TessellationData = data };

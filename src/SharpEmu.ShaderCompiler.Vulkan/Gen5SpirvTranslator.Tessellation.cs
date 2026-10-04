@@ -19,7 +19,16 @@ public static partial class Gen5SpirvTranslator
             var info = _request.TessellationHull!.Value;
             var local = Load(_uintType, _localInvocationIndexInput);
             var waveBase = BitwiseAnd(local, UInt(~63u));
-            var patchCount = TessellationWord(Gen5TessellationData.PatchCount);
+            // Workgroup k runs hull group k of the dispatch: its patches, its off-chip slot
+            // (s2) and its run of the factor ring (s4).
+            var group = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, Load(_uvec3Type, _workGroupIdInput), 0);
+            var groupFirst = _module.AddInstruction(SpirvOp.IMul, _uintType, group, UInt(info.PatchesPerGroup));
+            var firstPatch = IAdd(TessellationWord(Gen5TessellationData.FirstPatch), groupFirst);
+            var remainingPatches = _module.AddInstruction(SpirvOp.ISub, _uintType,
+                TessellationWord(Gen5TessellationData.PatchCount), groupFirst);
+            var patchCount = _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, remainingPatches, UInt(info.PatchesPerGroup)),
+                remainingPatches, UInt(info.PatchesPerGroup));
             uint WaveCount(uint controlPoints)
             {
                 var threads = _module.AddInstruction(SpirvOp.IMul, _uintType, patchCount, UInt(controlPoints));
@@ -29,15 +38,17 @@ public static partial class Gen5SpirvTranslator
                 return _module.AddInstruction(SpirvOp.Select, _uintType,
                     _module.AddInstruction(SpirvOp.ULessThan, _boolType, remaining, UInt(64)), remaining, UInt(64));
             }
-            StoreS(2, TessellationWord(Gen5TessellationData.OffchipOffset));
+            StoreS(2, IAdd(TessellationWord(Gen5TessellationData.OffchipOffset), _module.AddInstruction(SpirvOp.IMul, _uintType,
+                group, TessellationWord(Gen5TessellationData.OffchipSlotBytes))));
             StoreS(3, BitwiseOr(WaveCount(info.InputControlPoints), ShiftLeftLogical(WaveCount(info.OutputControlPoints), UInt(8))));
-            StoreS(4, TessellationWord(Gen5TessellationData.FactorOffset));
+            StoreS(4, IAdd(TessellationWord(Gen5TessellationData.FactorOffset), _module.AddInstruction(SpirvOp.IMul, _uintType,
+                group, TessellationWord(Gen5TessellationData.FactorGroupBytes))));
             var relativePatch = _module.AddInstruction(SpirvOp.UDiv, _uintType, local, UInt(info.OutputControlPoints));
             var controlPoint = _module.AddInstruction(SpirvOp.UMod, _uintType, local, UInt(info.OutputControlPoints));
-            StoreV(0, IAdd(relativePatch, TessellationWord(Gen5TessellationData.FirstPatch)), false);
+            StoreV(0, IAdd(relativePatch, firstPatch), false);
             StoreV(1, BitwiseOr(relativePatch, ShiftLeftLogical(controlPoint, UInt(8))), false);
             var inputIndex = IAdd(local, _module.AddInstruction(SpirvOp.IMul, _uintType,
-                TessellationWord(Gen5TessellationData.FirstPatch), UInt(info.InputControlPoints)));
+                firstPatch, UInt(info.InputControlPoints)));
             var indexSize = TessellationWord(Gen5TessellationData.IndexSize);
             var vertex = _tessellationVertexIndexScratch;
             Store(vertex, inputIndex);
@@ -83,16 +94,25 @@ public static partial class Gen5SpirvTranslator
                 _floatType, coordinates, 0)), guardWithExec: false);
             StoreV(6, Bitcast(_uintType, _module.AddInstruction(SpirvOp.CompositeExtract,
                 _floatType, coordinates, 1)), guardWithExec: false);
-            // v7 is the patch within its hull group and v8 the patch within the draw. Each
-            // native draw covers one group, so the draw's patch is the group's first patch
-            // plus the native primitive ID.
-            var relativePatch = Load(_uintType, _tessellationPatchIdInput);
-            StoreV(7, relativePatch, guardWithExec: false);
-            StoreV(8, _request.Bindings.UsesTessellationData
-                ? IAdd(relativePatch, TessellationWord(Gen5TessellationData.FirstPatch))
-                : relativePatch, guardWithExec: false);
-            if (_request.Bindings.UsesTessellationData)
-                StoreS(4, TessellationWord(Gen5TessellationData.OffchipOffset));
+            // v7 is the patch within its hull group and v8 the patch ID. A native draw covers
+            // whole hull groups in order, so the native primitive ID gives the group (and its
+            // off-chip slot in s4) and the patch within it.
+            var drawPatch = Load(_uintType, _tessellationPatchIdInput);
+            if (!_request.Bindings.UsesTessellationData)
+            {
+                StoreV(7, drawPatch, guardWithExec: false);
+                StoreV(8, drawPatch, guardWithExec: false);
+                return;
+            }
+
+            var groupPatches = TessellationWord(Gen5TessellationData.GroupPatches);
+            var divisor = _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, groupPatches, UInt(0)), UInt(uint.MaxValue), groupPatches);
+            var group = _module.AddInstruction(SpirvOp.UDiv, _uintType, drawPatch, divisor);
+            StoreV(7, _module.AddInstruction(SpirvOp.UMod, _uintType, drawPatch, divisor), guardWithExec: false);
+            StoreV(8, IAdd(drawPatch, TessellationWord(Gen5TessellationData.FirstPatch)), guardWithExec: false);
+            StoreS(4, IAdd(TessellationWord(Gen5TessellationData.OffchipOffset), _module.AddInstruction(SpirvOp.IMul, _uintType,
+                group, TessellationWord(Gen5TessellationData.OffchipSlotBytes))));
         }
 
         private void EmitTessellationExecutionModes(uint entryPoint)
