@@ -151,6 +151,28 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     }
 
     [Fact]
+    public void TessellatedPatches_KeepTheGuestCulling()
+    {
+        var banks = Banks();
+        banks.Context.RasterMode.CullBack = true;
+        var programs = Programs();
+        var tessellated = new VertexInputInfo
+        {
+            PositionExportControl = programs.VertexInput.PositionExportControl,
+            Stage = programs.VertexInput.Stage,
+            Tessellation = new(new(10), new(20), 4),
+        };
+        var rendering = new RenderingState { Samples = 1 };
+
+        var description = ShaderPipelineCache.BuildGraphicsDescription(
+            [], default, tessellated, programs.PixelInput, banks.Context, in rendering, PrimitiveTopology.PatchList, false, false,
+            programs.Vertex, programs.Pixel, SampleCountFlags.Count1Bit);
+
+        Assert.Equal(PrimitiveTopology.PatchList, description.StaticParameters.Topology);
+        Assert.True(description.StaticParameters.CullBack);
+    }
+
+    [Fact]
     public void DepthTarget_FoldsTheDepthAndStencilState()
     {
         var description = Describe(withDepth: true);

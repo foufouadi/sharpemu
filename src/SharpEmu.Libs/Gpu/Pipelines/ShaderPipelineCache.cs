@@ -557,7 +557,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         var depthState = withDepth ? depth.Target.State : default;
-        var rectangleList = topology == PrimitiveTopology.PatchList;
+        // A patch list without tessellation stages carries legacy rectangles, which are never
+        // culled. Tessellated patches rasterize as ordinary triangles and keep the guest's culling.
+        var rectangleList = topology == PrimitiveTopology.PatchList && vertexInput.Tessellation is null;
         var mode = context.RasterMode;
         parameters.NegativeOneToOne = !context.Clip.DirectXClipSpace;
         parameters.DepthClipEnable = context.Clip.IsZClipEnabled;
