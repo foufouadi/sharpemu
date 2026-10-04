@@ -167,8 +167,7 @@ public static class ResourceMaterializer
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
                     {
                         var descriptor = descriptors[candidateIndex];
-                        if (NullImageDescriptor(descriptor.Dwords) || !ValidImageDescriptor(descriptor.Dwords, image.R128) ||
-                            !ReservedImageBitsClear(descriptor.Dwords))
+                        if (!UsableImageCandidate(descriptor.Dwords, image.R128))
                             descriptor = DescriptorWords.Empty(8);
                         var existing = directTable.Descriptors.FindIndex(candidate => candidate.SameAs(descriptor));
                         if (existing < 0)
@@ -564,6 +563,10 @@ public static class ResourceMaterializer
         return blockBytes == 0 || (baseAddress & (blockBytes - 1)) == 0;
     }
 
+    private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, bool r128) =>
+        !NullImageDescriptor(candidate) && ValidImageDescriptor(candidate, r128) && ReservedImageBitsClear(candidate) &&
+        GuestImageFormat.SampledNumericClass(GuestImageFormat.FormatOf(candidate)) != ImageNumericClass.Unsupported;
+
     private static ulong ScalarBufferSize(ReadOnlySpan<uint> descriptor)
     {
         var stride = (descriptor[1] >> 16) & 0x3FFF;
@@ -674,8 +677,7 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.R128) ||
-                !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, image.R128))
             {
                 Array.Clear(candidate);
             }
@@ -731,8 +733,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) ||
-                !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
         }
@@ -915,7 +916,7 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) || !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
             offsets.Add(unchecked(indirect.DynamicOffsetBase + (key << 5)));
