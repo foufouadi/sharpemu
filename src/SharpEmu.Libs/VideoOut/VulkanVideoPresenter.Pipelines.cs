@@ -109,6 +109,8 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.UsesBindlessImages => BindlessImageHeapEnabled;
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
         bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
+
+        bool IShaderPipelineHost.SupportsDualSourceBlend => _supportsDualSourceBlend;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;

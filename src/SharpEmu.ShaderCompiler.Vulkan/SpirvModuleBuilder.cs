@@ -283,6 +283,7 @@ public enum SpirvDecoration : uint
     PerVertexKhr = 5285,
     Patch = 15,
     Location = 30,
+    Index = 32,
     Binding = 33,
     DescriptorSet = 34,
     Offset = 35,

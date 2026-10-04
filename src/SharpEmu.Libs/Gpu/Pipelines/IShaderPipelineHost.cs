@@ -72,6 +72,9 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // The device can blend with a second fragment output (dualSrcBlend).
+    bool SupportsDualSourceBlend => false;
+
     bool TryReadCleanGuestWords(ulong address, Span<uint> words)
     {
         using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
