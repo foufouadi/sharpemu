@@ -266,4 +266,31 @@ public sealed class TargetResolverTests : IClassFixture<HeadlessVulkanFixture>
         context.DepthTarget = RegisterWords.Depth(Base, 64, 64, depthTest: false, depthWrite: false);
         Assert.Null(DepthTargetResolver.Resolve(context, _vulkan.DeviceInfo, Fatal));
     }
+
+    [Fact]
+    public void DepthState_PlayroomReplacementClearsOnlyTheWrittenBit()
+    {
+        var context = StencilContext(pass: 3, writeMask: 0x80, operationValue: 1, depthControl: 0x007007B1);
+        context.StencilControl = new StencilControlRegisters
+        {
+            Fail = 3, Pass = 3, DepthFail = 3,
+            FailBack = 4, PassBack = 4, DepthFailBack = 4,
+        };
+        context.StencilMask.TestValue = 0x80;
+        context.StencilMask.TestValueBack = 0x80;
+        context.StencilMask.MaskBack = 0xFF;
+        context.StencilMask.WriteMaskBack = 0x80;
+        context.StencilMask.OperationValueBack = 1;
+
+        var state = DepthTargetResolver.ResolveState(context, true, Fatal);
+
+        Assert.Equal(new StencilOperations(StencilOp.Replace, StencilOp.Replace, StencilOp.Replace, CompareOp.Always), state.FrontOperations);
+        Assert.Equal(new StencilOperations(StencilOp.Zero, StencilOp.Zero, StencilOp.Zero, CompareOp.Always), state.BackOperations);
+        Assert.Equal(new StencilMasks(0xFF, 0x80, 0x80), state.FrontMasks);
+        Assert.Equal(state.FrontMasks, state.BackMasks);
+        for (uint oldValue = 0; oldValue <= 0xFF; oldValue++)
+        {
+            Assert.Equal((oldValue & ~0x80u) | (1u & 0x80u), oldValue & ~state.BackMasks.WriteMask);
+        }
+    }
 }

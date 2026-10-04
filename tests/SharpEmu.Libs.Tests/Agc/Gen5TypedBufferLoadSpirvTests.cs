@@ -167,4 +167,16 @@ public sealed class Gen5TypedBufferLoadSpirvTests
 
         return names;
     }
+
+    [Fact]
+    public void FormattedUntypedLoad_SpecializesOnTheDescriptorFormat()
+    {
+        var request = CreateCompileRequest("BufferLoadFormatXyzw", typed: false, typedFormat: 0, dwordCount: 4);
+        Assert.Equal(77u, Assert.Single(request.Resources.Info.Buffers).DescriptorFormat);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        // The specialized format is a translation-time constant, so it decodes on the host and
+        // the module needs no run-time format lookup table at all.
+        Assert.DoesNotContain(DescriptorFormatTableName, ModuleNames(shader.Spirv));
+    }
 }
