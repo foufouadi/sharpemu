@@ -83,7 +83,14 @@ public static partial class Gen5SpirvTranslator
                 _floatType, coordinates, 0)), guardWithExec: false);
             StoreV(6, Bitcast(_uintType, _module.AddInstruction(SpirvOp.CompositeExtract,
                 _floatType, coordinates, 1)), guardWithExec: false);
-            StoreV(7, Load(_uintType, _tessellationPatchIdInput), guardWithExec: false);
+            // v7 is the patch within its hull group and v8 the patch within the draw. Each
+            // native draw covers one group, so the draw's patch is the group's first patch
+            // plus the native primitive ID.
+            var relativePatch = Load(_uintType, _tessellationPatchIdInput);
+            StoreV(7, relativePatch, guardWithExec: false);
+            StoreV(8, _request.Bindings.UsesTessellationData
+                ? IAdd(relativePatch, TessellationWord(Gen5TessellationData.FirstPatch))
+                : relativePatch, guardWithExec: false);
             if (_request.Bindings.UsesTessellationData)
                 StoreS(4, TessellationWord(Gen5TessellationData.OffchipOffset));
         }

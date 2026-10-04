@@ -184,6 +184,29 @@ public sealed class Gen5TessellationTests
         Assert.DoesNotContain(instructions, i => i.Op == SpirvOp.ExecutionMode && i.Args[1] == 17);
     }
 
+    // The ES ABI gives the domain shader u, v, its relative patch and its patch ID in v5..v8.
+    [Fact]
+    public void Evaluation_FillsBothThePatchWithinItsGroupAndThePatchId()
+    {
+        var program = Program(new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Exp, "Exp", [0u, 0u],
+            [Gen5Operand.Vector(7), Gen5Operand.Vector(8), Gen5Operand.Vector(5), Gen5Operand.Vector(6)], [],
+            new Gen5ExportControl(12, 15, false, true, false)), EndProgram(8));
+        var (plan, resources, layout) = Prepare(program, ShaderStage.TessellationEvaluation);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        { Tessellation = new(Gen5TessellationDomain.Quads, Gen5TessellationSpacing.Equal, false, false) };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
+        var instructions = Instructions(shader.Spirv).ToArray();
+        var primitiveId = Assert.Single(instructions,
+            i => i.Op == SpirvOp.Decorate && i.Args[1] == (uint)SpirvDecoration.BuiltIn && i.Args[2] == 7).Args[0];
+        var derived = instructions.Where(i => i.Op == SpirvOp.Load && i.Args[2] == primitiveId).Select(i => i.Args[1]).ToHashSet();
+        foreach (var add in instructions.Where(i => i.Op == SpirvOp.IAdd && (derived.Contains(i.Args[2]) || derived.Contains(i.Args[3]))))
+            derived.Add(add.Args[1]);
+        var stored = instructions.Where(i => i.Op == SpirvOp.Store && derived.Contains(i.Args[1])).Select(i => i.Args[0]).ToHashSet();
+        // Two distinct registers receive the native primitive ID: v7 and v8.
+        Assert.Equal(2, stored.Count);
+    }
+
     [Fact]
     public void Evaluation_MissingConfigurationIsAnExplicitFailure()
     {
