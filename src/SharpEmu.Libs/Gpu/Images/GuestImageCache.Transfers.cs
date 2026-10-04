@@ -29,6 +29,7 @@ public sealed unsafe partial class GuestImageCache
         public bool Tiled;
         public bool SwapBgra16;
         public bool Valid;
+        public TileElementLayout Element;
     }
 
     private sealed class ImageDownloadPlan
@@ -121,6 +122,10 @@ public sealed unsafe partial class GuestImageCache
             }
         }
         plan.Tiled = plan.Layout.Surface.Description.TileMode != GuestTileMode.Linear;
+        if (!plan.Tiled && !TileGeometry.TryGetElementLayout(format, out plan.Element))
+        {
+            return plan;
+        }
         if (plan.Tiled)
         {
             if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, guestLevels, out var tiles))
@@ -153,6 +158,8 @@ public sealed unsafe partial class GuestImageCache
         SubmissionScheduler.Fatal(
             $"The color-attachment upload is invalid: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} layers={info.Resources.Layers} samples={info.Samples} backingSamples={image.Backing.Samples} compression={info.Metadata.Compression}.");
 
+    private static int _linearReadbackOverflowWarned;
+
     private static ImageDownloadPlan PlanDownload(CachedImage image)
     {
         ref readonly var info = ref image.Description;
@@ -177,6 +184,20 @@ public sealed unsafe partial class GuestImageCache
 
         plan.Color = PlanColorTransfer(image, UploadRole(image), TransferDirection.Download);
         plan.Valid = plan.Color.Valid;
+        // A linear layout computed for the format can need more bytes than the guest
+        // range holds. Copying it would write past the readback's storage.
+        if (plan.Valid && !plan.Color.Tiled &&
+            TextureTransferLayout.CopyFootprint(plan.Color.Regions, plan.Color.Element) > info.Data.Size)
+        {
+            plan.Valid = false;
+            if (Interlocked.Exchange(ref _linearReadbackOverflowWarned, 1) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][WARN] A linear image readback was skipped: its copy layout needs 0x{TextureTransferLayout.CopyFootprint(plan.Color.Regions, plan.Color.Element):X} bytes " +
+                    $"but the guest range is 0x{info.Data.Size:X}. address=0x{info.Data.Address:X16} format={info.GuestFormat} extent={info.Extent.Width}x{info.Extent.Height} levels={info.Resources.Levels}.");
+            }
+        }
+
         return plan;
     }
 
@@ -651,6 +672,13 @@ public sealed unsafe partial class GuestImageCache
         var swap = color.SwapBgra16 ? ColorChannelSwap.SwapBgra16 : ColorChannelSwap.None;
         if (!color.Tiled)
         {
+            var footprint = TextureTransferLayout.CopyFootprint(color.Regions, color.Element);
+            if (footprint > destinationSize)
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"A linear image download exceeds its destination: needed=0x{footprint:X} destination=0x{destinationSize:X} address=0x{image.Description.Data.Address:X16}.");
+            }
+
             if (swap == ColorChannelSwap.SwapBgra16)
             {
                 var linear = _tiler.GetScratchBuffer(destinationSize);
@@ -826,6 +854,13 @@ public sealed unsafe partial class GuestImageCache
                 color.Tiles = tiles;
                 color.LinearSize = LinearSizeOf(color.Tiles);
             }
+        }
+
+        // The kept levels must fit the bytes the buffer covers, as in a full readback.
+        if (!plan.Depth && !plan.Color.Tiled &&
+            TextureTransferLayout.CopyFootprint(plan.Color.Regions, plan.Color.Element) > copySize)
+        {
+            return false;
         }
 
         DownloadToBuffer(image, buffer, bufferOffset, copySize, plan);

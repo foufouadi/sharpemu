@@ -752,4 +752,32 @@ public sealed partial class GuestImageCacheTests
 
         harness.Shutdown();
     }
+
+    [Fact]
+    public void LinearReadback_LargerThanItsGuestRange_IsNotCopied()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new SharpEmu.Libs.Tests.Gpu.Scheduling.FatalScope();
+        const uint width = 516, height = 516;
+        const ulong size = (ulong)width * height;
+        var layout = TextureTransferLayout.Compute(GuestPixelFormat.Bits8UNorm, width, height, 1, 1, GuestTileMode.Linear, size, false, false, "test");
+        // The padded rows of the linear layout reach past the bytes the guest declared.
+        Assert.True(TextureTransferLayout.CopyFootprint(layout.BuildCopies(), new TileElementLayout(1, 1, 1)) > size);
+
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x100000, ReadWrite);
+        var request = LinearRequest(address, size, Format.R8Unorm, GuestPixelFormat.Bits8UNorm, GuestImageType.Color2D,
+            new Extent3D(width, height, 1), 1, 1, 1);
+        harness.Write(address, Bytes(0x01020304u));
+        var image = harness.Acquire(ref request);
+        // A GPU-modified image is the newest copy of its range, so it is eligible for readback.
+        harness.Image(image).MarkGpuModified();
+        Assert.True(harness.Image(image).SafeToDownload, $"gpu={harness.Image(image).IsGpuModified} buffer={harness.Image(image).IsBufferModified} cpu={harness.Image(image).IsCpuDirty}");
+
+        // Copying that layout would write past the readback storage, so nothing is read back.
+        Assert.False(harness.Worker.Run(() => harness.Images.TryDownloadForTest(image)));
+        harness.Finish();
+        Assert.Equal(0x01020304u, harness.ReadUInt32(address));
+        harness.Shutdown();
+    }
 }
