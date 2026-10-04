@@ -485,6 +485,19 @@ public static class ResourceMaterializer
         return value.ToString();
     }
 
+    private static readonly HashSet<uint> NulledSampledFormats = new();
+
+    private static void ReportNulledSampledFormat(uint format)
+    {
+        lock (NulledSampledFormats)
+        {
+            if (NulledSampledFormats.Add(format))
+            {
+                Console.Error.WriteLine($"[GPU][WARN] A sampled image descriptor uses unsupported format {format}; it is bound as a null texture.");
+            }
+        }
+    }
+
     private static bool NullImageDescriptor(ReadOnlySpan<uint> descriptor) =>
         descriptor[0] == 0 && (descriptor[1] & 0xFF) == 0;
 
@@ -1233,7 +1246,19 @@ public static class ResourceMaterializer
                     numericClass = ImageNumericClass.Uint;
                 }
             }
-            else if (numericClass == ImageNumericClass.Unsupported || (baseImage.DepthCompare && numericClass != ImageNumericClass.Float))
+            else if (numericClass == ImageNumericClass.Unsupported)
+            {
+                ReportNulledSampledFormat(format);
+                Array.Clear(descriptor);
+                images[index] = image with
+                {
+                    NumericClass = ImageNumericClass.Float,
+                    Dimension = ImageDimension.Dim2D,
+                    Cube = false,
+                };
+                continue;
+            }
+            else if (baseImage.DepthCompare && numericClass != ImageNumericClass.Float)
             {
                 return Fail($"sampled image descriptor {index} uses unsupported format {format}");
             }

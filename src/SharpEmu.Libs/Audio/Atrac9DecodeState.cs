@@ -28,6 +28,8 @@ internal readonly record struct Atrac9StreamInfo(
     int FrameSamples,
     int BytesPerFrame);
 
+internal readonly record struct Atrac9Gapless(uint TotalSamples, ushort SkipSamples, ushort SkippedSamples);
+
 internal sealed class Atrac9DecodeState
 {
     internal const int ResultNotInitialized = 0x00000001;
@@ -69,8 +71,58 @@ internal sealed class Atrac9DecodeState
     private ulong _totalDecodedSamples;
     private ulong _totalSampleLimit;
     private ulong _skippedSamples;
+    // Every sample the gapless window removed: the lead-in and the trimmed tail.
+    private ulong _droppedSamples;
+    private byte[]? _superframeOutput;
     private ushort _skipSamples;
     private bool _decodeErrorLogged;
+
+    // Gapless state from sceAjmBatchJobSetGaplessDecode. It is applied again whenever
+    // the stream restarts, as the hardware re-arms its skip and sample counts.
+    private Atrac9Gapless? _gaplessInit;
+
+    public Atrac9Gapless Gapless
+    {
+        get
+        {
+            lock (_gate)
+            {
+                var remaining = _totalSampleLimit == 0
+                    ? _gaplessInit?.TotalSamples ?? 0
+                    : (uint)Math.Min(uint.MaxValue, _totalSampleLimit > _totalDecodedSamples ? _totalSampleLimit - _totalDecodedSamples : 0);
+                return new Atrac9Gapless(
+                    remaining,
+                    (ushort)(_skipSamples - Math.Min(_skippedSamples, _skipSamples)),
+                    (ushort)Math.Min(ushort.MaxValue, _droppedSamples));
+            }
+        }
+    }
+
+    public void SetGapless(uint totalSamples, ushort skipSamples, bool reset)
+    {
+        lock (_gate)
+        {
+            _gaplessInit = new Atrac9Gapless(totalSamples, skipSamples, 0);
+            if (reset || (_totalSampleLimit == 0 && _skipSamples == 0))
+            {
+                ApplyGaplessNoLock();
+            }
+        }
+    }
+
+    private void ApplyGaplessNoLock()
+    {
+        if (_gaplessInit is not { } gapless)
+        {
+            return;
+        }
+
+        // Zero and uint.MaxValue both leave the stream unbounded.
+        _totalSampleLimit = gapless.TotalSamples is 0 or uint.MaxValue ? 0 : _totalDecodedSamples + gapless.TotalSamples;
+        _skipSamples = gapless.SkipSamples;
+        _skippedSamples = 0;
+        _droppedSamples = 0;
+    }
 
     public Atrac9Config? Config
     {
@@ -124,6 +176,11 @@ internal sealed class Atrac9DecodeState
             _totalSampleLimit = totalSamples;
             _skipSamples = skipSamples;
             _skippedSamples = 0;
+            _droppedSamples = 0;
+            if (totalSamples == 0 && skipSamples == 0)
+            {
+                ApplyGaplessNoLock();
+            }
 
             try
             {
@@ -168,7 +225,9 @@ internal sealed class Atrac9DecodeState
             _compressedLength = 0;
             _totalDecodedSamples = 0;
             _skippedSamples = 0;
+            _droppedSamples = 0;
             _containerHeaderLength = 0;
+            ApplyGaplessNoLock();
             if (_compressed is not null)
             {
                 Array.Clear(_compressed);
@@ -216,6 +275,12 @@ internal sealed class Atrac9DecodeState
             while (_compressedLength == info.SuperframeBytes ||
                    consumed < input.Length)
             {
+                // A stream that reached its gapless total takes no more input.
+                if (_totalSampleLimit != 0 && _totalDecodedSamples >= _totalSampleLimit)
+                {
+                    break;
+                }
+
                 // Titles that stream whole .at9 files hand AJM the RIFF/WAVE
                 // container rather than a pointer into its `data` chunk, so the
                 // stream has to be advanced past the header before the first
@@ -256,13 +321,31 @@ internal sealed class Atrac9DecodeState
                     break;
                 }
 
-                if (output.Length - written < outputBytesPerSuperframe)
+                // The gapless window trims the superframe: only the kept samples need room.
+                var fullSamples = info.FrameSamples * info.FramesPerSuperframe;
+                var dropSamples = _skippedSamples < _skipSamples
+                    ? (int)Math.Min((ulong)fullSamples, _skipSamples - _skippedSamples)
+                    : 0;
+                var availableSamples = fullSamples - dropSamples;
+                var writableSamples = _totalSampleLimit == 0
+                    ? availableSamples
+                    : (int)Math.Min((ulong)availableSamples, _totalSampleLimit > _totalDecodedSamples
+                        ? _totalSampleLimit - _totalDecodedSamples
+                        : 0);
+                var sampleBytes = checked(channels * bytesPerSample);
+                if (output.Length - written < writableSamples * sampleBytes)
                 {
                     status |= ResultNotEnoughRoom;
                     break;
                 }
 
-                var decoded = TryDecodeSuperframeNoLock(channels, encoding, output.Slice(written, outputBytesPerSuperframe));
+                if (_superframeOutput is null || _superframeOutput.Length < outputBytesPerSuperframe)
+                {
+                    _superframeOutput = new byte[outputBytesPerSuperframe];
+                }
+
+                var superframe = _superframeOutput.AsSpan(0, outputBytesPerSuperframe);
+                var decoded = TryDecodeSuperframeNoLock(channels, encoding, superframe);
                 if (!decoded)
                 {
                     if (!_decodeErrorLogged)
@@ -274,31 +357,17 @@ internal sealed class Atrac9DecodeState
                             "playing_silence");
                         _decodeErrorLogged = true;
                     }
-                    output.Slice(written, outputBytesPerSuperframe).Clear();
+                    superframe.Clear();
                     lock (DecoderInitGate)
                     {
                         InitializeDecodersNoLock();
                     }
                 }
 
-                var fullSamples = info.FrameSamples * info.FramesPerSuperframe;
-                var dropSamples = _skippedSamples < _skipSamples
-                    ? Math.Min((ulong)fullSamples, _skipSamples - _skippedSamples)
-                    : 0;
-                _skippedSamples += dropSamples;
-                var availableSamples = fullSamples - (int)dropSamples;
-                var writableSamples = _totalSampleLimit == 0
-                    ? availableSamples
-                    : (int)Math.Min((ulong)availableSamples, _totalSampleLimit > _totalDecodedSamples
-                        ? _totalSampleLimit - _totalDecodedSamples
-                        : 0);
-                var sampleBytes = checked(channels * bytesPerSample);
-                if (dropSamples != 0 && writableSamples != 0)
-                {
-                    output.Slice(written + checked((int)dropSamples) * sampleBytes, writableSamples * sampleBytes)
-                        .CopyTo(output.Slice(written, writableSamples * sampleBytes));
-                }
-
+                superframe.Slice(dropSamples * sampleBytes, writableSamples * sampleBytes)
+                    .CopyTo(output.Slice(written, writableSamples * sampleBytes));
+                _skippedSamples += (ulong)dropSamples;
+                _droppedSamples += (ulong)(fullSamples - writableSamples);
                 written += writableSamples * sampleBytes;
                 _compressedLength = 0;
                 _totalDecodedSamples += unchecked((uint)writableSamples);
@@ -691,6 +760,7 @@ internal sealed class Atrac9DecodeState
         _totalDecodedSamples = 0;
         _totalSampleLimit = 0;
         _skippedSamples = 0;
+        _droppedSamples = 0;
         _skipSamples = 0;
         _decodeErrorLogged = false;
     }

@@ -60,6 +60,14 @@ public static class AudioOut2Exports
     // SceAudioOut2Attribute: u32 attributeId, 4 pad, const void* value, size_t valueSize.
     private const int AttributeEntrySize = 0x18;
     private const uint PortAttributeIdPcm = 0;
+    private const uint PortAttributeIdGain = 1;
+    private const uint PortAttributeIdPassthrough = 5;
+    private const uint PortAttributeIdAmbisonics = 8;
+    internal const uint AmbisonicsNone = uint.MaxValue;
+    internal const uint AmbisonicsAcnBase = 64;
+    internal const uint PassthroughLeft = 1;
+    internal const uint PassthroughRight = 2;
+    private const float HalfPower = 0.70710677f;
     private const ushort PortStateOutputConnectedPrimary = 0x01;
 
     // A host device that already holds this much audio is pacing the context; anything beyond the
@@ -174,6 +182,9 @@ public static class AudioOut2Exports
             return ahead <= 0 ? 0 : (uint)Math.Min((ahead + GrainTicks - 1) / GrainTicks, QueueDepth);
         }
 
+        public double DeviceSlotFreeMilliseconds =>
+            DeviceSlotFreeThreshold(GrainSamples, Frequency, QueueDepth);
+
         // Grains the device holds beyond the cushion, at most QueueDepth.
         public uint DeviceQueuedGrains(int queuedMilliseconds)
         {
@@ -240,6 +251,9 @@ public static class AudioOut2Exports
         public uint SamplingFrequency { get; }
         public uint GrainSamples { get; }
         public ulong PcmAddress;
+        public float Gain = 1f;
+        public uint Ambisonics = AmbisonicsNone;
+        public uint Passthrough;
 
         public int PcmPending;
 
@@ -462,6 +476,14 @@ public static class AudioOut2Exports
         {
             context.DevicePaced = true;
         }
+
+        if (submitted || advancedGrain == 1)
+        {
+            if (blocking != 0)
+            {
+                WaitForDeviceSlot(context);
+            }
+        }
         else
         {
             // Push is the blocking point of a grain: it waits for the grain an Advance claimed, or
@@ -588,6 +610,7 @@ public static class AudioOut2Exports
 
         Span<byte> entry = stackalloc byte[AttributeEntrySize];
         Span<byte> pcm = stackalloc byte[8];
+        Span<byte> word = stackalloc byte[sizeof(uint)];
         for (uint i = 0; i < attributeCount; i++)
         {
             if (!ctx.Memory.TryRead(attributesAddress + (i * AttributeEntrySize), entry))
@@ -598,7 +621,41 @@ public static class AudioOut2Exports
             var attributeId = BinaryPrimitives.ReadUInt32LittleEndian(entry);
             var valueAddress = BinaryPrimitives.ReadUInt64LittleEndian(entry[0x08..]);
             var valueSize = BinaryPrimitives.ReadUInt64LittleEndian(entry[0x10..]);
-            if (attributeId != PortAttributeIdPcm || valueAddress == 0 || valueSize < 8)
+            if (valueAddress == 0)
+            {
+                continue;
+            }
+
+            if (attributeId is PortAttributeIdGain or PortAttributeIdPassthrough or PortAttributeIdAmbisonics)
+            {
+                if (valueSize < sizeof(uint) || !ctx.Memory.TryRead(valueAddress, word))
+                {
+                    continue;
+                }
+
+                var value = BinaryPrimitives.ReadUInt32LittleEndian(word);
+                switch (attributeId)
+                {
+                    case PortAttributeIdGain:
+                        var gain = BitConverter.UInt32BitsToSingle(value);
+                        if (float.IsFinite(gain))
+                        {
+                            port.Gain = gain;
+                        }
+
+                        break;
+                    case PortAttributeIdPassthrough:
+                        port.Passthrough = value;
+                        break;
+                    default:
+                        port.Ambisonics = value;
+                        break;
+                }
+
+                continue;
+            }
+
+            if (attributeId != PortAttributeIdPcm || valueSize < 8)
             {
                 continue;
             }
@@ -1099,6 +1156,28 @@ public static class AudioOut2Exports
         }
     }
 
+    internal static double DeviceSlotFreeThreshold(uint grainSamples, uint frequency, uint queueDepth) =>
+        DeviceCushionMilliseconds + (grainSamples * 1000.0 / frequency * Math.Max((long)queueDepth - 1, 0));
+
+    private static void WaitForDeviceSlot(ContextState context)
+    {
+        var backend = ResolveContextBackend(context, out _);
+        if (backend is null)
+        {
+            return;
+        }
+
+        var limit = context.DeviceSlotFreeMilliseconds;
+        var deadline = Stopwatch.GetTimestamp() + (Stopwatch.Frequency / 4);
+        int queued;
+        while ((queued = backend.QueuedMilliseconds) > limit &&
+               Stopwatch.GetTimestamp() < deadline &&
+               !HostSessionControl.IsShutdownRequested)
+        {
+            Thread.Sleep((int)Math.Clamp(Math.Ceiling(queued - limit), 1, 50));
+        }
+    }
+
     private static uint QueuedGrains(ContextState context)
     {
         if (context.DevicePaced)
@@ -1136,7 +1215,9 @@ public static class AudioOut2Exports
                     if (port.ContextHandle != context.Handle ||
                         port.PcmAddress == 0 ||
                         Interlocked.Exchange(ref port.PcmPending, 0) == 0 ||
-                        !TryDecodeDataFormat(port.DataFormat, out var ch, out var bps, out var isFloat))
+                        !TryDecodeDataFormat(port.DataFormat, out var ch, out var bps, out var isFloat) ||
+                        !TryGetStereoGains(port.PortType, ch, port.Gain, port.Ambisonics, port.Passthrough,
+                            out var leftGain, out var rightGain))
                     {
                         continue;
                     }
@@ -1160,7 +1241,8 @@ public static class AudioOut2Exports
                         ch,
                         bps,
                         isFloat,
-                        additive: mixedPorts > 0);
+                        leftGain,
+                        rightGain);
                     mixedPorts++;
                 }
 
@@ -1211,20 +1293,69 @@ public static class AudioOut2Exports
         }
     }
 
-    private static bool IsMainOrBgmPort(ushort portType)
+    internal static bool RoutesToSpeakers(ushort portType) => (portType & 0xFF) is 0 or 1 or 2;
+
+    internal static (float Gain, uint Ambisonics, uint Passthrough)? PortMixAttributes(ulong portHandle) =>
+        Ports.TryGetValue(portHandle, out var port) ? (port.Gain, port.Ambisonics, port.Passthrough) : null;
+
+    internal static bool TryGetStereoGains(
+        ushort portType,
+        int channels,
+        float gain,
+        uint ambisonics,
+        uint passthrough,
+        out float left,
+        out float right)
     {
-        var kind = portType & 0xFF;
-        return kind is 0 or 1;
+        left = 0f;
+        right = 0f;
+        if (!RoutesToSpeakers(portType) || gain == 0f)
+        {
+            return false;
+        }
+
+        if (!IsObjectPort(portType) || channels != 1)
+        {
+            left = gain;
+            right = gain;
+            return true;
+        }
+
+        if (ambisonics == AmbisonicsNone)
+        {
+            left = passthrough == PassthroughRight ? 0f : passthrough == PassthroughLeft ? gain : gain * HalfPower;
+            right = passthrough == PassthroughLeft ? 0f : passthrough == PassthroughRight ? gain : gain * HalfPower;
+            return true;
+        }
+
+        var acn = ambisonics >= AmbisonicsAcnBase;
+        var component = acn ? ambisonics - AmbisonicsAcnBase : ambisonics;
+        if (component == 0)
+        {
+            left = acn ? gain * HalfPower : gain;
+            right = left;
+            return true;
+        }
+
+        if (component == (acn ? 1u : 2u))
+        {
+            left = gain * HalfPower;
+            right = -left;
+            return true;
+        }
+
+        return false;
     }
 
-    private static void MixPortIntoStereo(
+    internal static void MixPortIntoStereo(
         ReadOnlySpan<byte> source,
         Span<float> mix,
         int frames,
         int channels,
         int bytesPerSample,
         bool isFloat,
-        bool additive)
+        float leftGain,
+        float rightGain)
     {
         var frameSize = channels * bytesPerSample;
         for (var frame = 0; frame < frames; frame++)
@@ -1253,16 +1384,8 @@ public static class AudioOut2Exports
                     : ReadNormalizedSample(frameBytes, 1, bytesPerSample, isFloat);
             }
 
-            if (additive)
-            {
-                mix[frame * 2] += left;
-                mix[(frame * 2) + 1] += right;
-            }
-            else
-            {
-                mix[frame * 2] = left;
-                mix[(frame * 2) + 1] = right;
-            }
+            mix[frame * 2] += left * leftGain;
+            mix[(frame * 2) + 1] += right * rightGain;
         }
     }
 
