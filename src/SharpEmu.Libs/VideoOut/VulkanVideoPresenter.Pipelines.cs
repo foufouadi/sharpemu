@@ -117,7 +117,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
-            if (IsCleanReadPage(address, sizeof(uint)))
+            if (IsCleanReadPage(address, sizeof(uint), clean: false))
             {
                 if (TryGetAliasPointer(address, sizeof(uint), out var alias))
                 {
@@ -152,7 +152,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
-                    NoteCleanReadPage(address, sizeof(uint));
+                    NoteCleanReadPage(address, sizeof(uint), clean: false);
                 }
             }
 
@@ -171,6 +171,23 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            if (!_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint), clean: true))
+            {
+                if (TryGetAliasPointer(address, sizeof(uint), out var alias))
+                {
+                    word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                    return true;
+                }
+
+                Span<byte> resident = stackalloc byte[sizeof(uint)];
+                if (_guestMemory.TryRead(address, resident))
+                {
+                    word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(resident);
+                    return true;
+                }
+            }
+
+            CleanReadVerifications++;
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
@@ -179,9 +196,12 @@ internal static unsafe partial class VulkanVideoPresenter
             // A word a previous GPU pass wrote is read once that pass's bytes are back in guest
             // memory, as the command processor would see them: an image's contents go through
             // its buffer view first, then the buffer comes back to guest memory.
-            foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+            if (_imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
             {
-                _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+                {
+                    _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                }
             }
 
             if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
@@ -191,7 +211,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if ((_bufferCache.MayHaveGpuDirtyPages(address, sizeof(uint)) && _bufferCache.HasGpuDirtyPages(address, sizeof(uint))) ||
                 _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
-                _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)).Count != 0)
+                _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
             {
                 return false;
             }
@@ -202,6 +222,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
+            NoteCleanReadPage(address, sizeof(uint), clean: true);
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
             return true;
         }
@@ -215,8 +236,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_bufferCache.HasGpuDirtyPages(address, size) || clean || !IsCleanReadPage(address, size))
+            if (_bufferCache.HasGpuDirtyPages(address, size) || !IsCleanReadPage(address, size, clean))
             {
+                CleanReadVerifications++;
                 if (!_guestMemory.CanRead(address, size) ||
                     _bufferCache.HasGpuDirtyBytes(address, size) ||
                     (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
@@ -224,7 +246,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     return false;
                 }
 
-                NoteCleanReadPage(address, size);
+                NoteCleanReadPage(address, size, clean);
             }
 
             if (TryGetAliasPointer(address, size, out var alias))
@@ -250,7 +272,13 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly long[] Versions = new long[CleanReadPageSlots];
             public readonly ulong[] Aliases = new ulong[CleanReadPageSlots];
             public readonly object?[] Snapshots = new object?[CleanReadPageSlots];
+            // A clean read also needs no GPU-dirty page and no GPU-modified image over the page.
+            public readonly bool[] CleanVerified = new bool[CleanReadPageSlots];
+            public readonly long[] ImageVersions = new long[CleanReadPageSlots];
         }
+
+        // Resident reads that had to check GPU ownership instead of trusting a verified page.
+        internal long CleanReadVerifications { get; private set; }
 
         private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)
         {
@@ -284,24 +312,30 @@ internal static unsafe partial class VulkanVideoPresenter
             return size != 0 && address + size > address && ((address + size - 1) & ~(CleanReadPageBytes - 1)) == page;
         }
 
-        private bool IsCleanReadPage(ulong address, ulong size) =>
+        private bool IsCleanReadPage(ulong address, ulong size, bool clean) =>
             _cleanReadPages is { } pages &&
             TryGetCleanReadPage(address, size, out var page, out var slot) &&
             pages.Tags[slot] == page + 1 &&
-            pages.Versions[slot] == _bufferCache.GpuModifiedVersion;
+            pages.Versions[slot] == _bufferCache.GpuModifiedVersion &&
+            (!clean || (pages.CleanVerified[slot] && pages.ImageVersions[slot] == CachedImage.GpuWriteVersion));
 
-        private void NoteCleanReadPage(ulong address, ulong size)
+        private void NoteCleanReadPage(ulong address, ulong size, bool clean)
         {
             if (!TryGetCleanReadPage(address, size, out var page, out var slot))
             {
                 return;
             }
 
+            // Read the versions first: a change during the checks then invalidates the entry.
             var version = _bufferCache.GpuModifiedVersion;
+            var imageVersion = CachedImage.GpuWriteVersion;
             if (!_guestMemory.CanRead(page, CleanReadPageBytes) || _bufferCache.HasGpuDirtyBytes(page, CleanReadPageBytes))
             {
                 return;
             }
+
+            var cleanVerified = clean && !_bufferCache.HasGpuDirtyPages(page, CleanReadPageBytes) &&
+                !_imageCache.HasGpuModifiedImageBytes(page, CleanReadPageBytes);
 
             var pages = _cleanReadPages ??= new CleanReadPages();
             if (pages.Tags[slot] != page + 1)
@@ -309,9 +343,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 pages.Tags[slot] = page + 1;
                 pages.Aliases[slot] = 0;
                 pages.Snapshots[slot] = null;
+                pages.CleanVerified[slot] = false;
+            }
+
+            if (pages.Versions[slot] != version)
+            {
+                pages.CleanVerified[slot] = false;
             }
 
             pages.Versions[slot] = version;
+            if (cleanVerified)
+            {
+                pages.CleanVerified[slot] = true;
+                pages.ImageVersions[slot] = imageVersion;
+            }
         }
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)

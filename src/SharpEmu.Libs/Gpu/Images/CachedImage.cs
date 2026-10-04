@@ -478,6 +478,10 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void ClearGpuModified() => _gpuModified = false;
 
+    // Advances whenever any image becomes GPU-modified, the only way an image starts to own
+    // guest bytes the CPU must not read.
+    public static long GpuWriteVersion => Interlocked.Read(ref _gpuWriteCounter);
+
     public bool IsBufferModified => _bufferModified;
 
     // The guest buffer cache holds this image's current GPU contents.

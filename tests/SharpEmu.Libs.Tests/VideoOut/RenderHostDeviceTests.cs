@@ -1018,6 +1018,70 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
         harness.Shutdown();
     }
 
+    // Resource reads check a page's GPU ownership once and trust it until a buffer or an image
+    // is written by the GPU; an image written afterwards makes clean reads refuse the page.
+    [Fact]
+    public void CleanResidentReads_VerifyAPageOnceUntilAnImageIsGpuWritten()
+    {
+        if (!Ready())
+        {
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, BitConverter.GetBytes(0xCAFEF00Du));
+        var renderHost = presenter.RenderHost;
+        var verifications = presenter.Instance.GetType().GetProperty("CleanReadVerifications",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        long Verifications() => (long)verifications.GetValue(presenter.Instance)!;
+        var request = SharpEmu.Libs.Tests.Gpu.Images.ImageCacheTestSupport.LinearRequest(address, 0x1000, Format.R8G8B8A8Unorm,
+            GuestPixelFormat.Bits8_8_8_8UNorm, GuestImageType.Color2D, new Extent3D(32, 32, 1), 1, 4, 1);
+        GuestGpuMemoryHook.Attach(harness.Gpu);
+        try
+        {
+            presenter.Run(() =>
+            {
+                Span<byte> bytes = stackalloc byte[sizeof(uint)];
+                Assert.True(renderHost.TryReadCleanGuestBytes(address, bytes));
+                var first = Verifications();
+                for (var index = 0; index < 16; index++)
+                {
+                    Assert.True(renderHost.TryReadCleanGuestBytes(address + (ulong)index * 4, bytes));
+                }
+
+                var host = (IShaderPipelineHost)presenter.Instance;
+                for (var index = 0; index < 16; index++)
+                {
+                    Assert.True(host.TryReadCleanGuestWord(address + (ulong)index * 4, out var word));
+                    if (index == 0) Assert.Equal(0xCAFEF00Du, word);
+                }
+
+                Assert.Equal(first, Verifications());
+                Assert.True(renderHost.TryReadCleanGuestBytes(address, bytes));
+                Assert.Equal(0xCAFEF00Du, BitConverter.ToUInt32(bytes));
+            });
+            var image = harness.Acquire(ref request);
+            presenter.Run(() =>
+            {
+                harness.Image(image).MarkGpuModified();
+                var before = Verifications();
+                Span<byte> bytes = stackalloc byte[sizeof(uint)];
+                Assert.False(renderHost.TryReadCleanGuestBytes(address, bytes));
+                Assert.True(Verifications() > before);
+            });
+        }
+        finally
+        {
+            GuestGpuMemoryHook.Attach(null);
+        }
+
+        harness.Finish();
+        harness.Shutdown();
+    }
+
     [Fact]
     public void ConsecutiveDraws_ShareOneRenderingScopeAndCloseItBeforeTheSubmit()
     {

@@ -522,6 +522,30 @@ public sealed partial class GuestImageCache
 
     // The GPU-modified images whose contents are not yet in a buffer and that overlap the range.
     // An image the CPU or a buffer wrote over since holds superseded contents; memory is newer.
+    // The ranges' test without building them: resource reads ask it for every guest word
+    // and almost never meet such an image.
+    public bool HasUnsynchronizedGpuImage(ulong address, ulong size)
+    {
+        if (!IsValidRange(address, size)) return false;
+        using var held = _lock.Hold();
+        if (!ImagePageOwnerTable.TryGetPageRange(address, size, out var first, out var lastExclusive)) return false;
+        for (var page = first; page < lastExclusive; page++)
+        {
+            var owners = _pageOwners.Find(page);
+            if (owners is null) continue;
+            for (var ownerIndex = 0; ownerIndex < owners.Count; ownerIndex++)
+            {
+                if (IsUnsynchronizedGpuImage(_slots.TryGet(owners[ownerIndex]), address, size)) return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsUnsynchronizedGpuImage(CachedImage? image, ulong address, ulong size) =>
+        image is not null && !image.DepthOwner.IsValid && image.GpuOverlaps(address, size) && !image.BufferHoldsGpuContents &&
+        !image.IsCpuDirty && !image.IsBufferModified;
+
     public List<(ulong Address, ulong Size)> UnsynchronizedGpuImageRanges(ulong address, ulong size)
     {
         var ranges = new List<(ulong Address, ulong Size)>();
@@ -535,9 +559,8 @@ public sealed partial class GuestImageCache
             for (var ownerIndex = 0; ownerIndex < owners.Count; ownerIndex++)
             {
                 var image = _slots.TryGet(owners[ownerIndex]);
-                if (image is not null && !image.DepthOwner.IsValid && image.GpuOverlaps(address, size) && !image.BufferHoldsGpuContents &&
-                    !image.IsCpuDirty && !image.IsBufferModified &&
-                    !ranges.Contains((image.Description.Data.Address, image.Description.Data.Size)))
+                if (IsUnsynchronizedGpuImage(image, address, size) &&
+                    !ranges.Contains((image!.Description.Data.Address, image.Description.Data.Size)))
                     ranges.Add((image.Description.Data.Address, image.Description.Data.Size));
             }
         }
