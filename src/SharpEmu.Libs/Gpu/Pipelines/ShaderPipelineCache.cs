@@ -115,6 +115,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             pixelOutputs = ResolveBoundTargets(context, targetExportMapping, depthBound ? pixelProgram.PixelColorExportMasks : null,
                 out var outputModes, out var outputMappings);
             pixelInfo = PixelStageInputResolver.Resolve(_context, pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount);
+            // SPI_PS_INPUT_CNTL can map an input to any parameter export, beyond the input count;
+            // the vertex program must declare every location the pixel program reads.
+            attributeCount = Math.Max(attributeCount, ReadVertexOutputCount(pixelProgram, pixelInfo));
         }
 
         ShaderProgram vertexProgram;
@@ -208,6 +211,32 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             shaderInterface.VertexOutputControl, clipSpace);
     }
 
+    // One past the highest parameter location the pixel program reads, resolved as its translator does.
+    private static uint ReadVertexOutputCount(Gen5ShaderProgram pixelProgram, PixelInputInfo info)
+    {
+        var attributes = pixelProgram.Instructions
+            .Select(static instruction => instruction.Control)
+            .OfType<Gen5InterpolationControl>()
+            .Select(static control => control.Attribute)
+            .Distinct()
+            .Order()
+            .ToArray();
+        if (attributes.Length == 0)
+        {
+            return 0;
+        }
+
+        var controls = new uint[32];
+        for (var index = 0u; index < (uint)controls.Length; index++)
+        {
+            controls[index] = index < info.InputCount && index < (uint)info.InterpolatorSettings.Length
+                ? info.InterpolatorSettings[index]
+                : index;
+        }
+
+        return Gen5PixelInputMapping.ResolveLocations(controls, attributes).Max() + 1;
+    }
+
     private static uint InterpolatedAttributeCount(Gen5ShaderProgram program)
     {
         var maxAttribute = -1;
@@ -232,6 +261,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         outputModes = new byte[PixelInputInfo.TargetCount];
         outputMappings = new ColorComponentMap[PixelInputInfo.TargetCount];
         var outputs = new List<Gen5PixelOutputBinding>(ContextRegisters.ColorTargetCount);
+        var location = 0u;
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
         {
             if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
@@ -256,9 +286,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 throw SubmissionScheduler.Fatal($"The color target format has no pixel output kind: slot={slot} layout={(uint)words.Layout} numberType={(uint)words.NumberType} order={(uint)words.Order}.");
             }
 
-            outputModes[slot] = (byte)((uint)kind + 1);
+            // A bound slot that no export reaches keeps its contents: its color write mask is zero.
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
+            // The high nibble keys the compiled program by the export that feeds the slot.
+            outputModes[slot] = (byte)(((uint)kind + 1) | (uint)((exportTarget + 1) << 4));
             outputMappings[slot] = new ColorComponentMap(mapping.Packed);
-            outputs.Add(new Gen5PixelOutputBinding(slot, (uint)outputs.Count, kind, mapping));
+            // No EXP target reaches 8 and above, so an unfed slot is declared but never written.
+            outputs.Add(new Gen5PixelOutputBinding(slot, location++, kind, mapping)
+            {
+                ExportTarget = exportTarget >= 0 ? (uint)exportTarget : ContextRegisters.ColorTargetCount + slot,
+            });
         }
 
         return outputs.ToArray();
@@ -457,13 +494,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             // A target the pixel program never exports keeps its contents, as on hardware; the
             // host output would otherwise write an undefined value (e.g. depth-only passes that
             // leave a color target bound and export only to the null target).
-            var exported = pixelStage is not null && ((pixelStage.PixelColorExportMasks >> (int)(color.Slot * 4)) & 0xFu) != 0;
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, color.Slot);
+            var exported = pixelStage is not null &&
+                (exportTarget >= 0 && ((pixelStage.PixelColorExportMasks >> (exportTarget * 4)) & 0xFu) != 0);
             var colorMask = exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0;
             parameters.SetColorMask(index, colorMask);
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
-                    $"PipelineCache output slot={color.Slot} guestMask=0x{context.RenderTargetMaskForSlot(color.Slot):X} " +
+                    $"PipelineCache output slot={color.Slot} export={exportTarget} " +
+                    $"guestMask=0x{context.RenderTargetMaskForSlot(color.Slot):X} " +
                     $"exported={(exported ? 1 : 0)} shaderMask=0x{pixelStage?.PixelColorExportMasks ?? 0:X8} " +
                     $"mapping=0x{color.Resolution.ExportMapping.Packed:X2} hostMask=0x{colorMask:X} format={(int)format}");
             }
@@ -607,6 +647,39 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             _computePipelines.Add(key, created);
             ShaderCacheCounters.CountComputePipeline();
             return created;
+        }
+    }
+
+    public bool TryCreateComputePipeline(ComputeInputInfo input, ShaderProgram program, out PipelineHandle handle)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
+        handle = default;
+        if (!program.IsValid)
+        {
+            throw SubmissionScheduler.Fatal("The dispatch has no compute program.");
+        }
+
+        var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
+        var key = new ComputePipelineKey(program.Id);
+        lock (_gate)
+        {
+            if (_computePipelines.TryGetValue(key, out var cached))
+            {
+                handle = cached;
+                return true;
+            }
+
+            if (!_host.TryCreateComputePipeline(
+                    new ComputePipelineDescription { Input = input, Program = program, Stage = stage },
+                    out var created))
+            {
+                return false;
+            }
+
+            _computePipelines.Add(key, created);
+            ShaderCacheCounters.CountComputePipeline();
+            handle = created;
+            return true;
         }
     }
 }

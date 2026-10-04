@@ -86,6 +86,7 @@ internal sealed class ProgramSourceEntry
     public required Gen5ShaderProgram Program { get; init; }
     public required bool HasBitwiseExclusiveOr { get; init; }
     public ConstantFill? ConstantFill { get; init; }
+    public BoundedFill? BoundedFill { get; init; }
     public EmbeddedVertexFetchPlan? EmbeddedFetch { get; init; }
     public ShaderVertexInput[] VertexInputs { get; init; } = [];
     public List<ProgramPermutation> Permutations { get; } = new(8);
@@ -102,6 +103,7 @@ internal sealed class ShaderProgramCache
     private readonly IShaderPipelineHost _host;
     private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new();
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
+    private readonly Dictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
@@ -115,11 +117,22 @@ internal sealed class ShaderProgramCache
     // (~4 % of the Demon's Souls render thread) for a debug dump that is almost never on.
     private readonly bool _spirvDumpEnabled = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"), "1", StringComparison.Ordinal);
 
+    private readonly GuestWordReader _readGuestWord;
+    private readonly GuestWordReader _readCleanGuestWord;
+    private readonly ResidentGuestBytesReader _readResidentGuestBytes;
+    private readonly ResidentGuestBytesReader? _prefetchResidentGuestBytes;
+
+    private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
+
     public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
     {
         _context = context;
         _compiler = compiler;
         _host = host;
+        _readGuestWord = host.TryReadGuestWord;
+        _readCleanGuestWord = host.TryReadCleanGuestWord;
+        _readResidentGuestBytes = host.TryReadResidentGuestBytes;
+        _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
     }
 
     public int ProgramCount => _programs.Count;
@@ -135,12 +148,30 @@ internal sealed class ShaderProgramCache
             return program;
         }
 
-        if (!Gen5ShaderTranslator.TryDecodeProgram(_context, source.Address, out program, out var error))
+        var recording = _host.ShaderPrewarm is not null ? new RecordingCpuMemory(_context.Memory) : null;
+        var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
+        if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
         {
             throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
         _decoded.Add(key, program);
+        if (recording is not null)
+        {
+            _codeCaptures[key] = new ShaderCodeCapture
+            {
+                Hash = source.Hash,
+                CodeSize = source.CodeSize,
+                Address = source.Address,
+                Generation = _context.TargetGeneration,
+                Fused = Gen5ShaderTranslator.TryGetFusedProgramParts(
+                    _context, source.Address, out var entryHeader, out var continuation, out var continuationHeader)
+                    ? new FusedCodeParts(entryHeader, continuation, continuationHeader)
+                    : null,
+                Ranges = recording.TakeRanges(),
+            };
+        }
+
         return program;
     }
 
@@ -205,6 +236,7 @@ internal sealed class ShaderProgramCache
             ReadMemory = _host.TryReadGuestWord,
             ReadCleanMemory = _host.TryReadCleanGuestWord,
             ReadCleanWords = _host.TryReadCleanGuestWords,
+            ReadResidentMemory = _prefetchResidentGuestBytes,
             ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
                 ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
                     Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
@@ -221,11 +253,17 @@ internal sealed class ShaderProgramCache
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
+        if (Diagnostics.GpuReadTrace.Enabled)
+        {
+            Diagnostics.GpuReadTrace.CurrentShader = source.Hash;
+            Diagnostics.GpuReadTrace.CurrentStage = source.Label;
+        }
+
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
             var materialized = _materializations is not null && captureIndirectImageFailure is null
-                ? _materializations.Materialize(entry.Plan, inputs, _host.TryReadResidentGuestBytes, ref snapshot, ref specialization,
+                ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
@@ -353,6 +391,7 @@ internal sealed class ShaderProgramCache
             Program = program,
             HasBitwiseExclusiveOr = exclusiveOr,
             ConstantFill = source.Stage == ShaderStage.Compute ? ConstantFillDetector.Detect(program) : null,
+            BoundedFill = source.Stage == ShaderStage.Compute ? BoundedFillDetector.Detect(program) : null,
             EmbeddedFetch = fetch,
             VertexInputs = vertexInputs,
         };
@@ -480,16 +519,8 @@ internal sealed class ShaderProgramCache
         try
         {
             resources = ResourceMaterializer.ApplyTo(plan, specialization);
-            layout = BindingLayout.Allocate(
-                resources.Info,
-                BindingLayout.CollectUserDataRegisters(program, source.UserDataBase, (uint)source.UserData.Length),
-                BindingLayout.UsesGlobalDataShare(program),
-                ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
-                BindingLayout.ReadsShaderBase(program),
-                pushDataCursor,
-                usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
-                usesBindlessImages: _host.UsesBindlessImages,
-                usesRuntimeBufferStrides: _host.RuntimeBufferStridesEnabled);
+            layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
+                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions);
         }
         catch (ResourcePlanException exception)
         {
@@ -533,6 +564,24 @@ internal sealed class ShaderProgramCache
         var id = ++_nextProgramId;
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         var info = CreateProgramInfo(source, entry, resources, layout, request);
+        if (source.Stage == ShaderStage.Compute &&
+            _host.ShaderPrewarm is { } prewarm &&
+            _codeCaptures.TryGetValue((source.Hash, source.CodeSize), out var capture))
+        {
+            prewarm.RecordCompute(capture, new ComputePrewarmRecord
+            {
+                Hash = source.Hash,
+                CodeSize = source.CodeSize,
+                Address = capture.Address,
+                UserDataBase = source.UserDataBase,
+                UserDataCount = (uint)source.UserData.Length,
+                PushDataCursor = pushDataCursor,
+                Info = options.ComputeInfo!,
+                SystemRegisters = options.ComputeSystemRegisters,
+                Specialization = specialization.Clone(),
+            });
+        }
+
         return new ProgramPermutation
         {
             Specialization = specialization,
@@ -617,13 +666,157 @@ internal sealed class ShaderProgramCache
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
+                    LocalDataShareDwords = info.LocalDataShareDwords,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),
-                    LocalDataShareDwords = info.LocalDataShareDwords,
                 };
             }
         }
+    }
+
+    private BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
+        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits) =>
+        BindingLayout.Allocate(
+            resources.Info,
+            BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount),
+            BindingLayout.UsesGlobalDataShare(program),
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+            BindingLayout.ReadsShaderBase(program),
+            pushDataCursor,
+            usesDispatchThreadLimits: usesDispatchThreadLimits,
+            usesBindlessImages: _host.UsesBindlessImages,
+            usesRuntimeBufferStrides: _host.RuntimeBufferStridesEnabled);
+
+    private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
+        ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, IShaderPipelineHost host) =>
+        new(plan, resources, layout)
+        {
+            WaveSize = info.WaveSize,
+            EnableExecGuardElision = info.WaveSize != 64 || host.ExecGuardElisionEnabled,
+            TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+            ScratchDwords = info.ScratchDwords,
+            SupportsSharedInt64Atomics = host.SharedInt64AtomicsEnabled,
+            SupportsExactFloat16Conversions = host.ExactFloat16ConversionsEnabled,
+            SupportsNonUniformImageIndexing = host.NonUniformImageIndexingEnabled,
+            ComputeSystemRegisters = systemRegisters,
+            LocalDataShareDwords = info.LocalDataShareDwords,
+            LocalSizeX = Math.Max(info.ThreadsX, 1),
+            LocalSizeY = Math.Max(info.ThreadsY, 1),
+            LocalSizeZ = Math.Max(info.ThreadsZ, 1),
+        };
+
+    internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        IShaderPipelineHost host, out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error)
+    {
+        compiled = null;
+        layout = null;
+        try
+        {
+            if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out var program, out error))
+            {
+                return false;
+            }
+
+            var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
+                waveSize: record.Info.WaveSize);
+            var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
+            layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, record.UserDataBase, record.UserDataCount),
+                BindingLayout.UsesGlobalDataShare(program), ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+                BindingLayout.ReadsShaderBase(program), record.PushDataCursor,
+                usesDispatchThreadLimits: record.Info.DispatchThreadDimensions,
+                usesBindlessImages: host.UsesBindlessImages,
+                usesRuntimeBufferStrides: host.RuntimeBufferStridesEnabled);
+            var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
+                host);
+            return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    // Identify a constant store value without making assumptions about its address.
+    internal static uint? FindConstantStoreValue(Gen5ShaderProgram program)
+    {
+        var constants = new Dictionary<uint, uint>();
+        uint? stored = null;
+        foreach (var instruction in program.Instructions)
+        {
+            switch (instruction.Opcode)
+            {
+                case "SEndpgm" or "SWaitcnt" or "SNop" or "SInstPrefetch":
+                    continue;
+                case "VLshlAddU32" or "VMadU32U24" or "VAddU32" or "VAddI32" or "VAddNcU32" or "VLshlrevB32":
+                    // Index arithmetic; a register it writes is no longer a known constant.
+                    foreach (var destination in instruction.Destinations)
+                    {
+                        if (destination.Kind == Gen5OperandKind.VectorRegister) constants.Remove(destination.Value);
+                    }
+
+                    continue;
+                case "VMovB32":
+                {
+                    if (instruction.Destinations.Count != 1 || instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                        instruction.Sources.Count != 1 || !TryDecodeIntegerConstant(instruction.Sources[0], out var value))
+                    {
+                        return null;
+                    }
+
+                    constants[instruction.Destinations[0].Value] = value;
+                    continue;
+                }
+
+                case "BufferStoreFormatX" or "BufferStoreDword":
+                {
+                    if (stored.HasValue || instruction.Control is not Gen5BufferMemoryControl control ||
+                        !constants.TryGetValue(control.VectorData, out var value))
+                    {
+                        return null;
+                    }
+
+                    stored = value;
+                    continue;
+                }
+
+                default:
+                    return null;
+            }
+        }
+
+        return stored;
+    }
+
+    private static bool TryDecodeIntegerConstant(Gen5Operand operand, out uint value)
+    {
+        value = 0;
+        if (operand.Kind == Gen5OperandKind.LiteralConstant)
+        {
+            value = operand.Value;
+            return true;
+        }
+
+        if (operand.Kind != Gen5OperandKind.EncodedConstant)
+        {
+            return false;
+        }
+
+        // Inline integers: 128..192 are 0..64, 193..208 are -1..-16.
+        if (operand.Value is >= 128 and <= 192)
+        {
+            value = operand.Value - 128;
+            return true;
+        }
+
+        if (operand.Value is >= 193 and <= 208)
+        {
+            value = unchecked((uint)(192 - (int)operand.Value));
+            return true;
+        }
+
+        return false;
     }
 
     private static ShaderProgramInfo CreateProgramInfo(
@@ -679,8 +872,11 @@ internal sealed class ShaderProgramCache
             VertexOffsetScalarRegister = entry.EmbeddedFetch?.VertexOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             InstanceOffsetScalarRegister = entry.EmbeddedFetch?.InstanceOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             UsesDeviceAddresses = info.UsesDeviceAddresses,
+            ConstantStoreValue = FindConstantStoreValue(entry.Program),
+            ImmediateConstantFill = ConstantFillDetector.DetectImmediate(entry.Program),
             HasBitwiseExclusiveOr = entry.HasBitwiseExclusiveOr,
             ConstantFill = entry.ConstantFill,
+            BoundedFill = entry.BoundedFill,
             Buffers = buffers,
             Images = images,
             SamplerCount = info.Samplers.Count,

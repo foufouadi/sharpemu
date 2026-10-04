@@ -314,6 +314,9 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
 
     BufferBinding IRenderHost.NullBuffer => new(0, 0);
 
+    // Metal bindings retain guest ranges directly; acquiring another range never replaces a handle.
+    void IRenderHost.PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges) { }
+
     BufferBinding IRenderHost.ObtainBuffer(ulong address, ulong size, bool isWritten)
     {
         _ = isWritten;
@@ -1188,6 +1191,12 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
     }
 
     bool IRenderHost.TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
+    {
+        _ = (address, size, fillValue);
+        return false;
+    }
+
+    bool IRenderHost.TryFillDccMetadata(ulong address, ulong size, uint fillValue)
     {
         _ = (address, size, fillValue);
         return false;

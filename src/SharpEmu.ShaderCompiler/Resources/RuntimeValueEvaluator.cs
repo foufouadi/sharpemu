@@ -257,43 +257,22 @@ public sealed class RuntimeValueEvaluator
         }
 
         var baseAddress = ((high << 32) | (uint)low) & AddressMask;
-        var immediate = (long)(int)memory.Offset;
-        ulong address;
-        if (value.Kind == ScalarValueKind.ScalarBufferWord)
+        ulong records = 0;
+        if (value.Kind == ScalarValueKind.ScalarBufferWord &&
+            (handle.Operands.Length != 4 ||
+             !EvaluateWide(handle.Operands[2], out records) ||
+             !EvaluateWide(handle.Operands[3], out _)))
         {
-            if (handle.Operands.Length != 4 ||
-                !EvaluateWide(handle.Operands[2], out var records) ||
-                !EvaluateWide(handle.Operands[3], out _))
-            {
-                return false;
-            }
+            return false;
+        }
 
-            if (immediate < 0)
-            {
+        switch (ResolveRawAddress(value.Kind, baseAddress, high, records, (long)(int)memory.Offset, (uint)offset, out var address))
+        {
+            case RawAddress.Failed:
                 return false;
-            }
-
-            var byteOffset = (ulong)immediate + (uint)offset;
-            var aligned = byteOffset & ~3ul;
-            var stride = ((uint)high >> 16) & 0x3FFFu;
-            var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
-            if (aligned > size || size - aligned < sizeof(uint))
-            {
-                // A scalar buffer load past the V# range returns zero on hardware, bound or not.
-                // Reads are evaluated up front, including ones in branches the shader skips.
+            case RawAddress.Zero:
                 result = 0;
                 return true;
-            }
-
-            address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
-        }
-        else
-        {
-            var relative = (immediate & ~3L) + (long)((uint)offset & ~3u);
-            if (!AddSignedAddress(baseAddress & ~3ul, relative, out address))
-            {
-                return false;
-            }
         }
 
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
@@ -313,6 +292,72 @@ public sealed class RuntimeValueEvaluator
         result = word;
         return true;
     }
+
+    internal enum RawAddress : byte
+    {
+        Read,
+        Zero,
+        Failed,
+    }
+
+    internal static RawAddress ResolveRawAddress(ScalarValueKind kind, ulong baseAddress, ulong high, ulong records, long immediate, uint offset,
+        out ulong address)
+    {
+        address = 0;
+        if (kind == ScalarValueKind.ScalarBufferWord)
+        {
+            if (immediate < 0)
+            {
+                return RawAddress.Failed;
+            }
+
+            var byteOffset = (ulong)immediate + offset;
+            var aligned = byteOffset & ~3ul;
+            var stride = ((uint)high >> 16) & 0x3FFFu;
+            var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
+            if (aligned > size || size - aligned < sizeof(uint))
+            {
+                // Scalar loads outside the descriptor range return zero.
+                return RawAddress.Zero;
+            }
+
+            address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
+            return RawAddress.Read;
+        }
+
+        var relative = (immediate & ~3L) + (long)(offset & ~3u);
+        return AddSignedAddress(baseAddress & ~3ul, relative, out address) ? RawAddress.Read : RawAddress.Failed;
+    }
+
+    internal bool TryEvaluateRawBase(ScalarValue handle, ScalarValueKind kind, out ulong baseAddress, out ulong high, out ulong records)
+    {
+        baseAddress = 0;
+        high = 0;
+        records = 0;
+        if (handle.Operands.Length < 2 ||
+            !EvaluateWide(handle.Operands[0], out var low) ||
+            !EvaluateWide(handle.Operands[1], out high))
+        {
+            return false;
+        }
+
+        if (kind == ScalarValueKind.ScalarBufferWord &&
+            (handle.Operands.Length != 4 ||
+             !EvaluateWide(handle.Operands[2], out records) ||
+             !EvaluateWide(handle.Operands[3], out _)))
+        {
+            return false;
+        }
+
+        baseAddress = ((high << 32) | (uint)low) & AddressMask;
+        return true;
+    }
+
+    internal bool IsEvaluated(ScalarValue value) => _cache.TryGetValue(value, out _);
+
+    internal void Seed(ScalarValue value, ulong result) => _cache[value] = result;
+
+    internal ResourceRuntimeInputs Inputs => _inputs;
 
     private static bool AddSignedAddress(ulong baseAddress, long offset, out ulong result)
     {
@@ -388,6 +433,7 @@ public sealed class RuntimeValueEvaluator
         if (evaluateTable && plan.ResourceBranches.Count != 0)
             activeSources = EvaluateActiveSources(plan, inputs, cleanEvaluator);
         var evaluated = new List<DescriptorWords>(sources.Count);
+        RawReadPrefetch.PrefetchSources(plan, sources, activeSources, evaluator);
         foreach (var sourceIndex in sources)
         {
             if (sourceIndex >= plan.DescriptorSources.Count)
@@ -418,6 +464,7 @@ public sealed class RuntimeValueEvaluator
             inputs.TablePhase?.Invoke(true);
             try
             {
+                RawReadPrefetch.PrefetchTable(plan, evaluator, cleanEvaluator, cleanFlatSlots);
                 foreach (var read in plan.TableReads)
                 {
                     var clean = read.FlatOffset < cleanFlatSlots.Count && cleanFlatSlots[(int)read.FlatOffset] != 0;

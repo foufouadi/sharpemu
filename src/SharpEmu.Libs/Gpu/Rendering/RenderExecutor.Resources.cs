@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
@@ -23,6 +24,26 @@ public sealed partial class RenderExecutor
     }
 
     private readonly record struct PreparedIndexBuffer(BufferBinding Binding, ulong Size, IndexType Type);
+
+    private void PrepareDrawBufferAllocations(VertexInputInfo vertexInput, in IndexSource index, ulong indirectAddress)
+    {
+        if (vertexInput.Buffers.Length > VertexInputInfo.MaxBuffers)
+            throw _host.Fatal($"The vertex input has too many buffers: count={vertexInput.Buffers.Length} max={VertexInputInfo.MaxBuffers}.");
+        Span<GuestSpan> ranges = stackalloc GuestSpan[VertexInputInfo.MaxBuffers + 2];
+        var count = 0;
+        foreach (var vertex in vertexInput.Buffers)
+        {
+            if (vertex.Size == 0) continue;
+            if (vertex.Address == 0 || vertex.Size > ulong.MaxValue - vertex.Address)
+                throw _host.Fatal($"The vertex buffer range is invalid: address=0x{vertex.Address:X16} size=0x{vertex.Size:X16}.");
+            ranges[count++] = new GuestSpan(vertex.Address, _host.ClampMappedSize(vertex.Address, vertex.Size));
+        }
+        if (index.Enabled && index.HostData is null)
+            ranges[count++] = new GuestSpan(index.Address, index.Size);
+        if (indirectAddress != 0)
+            ranges[count++] = new GuestSpan(indirectAddress, IndexedIndirectArgumentsSize);
+        _host.PrepareBufferAllocations(ranges[..count]);
+    }
 
     // Merges the vertex ranges, obtains one host buffer per merged range and offsets every slot into it.
     private BufferBinding[] AcquireVertexBuffers(VertexInputInfo vertexInput)
@@ -129,6 +150,11 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
+    // Device-address accesses are not split into reads and writes, so they count as stores.
+    private bool DrawWritesMemory(ShaderStageResources stage) =>
+        stage.Program is { } program &&
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+
     private bool HasBufferWrites(ShaderStageResources stage)
     {
         var program = stage.Program ?? throw _host.Fatal("A shader stage has no program.");
@@ -207,6 +233,11 @@ public sealed partial class RenderExecutor
         }
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
+        DropUnwrittenColorTargets(context, ref state, pixelProgram);
+        state.Rendering = AcquireAttachments(ref state);
+        // Attachment uploads can submit work. Finish every allocation merge before any
+        // shader descriptor, vertex binding or index binding takes a buffer handle.
+        PrepareDrawBufferAllocations(vertexInput, in indexSource, emission.IndirectArgumentsAddress);
         if (vertexProgram.UsesDeviceAddresses || (pixelProgram?.UsesDeviceAddresses ?? false))
         {
             _host.PrepareDeviceAddresses();
@@ -223,8 +254,6 @@ public sealed partial class RenderExecutor
         var indirectArguments = emission.IndirectArgumentsAddress != 0
             ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
             : default;
-        DropUnwrittenColorTargets(context, ref state, pixelProgram);
-        state.Rendering = AcquireAttachments(ref state);
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
             BoundColors(ref state),
@@ -266,6 +295,11 @@ public sealed partial class RenderExecutor
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);
+        }
+
+        if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
+        {
+            _host.PrepareMemoryWritingDraw();
         }
 
         _host.BeginRendering(in state.Rendering);

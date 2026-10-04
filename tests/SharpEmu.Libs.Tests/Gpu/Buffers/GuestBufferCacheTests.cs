@@ -43,6 +43,22 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
+    public void UnalignedImageObtainUploadsTheWholeDirtyPageToItsBufferOwner()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var owner = harness.Worker.Run(() =>
+            harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, Page)));
+        var expected = Pattern(0x1000, 37);
+        harness.Write(address, expected);
+        var source = harness.Worker.Run(() => harness.Cache.ObtainBufferForImage(address + 17, 64));
+        Assert.Same(owner, source.Buffer);
+        Assert.Equal(expected, harness.ReadBack(owner, owner.Offset(address), 0x1000));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void ImageUploadFailureIdentifiesAHoleBetweenBackedEndpoints()
     {
         if (_vulkan is null) return;
@@ -105,6 +121,77 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         });
         Assert.True(harness.Cache.TrySynchronizeCpuRead(address, 4));
         Assert.Equal(new byte[] { 0x78, 0x56, 0x34, 0x12 }, harness.Read(address, 4));
+    }
+
+    [Theory]
+    [InlineData(0x80UL)]
+    [InlineData(0x3F80UL)]
+    public void DrawAllocationPreparationKeepsShaderVertexAndIndexBindingsInOneLiveBuffer(ulong vertexOffset)
+    {
+        Assert.True(GatePrerequisites.Ready(_vulkan), "This regression test requires a Vulkan device.");
+        using var harness = new CacheHarness(_vulkan!);
+        var address = harness.MapBacked(0x40000, ReadWrite);
+        const uint writtenValue = 0x12345678;
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address + Page, Page);
+            var vertexAddress = address + Page + vertexOffset;
+            harness.Cache.PrepareBufferAllocations([
+                new GuestSpan(vertexAddress, Page), new GuestSpan(address, 4 * Page)]);
+            var (shader, offset) = harness.Cache.ObtainBuffer(address + Page, Page, isWritten: true);
+            var (vertex, _) = harness.Cache.ObtainBuffer(vertexAddress, Page, isWritten: false);
+            var (indices, _) = harness.Cache.ObtainBuffer(address, 4 * Page, isWritten: false);
+            // An attachment readback can finish the preparation tick before the draw's consumer.
+            harness.Scheduler.Finish();
+            Assert.NotEqual(0UL, shader.Handle.Handle);
+            Assert.Same(shader, vertex);
+            Assert.Same(shader, indices);
+            shader.Fill(offset, sizeof(uint), writtenValue);
+        });
+        Assert.True(harness.Cache.TrySynchronizeCpuRead(address + Page, sizeof(uint)));
+        Assert.Equal(writtenValue, BitConverter.ToUInt32(harness.Read(address + Page, sizeof(uint))));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void DrawAllocationPreparationLeavesDisjointSmallReadsInTheStreamRing()
+    {
+        Assert.True(GatePrerequisites.Ready(_vulkan), "This regression test requires a Vulkan device.");
+        using var harness = new CacheHarness(_vulkan!);
+        var address = harness.MapBacked(0x40000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            harness.Cache.PrepareBufferAllocations([
+                new GuestSpan(address, 64), new GuestSpan(address + 2 * Page, 64)]);
+            Assert.Equal(0, harness.Cache.BufferCount);
+            var (first, _) = harness.Cache.ObtainBuffer(address, 64, isWritten: false);
+            var (second, _) = harness.Cache.ObtainBuffer(address + 2 * Page, 64, isWritten: false);
+            Assert.Same(harness.Cache.GetUtilityBuffer(GpuBufferUsage.Stream), first);
+            Assert.Same(first, second);
+            Assert.Equal(0, harness.Cache.BufferCount);
+        });
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void DrawAllocationPreparationIncludesTouchingVertexRangesBeforeBindingTheShader()
+    {
+        Assert.True(GatePrerequisites.Ready(_vulkan), "This regression test requires a Vulkan device.");
+        using var harness = new CacheHarness(_vulkan!);
+        var address = harness.MapBacked(0x40000, ReadWrite);
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.FindBuffer(address, Page);
+            harness.Cache.PrepareBufferAllocations([
+                new GuestSpan(address, Page), new GuestSpan(address + Page, Page)]);
+            var (shader, _) = harness.Cache.ObtainBuffer(address, Page, isWritten: true);
+            // AcquireVertexBuffers merges byte ranges that touch into one request.
+            var (geometry, _) = harness.Cache.ObtainBuffer(address, 2 * Page, isWritten: false);
+            harness.Scheduler.Finish();
+            Assert.NotEqual(0UL, shader.Handle.Handle);
+            Assert.Same(shader, geometry);
+        });
+        harness.Shutdown();
     }
 
     [Theory]

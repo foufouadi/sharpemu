@@ -50,11 +50,11 @@ public sealed class RenderExecutorDrawTests : IDisposable
             "bind_target 1",
             "prepare_bindings Vertex -> 1",
             "prepare_bindings Pixel -> 2",
+            "acquire_color 0 100000000 image=1",
             "bind_resources 1",
             "bind_resources 2",
             "obtain 100400000 40 written=False -> 100:0",
             "obtain 100500000 C written=False",
-            "acquire_color 0 100000000 image=1",
             "debug DrawIndex 7 100 6 0 2 0",
             "bind_vertex 100:0",
             "commit Graphics A1 [1,2]",
@@ -511,6 +511,21 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.Contains("bind_vertex 100:100,100:0,101:0,1:0,100:180", _host.Calls);
     }
 
+    [Theory]
+    [InlineData(0x100UL)]
+    [InlineData(0x1200UL)]
+    public void IndexAllocationDoesNotRetireTheVertexBufferBeforeTheDraw(ulong vertexOffset)
+    {
+        _pipelines.Graphics = Programs(vertexBuffers:
+            [new VertexInputBuffer(IndexBase + vertexOffset, 16, 16)]);
+        _executor.DrawIndexed(1, Banks(), Indexed(4096));
+
+        var binding = Assert.Single(_host.LastVertexBindings);
+        Assert.True(_host.IsBufferLive(binding.Handle),
+            $"The draw binds a retired vertex buffer: {string.Join(" | ", _host.Calls)}");
+        Assert.Equal(vertexOffset, binding.Offset);
+    }
+
     [Fact]
     public void VertexRanges_ClampToTheMappedSizeAndFailForAnAddressOutsideTheAcquiredRange()
     {
@@ -585,7 +600,9 @@ public sealed class RenderExecutorDrawTests : IDisposable
         _executor.DrawIndexed(1, banks, Indexed(3));
 
         Assert.Contains("reset_bindings", _host.Calls);
-        Assert.Empty(_pipelines.Calls);
+        // The vertex stage is resolved to see whether it stores to memory, but nothing is drawn.
+        Assert.Empty(_pipelines.PipelineRequests);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("begin_rendering", StringComparison.Ordinal));
     }
 
     [Fact]

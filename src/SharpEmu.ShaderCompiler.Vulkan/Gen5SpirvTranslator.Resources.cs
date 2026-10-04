@@ -678,6 +678,24 @@ public static partial class Gen5SpirvTranslator
             return LoadBlockWord(_flattenedTable, slot);
         }
 
+        // A planned slot is inside the table the host binds, so its load skips the runtime bounds
+        // check. Large shaders make hundreds of these reads, and every check costs the Metal
+        // compiler time (one large pixel shader made about 376 of them).
+        private uint LoadFlattenedSlot(uint slot)
+        {
+            if (slot >= _request.FlattenedTableReservedWords)
+            {
+                return LoadFlattenedWord(UInt(slot));
+            }
+
+            // Reserved slots address guest words, after the bindless image indices
+            // that the host prepends to the same buffer.
+            var prefix = _request.Bindings.UsesBindlessImages
+                ? BindingLayout.ImageSlotTableDwordCount(_request.Resources.Info)
+                : 0;
+            return Load(_uintType, BlockWordPointer(_flattenedTable, UInt(prefix + slot)));
+        }
+
         // The shader base the host pushes for this draw, as two dwords.
         private (uint Low, uint High) LoadShaderBase()
         {
@@ -924,8 +942,8 @@ public static partial class Gen5SpirvTranslator
                 return _module.ConstantBool(false);
             }
 
-            var rangeBase = Pair64(LoadFlattenedWord(UInt(slot)), LoadFlattenedWord(UInt(slot + 1)));
-            var rangeSize = Widen(LoadFlattenedWord(UInt(slot + 2)));
+            var rangeBase = Pair64(LoadFlattenedSlot(slot), LoadFlattenedSlot(slot + 1));
+            var rangeSize = Widen(LoadFlattenedSlot(slot + 2));
             var width = ULong(widthBytes);
             var masked = And64(address64, ULong(DeviceAddressMask));
             var fits = ULessThanEqual64(width, rangeSize);
@@ -1031,7 +1049,7 @@ public static partial class Gen5SpirvTranslator
                         continue;
                     }
 
-                    value = LoadFlattenedWord(UInt(slot));
+                    value = LoadFlattenedSlot(slot);
                 }
                 else if (entry.Kind == MemoryResourceKind.ScalarBuffer && entry.DeviceDescriptor)
                 {

@@ -114,6 +114,23 @@ public sealed class Gen5InterpolationParameterTests
     }
 
     [Fact]
+    public void PixelSystemInputs_ReadTheirBuiltIns()
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(
+            Request(0, false, inputs: 0xF002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var builtIns = instructions
+            .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+                instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn)
+            .Select(instruction => instruction.Operands[2]).ToArray();
+        Assert.Contains((uint)SpirvBuiltIn.FrontFacing, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.Layer, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.SampleMask, builtIns);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.ShiftLeftLogical);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
     public void SlotsReadingOneParameter_ShareOneInput()
     {
         // PS slots 1 and 2 both read VS parameter 1; the second slot must not move to a
@@ -176,6 +193,23 @@ public sealed class Gen5InterpolationParameterTests
         ValidateWhenAvailable(shader.Spirv);
     }
 
+    [Fact]
+    public void FrontFace_ReadsTheRasterizerBuiltIn()
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(
+            Request(0, false, inputs: 0x1002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var frontFace = Assert.Single(instructions, instruction =>
+            instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn &&
+            instruction.Operands[2] == (uint)SpirvBuiltIn.FrontFacing).Operands[0];
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Load &&
+            instruction.Operands[2] == frontFace);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Constant &&
+            instruction.Operands.Length == 3 && instruction.Operands[2] == 0x3F800000u);
+        ValidateWhenAvailable(shader.Spirv, required: true);
+    }
+
     private static ShaderCompileRequest Request(
         uint selector, bool custom, uint inputs = 2, string opcode = "VInterpMovF32",
         uint inputCntl = 0x401, bool supportsPerVertex = true)
@@ -208,15 +242,19 @@ public sealed class Gen5InterpolationParameterTests
         return result;
     }
 
-    private static void ValidateWhenAvailable(byte[] code)
+    private static void ValidateWhenAvailable(byte[] code, bool required = false)
     {
         var sdk = Environment.GetEnvironmentVariable("VULKAN_SDK");
-        if (string.IsNullOrWhiteSpace(sdk))
-        {
-            return;
-        }
-        var executable = Path.Combine(sdk, OperatingSystem.IsWindows() ? "Bin/spirv-val.exe" : "bin/spirv-val");
-        if (!File.Exists(executable))
+        var name = OperatingSystem.IsWindows() ? "spirv-val.exe" : "spirv-val";
+        var sdkExecutable = string.IsNullOrWhiteSpace(sdk) ? null :
+            Path.Combine(sdk, OperatingSystem.IsWindows() ? "Bin" : "bin", name);
+        var executable = sdkExecutable is not null && File.Exists(sdkExecutable) ? sdkExecutable :
+            (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+                .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                .Select(directory => Path.Combine(directory.Trim('"'), name)).FirstOrDefault(File.Exists);
+        if (required)
+            Assert.NotNull(executable);
+        if (executable is null)
         {
             return;
         }

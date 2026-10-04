@@ -21,6 +21,36 @@ public sealed class FontExportsTests
         _ctx = new CpuContext(_memory, Generation.Gen5);
     }
 
+    [Fact]
+    public void TextSourceInit_WritesParserAndTextRangeWithoutOverwritingNextObject()
+    {
+        const ulong text = Base + 0x300;
+        const ulong parser = Base + 0x400;
+        const ulong parserObject = Base + 0x500;
+        var bytes = new byte[0x68];
+        Array.Fill(bytes, (byte)0xcc);
+        Assert.True(_memory.TryWrite(LayoutAddress, bytes));
+        _ctx[CpuRegister.Rdi] = LayoutAddress;
+        _ctx[CpuRegister.Rsi] = text;
+        _ctx[CpuRegister.Rdx] = 9;
+        _ctx[CpuRegister.Rcx] = parser;
+        _ctx[CpuRegister.R8] = parserObject;
+
+        Assert.Equal(0, FontExports.TextSourceInit(_ctx));
+        Assert.True(_memory.TryRead(LayoutAddress, bytes));
+        Assert.Equal(0UL, BinaryPrimitives.ReadUInt64LittleEndian(bytes));
+        Assert.Equal(text, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x08)));
+        Assert.Equal(text + 9, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x10)));
+        Assert.Equal(text, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x18)));
+        Assert.Equal(parser, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x20)));
+        Assert.Equal(parserObject, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x28)));
+        Assert.Equal(0UL, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x30)));
+        Assert.Equal(0x10UL, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x38)));
+        Assert.Equal(9UL, BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(0x40)));
+        Assert.All(bytes[0x48..0x60], value => Assert.Equal((byte)0, value));
+        Assert.All(bytes[0x60..], value => Assert.Equal((byte)0xcc, value));
+    }
+
     // SceFontHorizontalLayout is three floats; the sentinel directly after
     // them must survive the call.
     [Fact]

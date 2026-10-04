@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.HLE.GpuMemory;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
@@ -116,6 +117,9 @@ public interface IRenderHost
 
     BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten);
 
+    // Resolve allocations that can overlap before descriptors or geometry capture their handles.
+    void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges);
+
     // Copies host bytes into the stream ring for the current recording.
     BufferBinding UploadTransient(ReadOnlySpan<byte> data, uint alignment);
 
@@ -139,6 +143,12 @@ public interface IRenderHost
     void BeginRendering(in RenderingState state);
 
     void EndRendering();
+
+    // Whether a texture bound for the draw being prepared reads the depth attachment's subresources.
+    bool SamplesDepthAttachment(in DepthAttachmentState depth) => true;
+
+    // The next draw stores to buffers or storage images; called before its BeginRendering.
+    void PrepareMemoryWritingDraw() { }
 
     void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline);
 
@@ -182,6 +192,8 @@ public interface IRenderHost
     bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear);
 
     bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue);
+
+    bool TryFillDccMetadata(ulong address, ulong size, uint fillValue);
 
     Exception Fatal(string message);
 }

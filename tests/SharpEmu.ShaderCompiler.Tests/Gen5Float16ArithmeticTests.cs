@@ -17,6 +17,35 @@ public sealed class Gen5Float16ArithmeticTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public void PackedTruncation_PointerMatchesRegisterStorage(bool elideExecGuards)
+    {
+        var program = Decode([0x5E101B0Du, SEndpgm]); // v_cvt_pkrtz_f16_f32 v8, v13, v13
+        var (plan, resources, bindings) = ResourceTestProgram.Prepare(program, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, bindings)
+        { EnableExecGuardElision = elideExecGuards };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var pointerStorage = new Dictionary<uint, uint>();
+        var variableStorage = new Dictionary<uint, uint>();
+        var chains = new List<(uint Type, uint Base)>();
+        for (var offset = 20; offset < shader.Spirv.Length;)
+        {
+            uint Word(int index) => BinaryPrimitives.ReadUInt32LittleEndian(shader.Spirv.AsSpan(offset + index * 4));
+            var header = Word(0);
+            var opcode = (SpirvOp)(header & 0xFFFF);
+            if (opcode == SpirvOp.TypePointer) pointerStorage.Add(Word(1), Word(2));
+            if (opcode == SpirvOp.Variable) variableStorage.Add(Word(2), Word(3));
+            if (opcode == SpirvOp.AccessChain) chains.Add((Word(1), Word(3)));
+            offset += (int)(header >> 16) * 4;
+        }
+        Assert.NotEmpty(chains);
+        foreach (var chain in chains.Where(chain => variableStorage.ContainsKey(chain.Base)))
+            Assert.Equal(variableStorage[chain.Base], pointerStorage[chain.Type]);
+        Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public void PackedFma_WithExactNativeHalfSupport_DoesNotExpandRoundToOdd(bool fmac)
     {
         var program = fmac

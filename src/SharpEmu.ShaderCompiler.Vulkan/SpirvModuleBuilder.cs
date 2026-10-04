@@ -291,6 +291,7 @@ public enum SpirvBuiltIn : uint
     SubgroupSize = 36,
     SubgroupLocalInvocationId = 41,
     SampleId = 18,
+    SampleMask = 20,
     FragDepth = 22,
 }
 
@@ -384,6 +385,8 @@ public sealed class SpirvModuleBuilder
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
+    // The value of every 32-bit integer and boolean constant, for folding instructions over them.
+    private readonly Dictionary<uint, uint> _scalarConstantValues = [];
     private readonly HashSet<SpirvCapability> _declaredCapabilities = [];
     private readonly Dictionary<string, uint> _extInstImports = [];
     private uint _nextId = 1;
@@ -693,6 +696,7 @@ public sealed class SpirvModuleBuilder
             type,
             id);
         _constants.Add(key, id);
+        _scalarConstantValues[id] = value ? 1u : 0u;
         return id;
     }
 
@@ -707,6 +711,11 @@ public sealed class SpirvModuleBuilder
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.Constant, type, id, value);
         _constants.Add(key, id);
+        if (IsInt32Type(type))
+        {
+            _scalarConstantValues[id] = value;
+        }
+
         return id;
     }
 
@@ -782,9 +791,13 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
+    private readonly List<uint> _functionVariables = [];
+    private int _functionVariableOffset = -1;
+
     public uint BeginFunction(uint returnType, uint functionType)
     {
         var id = AllocateId();
+        _functionVariableOffset = -1;
         Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
         return id;
     }
@@ -792,6 +805,7 @@ public sealed class SpirvModuleBuilder
     // Begins a function whose id was allocated earlier, so it can be called before it is emitted.
     public uint BeginFunction(uint returnType, uint functionType, uint id)
     {
+        _functionVariableOffset = -1;
         Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
         return id;
     }
@@ -803,6 +817,7 @@ public sealed class SpirvModuleBuilder
     {
         var result = id ?? AllocateId();
         Emit(_functions, SpirvOp.Label, result);
+        if (_functionVariableOffset < 0) _functionVariableOffset = _functions.Count;
         return result;
     }
 
@@ -812,7 +827,7 @@ public sealed class SpirvModuleBuilder
         if (initializer.HasValue)
         {
             Emit(
-                _functions,
+                _functionVariables,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -822,7 +837,7 @@ public sealed class SpirvModuleBuilder
         else
         {
             Emit(
-                _functions,
+                _functionVariables,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -833,12 +848,164 @@ public sealed class SpirvModuleBuilder
     }
 
     public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands) =>
-        EmitResult(_functions, opcode, resultType, operands);
+        TryFold(opcode, resultType, operands, out var folded)
+            ? folded
+            : EmitResult(_functions, opcode, resultType, operands);
+
+    private bool IsInt32Type(uint type) =>
+        (_integerTypes.TryGetValue((32, false), out var unsignedType) && unsignedType == type) ||
+        (_integerTypes.TryGetValue((32, true), out var signedType) && signedType == type);
+
+    private bool IsBoolType(uint type) => _boolType == type;
+
+    private bool TryConstant(uint id, out uint value) => _scalarConstantValues.TryGetValue(id, out value);
+
+    // The value of a 32-bit integer or boolean constant id.
+    public bool TryGetConstantValue(uint id, out uint value) => TryConstant(id, out value);
+
+    // Folds pure 32-bit integer and boolean instructions whose inputs are known constants, and
+    // selections on a known condition, so translation-time constants (specialized descriptor
+    // formats, swizzles, strides) do not reach the driver as runtime work.
+    private bool TryFold(SpirvOp opcode, uint resultType, uint[] operands, out uint result)
+    {
+        result = 0;
+        switch (opcode)
+        {
+            case SpirvOp.Select when operands.Length == 3 && IsBoolScalarConstant(operands[0], out var condition):
+                result = condition ? operands[1] : operands[2];
+                return true;
+            case SpirvOp.LogicalAnd when IsBoolType(resultType) && operands.Length == 2:
+                if (IsBoolScalarConstant(operands[0], out var leftAnd))
+                {
+                    result = leftAnd ? operands[1] : ConstantBool(false);
+                    return true;
+                }
+
+                if (IsBoolScalarConstant(operands[1], out var rightAnd))
+                {
+                    result = rightAnd ? operands[0] : ConstantBool(false);
+                    return true;
+                }
+
+                return false;
+            case SpirvOp.LogicalOr when IsBoolType(resultType) && operands.Length == 2:
+                if (IsBoolScalarConstant(operands[0], out var leftOr))
+                {
+                    result = leftOr ? ConstantBool(true) : operands[1];
+                    return true;
+                }
+
+                if (IsBoolScalarConstant(operands[1], out var rightOr))
+                {
+                    result = rightOr ? ConstantBool(true) : operands[0];
+                    return true;
+                }
+
+                return false;
+            case SpirvOp.LogicalNot when IsBoolType(resultType) && operands.Length == 1 && IsBoolScalarConstant(operands[0], out var negated):
+                result = ConstantBool(!negated);
+                return true;
+        }
+
+        var resultIsInt = IsInt32Type(resultType);
+        var resultIsBool = IsBoolType(resultType);
+        if ((!resultIsInt && !resultIsBool) || operands.Length is < 1 or > 3)
+        {
+            return false;
+        }
+
+        Span<uint> values = stackalloc uint[operands.Length];
+        for (var index = 0; index < operands.Length; index++)
+        {
+            if (!TryConstant(operands[index], out values[index]))
+            {
+                return false;
+            }
+        }
+
+        uint folded;
+        bool? foldedBool = null;
+        switch (opcode)
+        {
+            case SpirvOp.IAdd when operands.Length == 2: folded = values[0] + values[1]; break;
+            case SpirvOp.ISub when operands.Length == 2: folded = values[0] - values[1]; break;
+            case SpirvOp.IMul when operands.Length == 2: folded = values[0] * values[1]; break;
+            case SpirvOp.BitwiseAnd when operands.Length == 2: folded = values[0] & values[1]; break;
+            case SpirvOp.BitwiseOr when operands.Length == 2: folded = values[0] | values[1]; break;
+            case SpirvOp.BitwiseXor when operands.Length == 2: folded = values[0] ^ values[1]; break;
+            case SpirvOp.Not when operands.Length == 1: folded = ~values[0]; break;
+            case SpirvOp.ShiftLeftLogical when operands.Length == 2 && values[1] < 32: folded = values[0] << (int)values[1]; break;
+            case SpirvOp.ShiftRightLogical when operands.Length == 2 && values[1] < 32: folded = values[0] >> (int)values[1]; break;
+            case SpirvOp.ShiftRightArithmetic when operands.Length == 2 && values[1] < 32: folded = (uint)((int)values[0] >> (int)values[1]); break;
+            case SpirvOp.BitFieldUExtract when operands.Length == 3 && values[1] + (ulong)values[2] <= 32:
+                folded = values[2] == 0 ? 0u : (uint)((values[0] >> (int)values[1]) & (values[2] == 32 ? uint.MaxValue : (1u << (int)values[2]) - 1));
+                break;
+            case SpirvOp.IEqual when operands.Length == 2: foldedBool = values[0] == values[1]; folded = 0; break;
+            case SpirvOp.INotEqual when operands.Length == 2: foldedBool = values[0] != values[1]; folded = 0; break;
+            case SpirvOp.ULessThan when operands.Length == 2: foldedBool = values[0] < values[1]; folded = 0; break;
+            case SpirvOp.ULessThanEqual when operands.Length == 2: foldedBool = values[0] <= values[1]; folded = 0; break;
+            case SpirvOp.UGreaterThan when operands.Length == 2: foldedBool = values[0] > values[1]; folded = 0; break;
+            case SpirvOp.UGreaterThanEqual when operands.Length == 2: foldedBool = values[0] >= values[1]; folded = 0; break;
+            case SpirvOp.SLessThan when operands.Length == 2: foldedBool = (int)values[0] < (int)values[1]; folded = 0; break;
+            case SpirvOp.SLessThanEqual when operands.Length == 2: foldedBool = (int)values[0] <= (int)values[1]; folded = 0; break;
+            case SpirvOp.SGreaterThan when operands.Length == 2: foldedBool = (int)values[0] > (int)values[1]; folded = 0; break;
+            case SpirvOp.SGreaterThanEqual when operands.Length == 2: foldedBool = (int)values[0] >= (int)values[1]; folded = 0; break;
+            case SpirvOp.LogicalEqual when operands.Length == 2: foldedBool = values[0] == values[1]; folded = 0; break;
+            case SpirvOp.LogicalNotEqual when operands.Length == 2: foldedBool = values[0] != values[1]; folded = 0; break;
+            default:
+                return false;
+        }
+
+        if (foldedBool is { } boolean)
+        {
+            if (!resultIsBool)
+            {
+                return false;
+            }
+
+            result = ConstantBool(boolean);
+            return true;
+        }
+
+        if (!resultIsInt)
+        {
+            return false;
+        }
+
+        result = Constant(resultType, folded);
+        return true;
+    }
+
+    private bool IsBoolScalarConstant(uint id, out bool value)
+    {
+        value = false;
+        if (_boolType is not { } boolType || !TryConstant(id, out var raw) ||
+            !_constants.TryGetValue((boolType, raw), out var constantId) || constantId != id)
+        {
+            return false;
+        }
+
+        value = raw != 0;
+        return true;
+    }
 
     public void AddStatement(SpirvOp opcode, params uint[] operands) =>
         Emit(_functions, opcode, operands);
 
-    public void EndFunction() => Emit(_functions, SpirvOp.FunctionEnd);
+    public void EndFunction()
+    {
+        // Registers are discovered while emitting the body. SPIR-V requires every
+        // Function variable to precede the entry block's executable instructions.
+        if (_functionVariables.Count != 0)
+        {
+            if (_functionVariableOffset < 0)
+                throw new InvalidOperationException("Function variables require an entry block.");
+            _functions.InsertRange(_functionVariableOffset, _functionVariables);
+            _functionVariables.Clear();
+        }
+        _functionVariableOffset = -1;
+        Emit(_functions, SpirvOp.FunctionEnd);
+    }
 
     public byte[] Build()
     {

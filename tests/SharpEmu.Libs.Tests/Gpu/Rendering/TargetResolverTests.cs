@@ -72,7 +72,7 @@ public sealed class TargetResolverTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     [Fact]
-    public void DepthState_ConvertsTheStencilFacesAndRejectsAMismatchedReplacement()
+    public void DepthState_ConvertsTheStencilFacesAndRejectsAConflictingReplacement()
     {
         var context = StencilContext(pass: 4, writeMask: 0xFF, operationValue: 0x10, DepthControl(CompareOp.Less, CompareOp.Always));
 
@@ -95,12 +95,66 @@ public sealed class TargetResolverTests : IClassFixture<HeadlessVulkanFixture>
         var tested = StencilContext(pass: 4, writeMask: 0xFF, operationValue: 0x20, DepthControl(CompareOp.Less, CompareOp.Equal));
         Assert.Contains("replacement", Assert.Throws<InvalidOperationException>(() => DepthTargetResolver.ResolveState(tested, true, Fatal)).Message);
         context.StencilMask.OperationValue = 0x20;
+        state = DepthTargetResolver.ResolveState(context, true, Fatal);
+        Assert.Equal(0x20u, state.FrontMasks.Reference); // Always does not consume the comparison reference.
+        context.DepthTarget = context.DepthTarget with { DepthControl = DepthControl(CompareOp.Less, CompareOp.Equal) };
+        Assert.Contains("replacement", Assert.Throws<InvalidOperationException>(() => DepthTargetResolver.ResolveState(context, true, Fatal)).Message);
 
         // Without a write mask the operations have no effect, so the mismatch does not matter.
         context.StencilMask.WriteMask = 0;
         state = DepthTargetResolver.ResolveState(context, true, Fatal);
-        Assert.Equal(StencilOperations.Default with { Compare = CompareOp.Always }, state.FrontOperations);
+        Assert.Equal(StencilOperations.Default with { Compare = CompareOp.Equal }, state.FrontOperations);
         Assert.Equal(0u, state.FrontMasks.WriteMask);
+    }
+
+    [Fact]
+    public void DepthState_ReplacementWithZeroWrittenBitsUsesZeroOperation()
+    {
+        var context = StencilContext(pass: 4, writeMask: 0x80, operationValue: 1,
+            DepthControl(CompareOp.Less, CompareOp.Always));
+        context.StencilMask.TestValue = 0x80;
+
+        var state = DepthTargetResolver.ResolveState(context, true, Fatal);
+
+        Assert.Equal(StencilOp.Zero, state.FrontOperations.PassOperation);
+        Assert.Equal(0x80u, state.FrontMasks.WriteMask);
+        for (uint oldValue = 0; oldValue <= 0xFF; oldValue++)
+        {
+            Assert.Equal((oldValue & ~0x80u) | (1u & 0x80u), oldValue & ~state.FrontMasks.WriteMask);
+        }
+    }
+
+    [Theory]
+    [InlineData(0x0F, 0xF0, 0x20, 0x20)]
+    [InlineData(0xFF, 0xF0, 0x11, 0x10)]
+    public void DepthState_ReplacementMergesOnlyBitsUnusedByComparison(byte compareMask, byte writeMask, byte operationValue, uint reference)
+    {
+        var context = StencilContext(pass: 4, writeMask, operationValue,
+            DepthControl(CompareOp.Less, CompareOp.Equal));
+        context.StencilMask.Mask = compareMask;
+
+        var state = DepthTargetResolver.ResolveState(context, true, Fatal);
+
+        Assert.Equal(StencilOp.Replace, state.FrontOperations.PassOperation);
+        Assert.Equal(reference, state.FrontMasks.Reference);
+        Assert.Equal((uint)(context.StencilMask.TestValue & compareMask), state.FrontMasks.Reference & compareMask);
+        Assert.Equal((uint)(operationValue & writeMask), state.FrontMasks.Reference & writeMask);
+    }
+
+    [Theory]
+    [InlineData(0x0F, 0xF0, 0x20, 0x20)]
+    [InlineData(0xFF, 0xF0, 0x11, 0x10)]
+    public void DepthState_ReplacementMergesOnlyBitsUnusedByComparison_Upstream(byte compareMask, byte writeMask, byte operationValue, uint reference)
+    {
+        var context = StencilContext(pass: 4, writeMask, operationValue, DepthControl(CompareOp.Less, CompareOp.Equal));
+        context.StencilMask.Mask = compareMask;
+
+        var state = DepthTargetResolver.ResolveState(context, true, Fatal);
+
+        Assert.Equal(StencilOp.Replace, state.FrontOperations.PassOperation);
+        Assert.Equal(reference, state.FrontMasks.Reference);
+        Assert.Equal((uint)(context.StencilMask.TestValue & compareMask), state.FrontMasks.Reference & compareMask);
+        Assert.Equal((uint)(operationValue & writeMask), state.FrontMasks.Reference & writeMask);
     }
 
     [Fact]

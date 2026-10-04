@@ -22,6 +22,35 @@ public static class FontExports
     private static readonly Lazy<byte[]?> BitmapFont = new(LoadBitmapFont);
 
     [SysAbiExport(
+        Nid = "oaJ1BpN2FQk",
+        ExportName = "sceFontTextSourceInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int TextSourceInit(CpuContext ctx)
+    {
+        var sourceAddress = ctx[CpuRegister.Rdi];
+        var textAddress = ctx[CpuRegister.Rsi];
+        var textSize = (uint)ctx[CpuRegister.Rdx];
+        if (sourceAddress == 0 || textAddress > ulong.MaxValue - textSize)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> source = stackalloc byte[0x60];
+        source.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x08..], textAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x10..], textAddress == 0 ? 0 : textAddress + textSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x18..], textAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x20..], ctx[CpuRegister.Rcx]);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x28..], ctx[CpuRegister.R8]);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x38..], 0x10);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x40..], textSize);
+        return ctx.Memory.TryWrite(sourceAddress, source)
+            ? SetSuccess(ctx)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "whrS4oksXc4",
         ExportName = "sceFontMemoryInit",
         Target = Generation.Gen5,
