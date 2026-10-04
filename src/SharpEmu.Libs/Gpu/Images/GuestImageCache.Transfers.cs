@@ -50,6 +50,27 @@ public sealed unsafe partial class GuestImageCache
         return size;
     }
 
+    // A single-level linear target whose builder laid out one slice with the guest's pitch,
+    // which need not be aligned like a texture's. Textures leave the layout empty, and other
+    // shapes keep the format's linear layout.
+    private static MipLevelLayout[] GuestLinearLevels(in ImageDescription info, uint levels)
+    {
+        if (info.TileMode != GuestTileMode.Linear || levels != 1 || info.IsVolume || info.Resources.Layers == 0)
+        {
+            return [];
+        }
+
+        var slice = info.MipLayout[0];
+        if (slice.Size == 0 || slice.Pitch < info.Extent.Width || slice.Height < info.Extent.Height ||
+            (ulong)slice.Pitch * slice.Height * info.BytesPerBlock > slice.Size ||
+            slice.Size * info.Resources.Layers > info.Data.Size)
+        {
+            return [];
+        }
+
+        return [slice];
+    }
+
     private static ColorTransferPlan PlanColorTransfer(CachedImage image, ImageRole role, TransferDirection direction)
     {
         ref readonly var info = ref image.Description;
@@ -110,7 +131,8 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var guestLevels = info.FirstLevel + info.Resources.Levels;
-        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
+        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner,
+            GuestLinearLevels(info, guestLevels));
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {

@@ -183,7 +183,8 @@ public sealed class TextureTransferLayout
         ulong uploadSize,
         bool allowDepthTile,
         bool volume,
-        string owner)
+        string owner,
+        ReadOnlySpan<MipLevelLayout> guestLinearLevels = default)
     {
         var layout = new TextureTransferLayout();
         var description = new TiledSurfaceDescription(
@@ -231,7 +232,23 @@ public sealed class TextureTransferLayout
         }
 
         layout.Pitch = TileGeometry.TexturePitch(format, width, tile);
-        if (tile == GuestTileMode.Linear)
+        if (tile == GuestTileMode.Linear && guestLinearLevels.Length >= levels)
+        {
+            // A linear target's builder already laid its levels out with the guest's pitch
+            // (a render target's need not be aligned like a texture's); copy that layout.
+            for (uint level = 0; level < levels; level++)
+            {
+                var guest = guestLinearLevels[(int)level];
+                layout.Mips[level] = new TransferMipLayout
+                {
+                    Offset = guest.Offset,
+                    Size = guest.Size,
+                    RowLength = guest.Pitch,
+                    ImageHeight = guest.Height,
+                };
+            }
+        }
+        else if (tile == GuestTileMode.Linear)
         {
             var levelSpans = new TileLevelSpan[TiledSurfaceLayout.MaxLevels];
             var paddedSizes = new TilePaddedSize[TiledSurfaceLayout.MaxLevels];
