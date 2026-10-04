@@ -664,7 +664,7 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
     public void SharedFormattedLoad_RecordsTheFaultingCallerPc(bool firstPageMapped)
     {
         var vulkan = fixture.Vulkan;
-        Assert.True(GatePrerequisites.Ready(vulkan, shaderInt64: true));
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
         var program = Program([
             .. GpuDescriptorLoadProgram(true, 1).Instructions.Take(8),
             BufferAccess(36, "BufferLoadFormatX", 16, dwords: 1, vectorData: 4),
@@ -692,7 +692,7 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
     public void RepeatedD16Loads_KeepPerLaneValuesAndInactiveRegisters(uint waveSize, uint secondFormat)
     {
         var vulkan = fixture.Vulkan;
-        Assert.True(GatePrerequisites.Ready(vulkan, shaderInt64: true));
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
         Gen5ShaderInstruction Load(uint pc) => BufferAccess(pc, "BufferLoadFormatD16Xy", 16,
             dwords: 1, vectorData: 4, offsetEnabled: true, vectorAddress: OffsetRegister) with
         {

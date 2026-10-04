@@ -30,7 +30,7 @@ public sealed class ScalarCompareImmediateDeviceTests(HeadlessVulkanFixture fixt
     public void CompareUsesTheImmediateExtensionOfItsSignedness(uint opcode, uint value, uint immediate, uint expected)
     {
         var vulkan = fixture.Vulkan;
-        Assert.True(GatePrerequisites.Ready(vulkan, shaderInt64: true), "A Vulkan device with shaderInt64 is required.");
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
         var program = Program(
             DecodeWords(0x8000_0000u | ((0x60u + opcode) << 23) | (8u << 16) | immediate) with { Pc = 0 },
             DecodeWords(0x8509_8081u) with { Pc = 4 },

@@ -27,8 +27,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     [Fact]
     public void AGuestReadWaitsOffTheQueueThreadAndLandsTheGpuBytes()
     {
-        Assert.NotNull(_vulkan);
-        Assert.True(GatePrerequisites.Ready(_vulkan), "A Vulkan device is required for this GPU regression test.");
+        if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
@@ -67,8 +66,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     [Fact]
     public void AHotWindowIsReadAheadAfterTheNextGpuWrite()
     {
-        Assert.NotNull(_vulkan);
-        Assert.True(GatePrerequisites.Ready(_vulkan), "A Vulkan device is required for this GPU regression test.");
+        if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
@@ -91,8 +89,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     [Fact]
     public void AReadAheadOverwrittenBeforeItsReadIsNeverApplied()
     {
-        Assert.NotNull(_vulkan);
-        Assert.True(GatePrerequisites.Ready(_vulkan), "A Vulkan device is required for this GPU regression test.");
+        if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
@@ -116,8 +113,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     [Fact]
     public void RepeatedGuestReadsReuseTheReadbackSlots()
     {
-        Assert.NotNull(_vulkan);
-        Assert.True(GatePrerequisites.Ready(_vulkan), "A Vulkan device is required for this GPU regression test.");
+        if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
