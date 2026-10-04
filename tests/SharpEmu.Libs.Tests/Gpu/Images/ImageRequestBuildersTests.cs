@@ -27,6 +27,21 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Invalid, 32, 32)));
         Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(0, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
         Assert.False(ImageRequestBuilders.DescribesHostTexture(new uint[8]));
+    [Theory]
+    [InlineData(0x100u)]
+    [InlineData(0x800u)]
+    public void TiledTextureViewPreservesItsDescriptorAddress(uint offset)
+    {
+        var words = RegisterWords.Texture(Base + offset, GuestPixelFormat.Bits16_16_16_16Float,
+            16, 16, tile: GuestTileMode.Standard4KB);
+        var shape = new ShaderImageShape(false, false, true, false, TextureNumericClass.Float);
+        var request = ImageRequestBuilders.Texture(words, shape).Request;
+        Assert.Equal(Base + offset, request.Description.Data.Address);
+        Assert.Equal(4096UL, request.Description.Data.Size);
+        Assert.Equal(32u, request.Description.Pitch);
+        Assert.Equal(GuestTileMode.Standard4KB, request.Description.TileMode);
+        Assert.Equal(Format.R16G16B16A16Sfloat, request.Description.PixelFormat);
+        Assert.Equal(0UL, request.Description.MipLayout[0].Offset);
     }
 
     [Fact]
