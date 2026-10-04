@@ -72,6 +72,29 @@ public sealed partial class GuestImageCache
         FinishRetiredImagesForAllocation(requiredBytes);
     }
 
+    // An allocation failed despite the budget. Retire every image collection allows, then let
+    // the retired ones be destroyed and return unused pool memory to the device.
+    private void ReclaimAfterFailedAllocation()
+    {
+        _allocationCollectionBlocked = false;
+        while (true)
+        {
+            var before = _totalUsedMemory;
+            Collect(_collectionTick, allowAggressive: true);
+            if (_totalUsedMemory == before)
+                break;
+        }
+
+        if (_scheduler.Active && !_scheduler.InsideTickCallback)
+        {
+            _lock.Exit();
+            try { _scheduler.Finish(); }
+            finally { _lock.Enter(); }
+        }
+
+        ReleaseUnusedMemoryCore();
+    }
+
     private void FinishRetiredImagesForAllocation(ulong requiredBytes)
     {
         var retired = Interlocked.Read(ref _retiredImageMemoryBytes);

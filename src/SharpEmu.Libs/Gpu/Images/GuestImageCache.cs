@@ -724,7 +724,27 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
         var requiredBytes = (description.Data.Size + 1023) & ~1023UL;
         CollectForAllocation(requiredBytes);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory));
+        CachedImage image;
+        try
+        {
+            image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory);
+        }
+        catch (CachedImage.ImageOutOfMemoryException)
+        {
+            // The budget is an estimate: the device can still run out. Free everything that can
+            // go, wait for retired images to be destroyed, and try once more.
+            ReclaimAfterFailedAllocation();
+            try
+            {
+                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory);
+            }
+            catch (CachedImage.ImageOutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        var imageIdentifier = _slots.Insert(image);
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

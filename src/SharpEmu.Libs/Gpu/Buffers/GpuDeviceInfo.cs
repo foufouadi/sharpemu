@@ -173,6 +173,9 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
 
     public int LiveAllocations => Volatile.Read(ref _liveAllocations);
 
+    // Tests make an allocation of the given size fail as an exhausted device would.
+    internal Func<ulong, bool>? AllocationFailure { get; set; }
+
     public int PeakAllocations => Volatile.Read(ref _peakAllocations);
 
     public MemoryPropertyFlags GetMemoryTypeFlags(uint index)
@@ -213,7 +216,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     {
         fixed (MemoryAllocateInfo* pointer = &info)
         {
-            var result = Vk.AllocateMemory(Device, pointer, null, out memory);
+            memory = default;
+            var result = AllocationFailure?.Invoke(info.AllocationSize) == true
+                ? Result.ErrorOutOfDeviceMemory
+                : Vk.AllocateMemory(Device, pointer, null, out memory);
             if (result != Result.Success)
                 Interlocked.Exchange(ref _lastFailedAllocationBytes, checked((long)info.AllocationSize));
             if (result == Result.Success)

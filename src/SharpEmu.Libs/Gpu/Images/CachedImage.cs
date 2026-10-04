@@ -211,6 +211,9 @@ public sealed unsafe partial class CachedImage : IDisposable
             ReleaseMemory();
             Backing.Handle = default;
             Backing.Memory = default;
+            // Running out of memory is recoverable: the cache can free images and try again.
+            if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
+                throw new ImageOutOfMemoryException(CreateFailureMessage(create, "vkAllocateMemory", allocated, requirements.Size));
             throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
         }
 
@@ -235,14 +238,19 @@ public sealed unsafe partial class CachedImage : IDisposable
     }
 
     private Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-        SubmissionScheduler.Fatal(
+        SubmissionScheduler.Fatal(CreateFailureMessage(create, operation, result, requiredBytes));
+
+    private string CreateFailureMessage(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
             $"The image could not be created: operation={operation} result={result} required_bytes={requiredBytes} " +
             $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
             $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X} " +
             $"live_allocations={_device.LiveAllocations} allocation_limit={_device.MaxMemoryAllocationCount} " +
             $"image_pool_allocated={_memoryPool?.AllocatedBytes ?? 0} image_pool_placed={_memoryPool?.PlacedBytes ?? 0} " +
             $"last_failed_allocation_bytes={_device.LastFailedAllocationBytes} guest_address=0x{Description.Data.Address:X16} " +
-            (_memoryDiagnostics?.Invoke() ?? string.Empty));
+            (_memoryDiagnostics?.Invoke() ?? string.Empty);
+
+    // The device ran out of memory for the image's backing. Nothing was left allocated.
+    internal sealed class ImageOutOfMemoryException(string message) : Exception(message);
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration, bool allowCompressedImageFallback)
     {

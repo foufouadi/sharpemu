@@ -811,6 +811,36 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // The image budget is an estimate, so the device can still run out of memory. The cache
+    // frees what it can and tries the allocation once more instead of stopping.
+    [Fact]
+    public void ImageAllocation_RetriesOnceAfterTheDeviceRunsOutOfMemory()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new SharpEmu.Libs.Tests.Gpu.Scheduling.FatalScope();
+        const uint width = 4096, height = 4096;
+        const ulong size = (ulong)width * height * 4;
+        using var harness = new CacheHarness(_vulkan, backingBytes: 80UL * 1024 * 1024);
+        var address = harness.MapBacked(size, ReadWrite);
+        var attempts = 0;
+        harness.Vulkan.DeviceInfo.AllocationFailure = bytes => bytes >= OptimalImageMemoryPool.DedicatedThreshold && attempts++ == 0;
+        try
+        {
+            var request = LinearRequest(address, size, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm,
+                GuestImageType.Color2D, new Extent3D(width, height, 1), 1, 4, 1);
+            var image = harness.Find(ref request);
+
+            Assert.True(harness.Images.Contains(image));
+            Assert.Equal(2, attempts);
+        }
+        finally
+        {
+            harness.Vulkan.DeviceInfo.AllocationFailure = null;
+        }
+
+        harness.Shutdown();
+    }
+
     [Fact]
     public void UnsynchronizedGpuImageTest_MatchesItsRangesWithoutAllocating()
     {
