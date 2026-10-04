@@ -620,6 +620,9 @@ internal static unsafe partial class VulkanVideoPresenter
             _maxUpdateAfterBindSampledImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSampledImages;
             _maxUpdateAfterBindStorageImages = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindStorageImages;
             _maxUpdateAfterBindDescriptors = descriptorIndexingProperties.MaxUpdateAfterBindDescriptorsInAllPools;
+            _maxPerStageSamplers = properties.Limits.MaxPerStageDescriptorSamplers;
+            _maxPerStageUpdateAfterBindSamplers = descriptorIndexingProperties.MaxPerStageDescriptorUpdateAfterBindSamplers;
+            _maxUpdateAfterBindSamplers = descriptorIndexingProperties.MaxDescriptorSetUpdateAfterBindSamplers;
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan bindless limits sampled={_maxUpdateAfterBindSampledImages} " +
                 $"storage={_maxUpdateAfterBindStorageImages} total={_maxUpdateAfterBindDescriptors}");

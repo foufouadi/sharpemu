@@ -70,6 +70,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _maxUpdateAfterBindSampledImages = uint.MaxValue;
         private uint _maxUpdateAfterBindStorageImages = uint.MaxValue;
         private uint _maxUpdateAfterBindDescriptors = uint.MaxValue;
+        private uint _maxPerStageSamplers = uint.MaxValue;
+        private uint _maxPerStageUpdateAfterBindSamplers = uint.MaxValue;
+        private uint _maxUpdateAfterBindSamplers = uint.MaxValue;
         private SampleCountFlags _noAttachmentSampleCounts;
         private DescriptorHeap _descriptorHeap = null!;
         private BindlessImageHeap? _bindlessImageHeap;
@@ -608,16 +611,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _bindlessImageHeap = new BindlessImageHeap(
-                _deviceInfo,
-                _scheduler,
+            _bindlessImageHeap = new BindlessImageHeap(_deviceInfo, _scheduler, new BindlessImageHeap.Limits(
                 _maxPerStageSampledImages,
                 _maxPerStageStorageImages,
+                _maxPerStageSamplers,
                 _maxPerStageUpdateAfterBindSampledImages,
                 _maxPerStageUpdateAfterBindStorageImages,
+                _maxPerStageUpdateAfterBindSamplers,
                 _maxUpdateAfterBindSampledImages,
                 _maxUpdateAfterBindStorageImages,
-                _maxUpdateAfterBindDescriptors);
+                _maxUpdateAfterBindSamplers,
+                _maxUpdateAfterBindDescriptors));
             _imageCache.BindlessImageInvalidator = _bindlessImageHeap.InvalidateViews;
             _bindlessImageHeap.SetDefaultSampler(_samplerStore.GetSampler(new SamplerDescriptorWords(stackalloc uint[4]), integerView: false));
         }
