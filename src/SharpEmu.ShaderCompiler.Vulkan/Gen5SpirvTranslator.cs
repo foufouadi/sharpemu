@@ -427,6 +427,7 @@ public static partial class Gen5SpirvTranslator
 
 
 
+                EmitDeviceFormatLoadFunctions();
 
                 var model = _stage switch
                 {
@@ -3477,6 +3478,8 @@ public static partial class Gen5SpirvTranslator
         }
 
 
+        private readonly Dictionary<uint, uint> _deviceFormatLoadFunctions = new();
+
         private void EmitDeviceBufferFormatLoad(
             uint baseAddress,
             uint size,
@@ -3485,6 +3488,57 @@ public static partial class Gen5SpirvTranslator
             uint vectorData,
             uint componentCount,
             bool packedD16 = false)
+        {
+            if (!_deviceFormatLoadFunctions.TryGetValue(componentCount, out var function))
+            {
+                function = _module.AllocateId();
+                _deviceFormatLoadFunctions.Add(componentCount, function);
+            }
+
+            var values = _module.AddInstruction(SpirvOp.FunctionCall, _uvec4Type, function,
+                baseAddress, size, byteAddress, descriptorWord3, UInt(_deviceAddressInstructionPc));
+            var format = BitwiseAnd(ShiftRightLogical(descriptorWord3, UInt(12)), UInt(0x7F));
+            var (_, numberFormat) = DecodeGfx10BufferFormat(format);
+            for (uint component = 0; component < componentCount; component++)
+            {
+                var value = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, values, component);
+                StoreFormattedBufferComponent(vectorData, component, value, numberFormat, packedD16);
+            }
+        }
+
+        private void EmitDeviceFormatLoadFunctions()
+        {
+            foreach (var (components, function) in _deviceFormatLoadFunctions)
+            {
+                var type = _module.TypeFunction(_uvec4Type,
+                    _ulongType, _ulongType, _uintType, _uintType, _uintType);
+                // Keeping the shared decoder as a function avoids expanding the
+                // complete runtime format path at every read site in the driver.
+                _module.BeginFunction(_uvec4Type, type, function, SpirvFunctionControl.DontInline);
+                _module.AddName(function, $"loadDeviceBufferFormat{components}");
+                var address = _module.AddFunctionParameter(_ulongType);
+                var size = _module.AddFunctionParameter(_ulongType);
+                var offset = _module.AddFunctionParameter(_uintType);
+                var descriptor = _module.AddFunctionParameter(_uintType);
+                _deviceAddressInstructionPcValue = _module.AddFunctionParameter(_uintType);
+                _module.AddLabel();
+                var values = LoadDeviceBufferFormatValues(address, size, offset, descriptor, components);
+                _deviceAddressInstructionPcValue = null;
+                var result = new uint[4];
+                for (var component = 0; component < result.Length; component++)
+                    result[component] = component < values.Length ? values[component] : UInt(0);
+                _module.AddStatement(SpirvOp.ReturnValue,
+                    _module.AddInstruction(SpirvOp.CompositeConstruct, _uvec4Type, result));
+                _module.EndFunction();
+            }
+        }
+
+        private uint[] LoadDeviceBufferFormatValues(
+            uint baseAddress,
+            uint size,
+            uint byteAddress,
+            uint descriptorWord3,
+            uint componentCount)
         {
             var unifiedFormat = BitwiseAnd(
                 ShiftRightLogical(descriptorWord3, UInt(12)),
@@ -3522,9 +3576,9 @@ public static partial class Gen5SpirvTranslator
                         _boolType, isMemory, selectedInBounds, _module.ConstantBool(true)));
                 }
                 for (uint destination = 0; destination < componentCount; destination++)
-                    StoreFormattedBufferComponent(vectorData, destination, _module.AddInstruction(SpirvOp.Select,
-                        _uintType, allInBounds, values[destination], constants[destination]), numberFormat, packedD16);
-                return;
+                    values[destination] = _module.AddInstruction(SpirvOp.Select,
+                        _uintType, allInBounds, values[destination], constants[destination]);
+                return values;
             }
             var canonical = new uint[4];
             var componentBounds = new uint[4];
@@ -3562,6 +3616,7 @@ public static partial class Gen5SpirvTranslator
                 inBounds = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, inBounds, selectedInBounds);
             }
 
+            var valuesFull = new uint[componentCount];
             var one = Gfx10FormatOne(numberFormat);
             for (uint destination = 0; destination < componentCount; destination++)
             {
@@ -3572,9 +3627,9 @@ public static partial class Gen5SpirvTranslator
                 value = SelectUInt(selector, 5, canonical[1], value);
                 value = SelectUInt(selector, 6, canonical[2], value);
                 value = SelectUInt(selector, 7, canonical[3], value);
-                StoreFormattedBufferComponent(vectorData, destination,
-                    _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant), numberFormat, packedD16);
+                valuesFull[destination] = _module.AddInstruction(SpirvOp.Select, _uintType, inBounds, value, constant);
             }
+            return valuesFull;
         }
 
         private uint LoadGfx10DeviceBufferFormatComponent(

@@ -221,6 +221,12 @@ public enum SpirvCapability : uint
     PhysicalStorageBufferAddresses = 5347,
 }
 
+public enum SpirvFunctionControl : uint
+{
+    None = 0,
+    DontInline = 2,
+}
+
 public enum SpirvStorageClass : uint
 {
     UniformConstant = 0,
@@ -803,10 +809,10 @@ public sealed class SpirvModuleBuilder
     }
 
     // Begins a function whose id was allocated earlier, so it can be called before it is emitted.
-    public uint BeginFunction(uint returnType, uint functionType, uint id)
+    public uint BeginFunction(uint returnType, uint functionType, uint id, SpirvFunctionControl functionControl = SpirvFunctionControl.None)
     {
         _functionVariableOffset = -1;
-        Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
+        Emit(_functions, SpirvOp.Function, returnType, id, (uint)functionControl, functionType);
         return id;
     }
 
