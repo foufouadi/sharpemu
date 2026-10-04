@@ -386,6 +386,14 @@ internal static unsafe partial class VulkanVideoPresenter
             return new BufferBinding(buffer.Handle, 0);
         }
 
+        public ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten)
+        {
+            // Read-only indices normally use the transient stream fast path.
+            // Physical pointers require a cache allocation created with BDA usage.
+            var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, isWritten, requiresDeviceAddress: true);
+            return checked(buffer.DeviceAddress + offset);
+        }
+
         public void BindVertexBuffers(ReadOnlySpan<BufferBinding> bindings, VertexInputInfo input)
         {
             if (bindings.IsEmpty) return;
@@ -1107,8 +1115,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void ShaderWriteBarrier(PipelineStageFlags sourceStages) =>
             RecordMemoryBarrier(
                 sourceStages,
-                PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.VertexInputBit | PipelineStageFlags.VertexShaderBit |
-                PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.TransferBit | PipelineStageFlags.ColorAttachmentOutputBit,
+                PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.AllGraphicsBit | PipelineStageFlags.TransferBit,
                 AccessFlags.ShaderWriteBit,
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit | AccessFlags.VertexAttributeReadBit | AccessFlags.IndexReadBit |
                 AccessFlags.UniformReadBit | AccessFlags.TransferReadBit | AccessFlags.TransferWriteBit |

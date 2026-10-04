@@ -193,6 +193,27 @@ public sealed class RenderExecutorDrawTests : IDisposable
         { "max output per subgroup", banks => banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0x41 },
     };
 
+    // LS/HS/ES with passthrough primitive generation: the merged tessellation path.
+    private const uint TessellationStages = 0x0200210D;
+
+    [Theory]
+    [InlineData(0x45u, 0xC301u, "power-of-two partitioning")]
+    [InlineData(0x03u, 0xC301u, "an undefined domain")]
+    [InlineData(0x41u, 0x0000u, "an empty hull workgroup")]
+    public void UnsupportedTessellation_SkipsTheDrawInsteadOfFailing(uint factorParameter, uint hullConfiguration, string reason)
+    {
+        var banks = Banks();
+        banks.Context.ShaderStages = TessellationStages;
+        banks.Context.ShaderInterface.TessellationFactorParameter = factorParameter;
+        banks.Context.ShaderInterface.LocalHullConfiguration = hullConfiguration;
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        _executor.DrawAuto(2, banks, Auto(3));
+
+        Assert.True(_pipelines.Calls.Count == 0, reason);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("find_image", StringComparison.Ordinal));
+    }
+
     [Theory]
     [MemberData(nameof(UnsupportedGeometryStages))]
     public void UnsupportedGeometryStage_SkipsTheDraw(string reason, Action<RegisterBanks> mutate)

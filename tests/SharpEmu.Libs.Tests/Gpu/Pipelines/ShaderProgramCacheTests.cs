@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
+using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
 using Xunit;
 
@@ -20,6 +21,29 @@ public sealed class ShaderProgramCacheTests : IDisposable
     private const ulong DataBase = PipelineTestGuest.MemoryBase + 0x4_0000;
     private const uint Format32x4Uint = 75;
     private const uint Format32x4Float = 77;
+
+    [Fact]
+    public void TessellationRuntimeData_UsesOnePermutationAcrossDifferentPushCursors()
+    {
+        _guest.RegisterProgram(CodeA, HeaderA, PipelineTestGuest.EndProgram);
+        var source = _guest.Source(CodeA, ShaderStage.TessellationEvaluation, []);
+        var options = new StageCompileOptions
+        {
+            VertexInfo = new VertexInputInfo(),
+            Tessellation = new(Gen5TessellationDomain.Quads, Gen5TessellationSpacing.Equal, false, false),
+        };
+        var cursor = 0u;
+        var first = _guest.Programs.GetOrCompile(source, options, ref cursor, out var firstStage);
+        cursor = 9;
+        var second = _guest.Programs.GetOrCompile(source, options, ref cursor, out var secondStage);
+        Assert.Equal(first, second);
+        Assert.Same(firstStage.Program, secondStage.Program);
+        Assert.Single(_guest.Compiler.Requests);
+        Assert.Single(Assert.Single(_guest.Programs.Entries).Permutations);
+        Assert.True(firstStage.Program!.Bindings!.UsesTessellationData);
+        Assert.False(firstStage.Program.Bindings.UsesPushData);
+        Assert.Equal(9u, cursor);
+    }
 
     [Fact]
     public void EmbeddedFetchIsReplacedBeforeTheProgramRequestsResourceTables()

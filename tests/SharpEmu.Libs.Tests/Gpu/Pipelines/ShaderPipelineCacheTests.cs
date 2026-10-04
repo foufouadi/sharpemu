@@ -19,6 +19,24 @@ public sealed class ShaderPipelineCacheTests : IDisposable
 {
     private const uint Format32x4Float = 77;
 
+    [Theory]
+    [InlineData(6u)]
+    [InlineData(32u)]
+    public void MergedHullUserData_CarriesTheBackAddressBesideTheDeclaredFrontBank(uint count)
+    {
+        var registers = new UserScalarRegisters();
+        for (uint index = 0; index < count; index++) registers.Set(index, 100 + index, UserScalarKind.Unknown);
+        var data = ShaderPipelineCache.MergedHullUserData(registers, count, 0x20_ABCDEFBC);
+        Assert.Equal((int)count + 2, data.Length);
+        Assert.Equal(registers.Values.AsSpan(0, (int)count).ToArray(), data.AsSpan(0, (int)count).ToArray());
+        Assert.Equal(0xABCDEFBCu, data[count]);
+        Assert.Equal(0x20u, data[count + 1]);
+        var changed = ShaderPipelineCache.MergedHullUserData(registers, count, 0x21_98765404);
+        Assert.Equal(0x98765404u, changed[count]);
+        Assert.Equal(0x21u, changed[count + 1]);
+        Assert.Equal(0xABCDEFBCu, data[count]);
+    }
+
     private readonly FatalScope _fatal = new();
 
     public void Dispose() => _fatal.Dispose();
@@ -210,6 +228,25 @@ public sealed class ShaderPipelineCacheTests : IDisposable
         };
         Assert.NotEqual(key, ShaderPipelineCache.KeyOf(renderingChanged));
         Assert.Equal(key, ShaderPipelineCache.KeyOf(With(description, description.StaticParameters)));
+    }
+
+    [Fact]
+    public void GraphicsPipelineKey_DistinguishesTessellationStagesAndPatchSizes()
+    {
+        var basic = Describe();
+        GraphicsPipelineKey Key(ulong control, ulong evaluation, uint points) => ShaderPipelineCache.KeyOf(new()
+        {
+            Rendering = basic.Rendering, VertexInput = basic.VertexInput, VertexInfo = basic.VertexInfo,
+            VertexProgram = basic.VertexProgram, VertexStage = basic.VertexStage, PixelInfo = basic.PixelInfo,
+            PixelProgram = basic.PixelProgram, PixelStage = basic.PixelStage, StaticParameters = basic.StaticParameters,
+            Tessellation = new(new(control), new(evaluation), points),
+        });
+        var key = Key(10, 20, 4);
+        Assert.Equal(key, Key(10, 20, 4));
+        Assert.NotEqual(key, ShaderPipelineCache.KeyOf(basic));
+        Assert.NotEqual(key, Key(11, 20, 4));
+        Assert.NotEqual(key, Key(10, 21, 4));
+        Assert.NotEqual(key, Key(10, 20, 3));
     }
 
     [Fact]

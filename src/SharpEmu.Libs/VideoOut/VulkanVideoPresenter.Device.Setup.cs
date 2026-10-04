@@ -765,6 +765,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _supportsFillRectangle = IsDeviceExtensionAvailable(FillRectangleExtensionName);
             var enabledFeatures = new PhysicalDeviceFeatures
             {
+                TessellationShader = supportedFeatures.TessellationShader,
                 DepthBounds = supportedFeatures.DepthBounds,
                 IndependentBlend = supportedFeatures.IndependentBlend,
                 VertexPipelineStoresAndAtomics = supportedFeatures.VertexPipelineStoresAndAtomics,

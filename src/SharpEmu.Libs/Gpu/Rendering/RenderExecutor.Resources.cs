@@ -309,7 +309,11 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x500);
         }
 
-        if (emission.IndirectArgumentsAddress != 0)
+        if (state.Programs.Tessellation is not null)
+        {
+            _host.Draw(draw.Count, 1, 0, 0);
+        }
+        else if (emission.IndirectArgumentsAddress != 0)
         {
             // Uploads and shader writes end with barriers to all commands, so the
             // indirect read sees them.
@@ -327,7 +331,7 @@ public sealed partial class RenderExecutor
         var writeStages = PipelineStageFlags.None;
         if (HasBufferWrites(vertexInput.Stage))
         {
-            writeStages |= PipelineStageFlags.VertexShaderBit;
+            writeStages |= vertexInput.Tessellation is null ? PipelineStageFlags.VertexShaderBit : PipelineStageFlags.TessellationEvaluationShaderBit;
         }
 
         if (state.PixelActive && HasBufferWrites(pixelInput.Stage))

@@ -84,6 +84,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderStageKind.Vertex => ShaderStage.Vertex,
             ShaderStageKind.Pixel => ShaderStage.Pixel,
             ShaderStageKind.Compute => ShaderStage.Compute,
+            ShaderStageKind.TessellationEvaluation => ShaderStage.TessellationEvaluation,
             _ => throw SubmissionScheduler.Fatal($"The stage kind is unknown: stage={program.Stage} hash=0x{program.Hash:X16}."),
         };
 
@@ -406,6 +407,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
+            stage.WriteTessellationData(shaderData);
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {
@@ -423,6 +425,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return prepared;
+        }
+
+        public void UpdateTessellationData(IPreparedBindings prepared, uint[] data)
+        {
+            var stage = (PreparedStageBindings)prepared;
+            (stage.Stage with { TessellationData = data }).WriteTessellationData(stage.ShaderData);
         }
 
         // Reject incompatible draw views before buffer writes or image transitions are recorded.
@@ -950,7 +958,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var stage = (PreparedStageBindings)prepared;
                 var stageFlag = DescriptorWriter.ShaderStageFlag(StageOf(stage.Program));
-                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit)) == 0) ||
+                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.TessellationEvaluationBit)) == 0) ||
                     (bindPoint == PipelineBindPoint.Compute && stageFlag != ShaderStageFlags.ComputeBit))
                 {
                     throw SubmissionScheduler.Fatal($"A stage does not belong to the bind point: stage={stage.Program.Stage} bindPoint={bindPoint}.");
@@ -1015,7 +1023,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var bufferIndex = 0;
             var imageIndex = 0;
             var writeIndex = 0;
-            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
+            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.AllGraphicsBit;
             TextureResource[] textures = textureCount == 0 ? [] : new TextureResource[textureCount];
             var textureIndex = 0;
             fixed (DescriptorBufferInfo* bufferInfoPointer = bufferInfos)
@@ -1184,7 +1192,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (hasPushData)
                 {
-                    var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit : ShaderStageFlags.ComputeBit;
+                    var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit |
+                        (entry.Description?.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit) : ShaderStageFlags.ComputeBit;
                     _vk.CmdPushConstants(command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData);
                 }
 

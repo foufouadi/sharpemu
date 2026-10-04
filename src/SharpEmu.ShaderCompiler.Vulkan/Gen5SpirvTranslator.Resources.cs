@@ -18,6 +18,27 @@ public static partial class Gen5SpirvTranslator
     public static bool TryCompileProgram(ShaderCompileRequest request, out Gen5SpirvShader shader, out string error)
     {
         shader = default!;
+        if (request.CooperativeWave64Workgroup && (request.Stage != ShaderStage.Compute || request.WaveSize != 64 ||
+            (ulong)request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ is 0 or > 256 ||
+            (request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ) % 64 != 0))
+        {
+            error = "Cooperative wave64 requires a compute workgroup containing one to four complete waves.";
+            return false;
+        }
+        if (request.TessellationHull is not null &&
+            (request.Stage != ShaderStage.Compute || !request.CooperativeWave64Workgroup || !request.Bindings.UsesTessellationData))
+        {
+            error = "A merged hull program requires cooperative compute execution and tessellation runtime data.";
+            return false;
+        }
+        if (request.Stage == ShaderStage.TessellationEvaluation &&
+            (request.Tessellation is not { } tessellation ||
+             !Enum.IsDefined(tessellation.Domain) || !Enum.IsDefined(tessellation.Spacing) ||
+             tessellation.Spacing == Gen5TessellationSpacing.PowerOfTwo))
+        {
+            error = "Tessellation evaluation requires a supported tessellation configuration; power-of-two partitioning needs factor conversion.";
+            return false;
+        }
         try
         {
             BindingLayoutValidator.Validate(
@@ -125,6 +146,7 @@ public static partial class Gen5SpirvTranslator
             {
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,
                 ShaderStage.Pixel => Gen5SpirvStage.Pixel,
+                ShaderStage.TessellationEvaluation => Gen5SpirvStage.TessellationEvaluation,
                 _ => Gen5SpirvStage.Compute,
             };
             _pixelOutputBindings = request.PixelOutputs;
@@ -137,7 +159,8 @@ public static partial class Gen5SpirvTranslator
             _localSizeY = Math.Max(request.LocalSizeY, 1);
             _localSizeZ = Math.Max(request.LocalSizeZ, 1);
             _physicalAxisOfLogical = ComputeWorkgroupAxisOrder(_localSizeX, _localSizeY, _localSizeZ);
-            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && (ulong)_localSizeX * _localSizeY * _localSizeZ == 64;
+            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 &&
+                ((ulong)_localSizeX * _localSizeY * _localSizeZ == 64 || request.CooperativeWave64Workgroup);
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
             _pixelInputEnable = request.PixelInputEnable;
             _pixelInputAddress = request.PixelInputAddress;
@@ -199,6 +222,7 @@ public static partial class Gen5SpirvTranslator
                         break;
                     case DescriptorBindingKind.ShaderData:
                         _shaderData = DeclareWordBlock("shaderData", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
+                        _module.AddDecoration(_shaderData, SpirvDecoration.NonWritable);
                         break;
                     case DescriptorBindingKind.RuntimeDescriptorTable:
                         _runtimeDescriptorTable = DeclareWordBlock("runtimeDescriptorTable", number, 1u);
@@ -214,8 +238,7 @@ public static partial class Gen5SpirvTranslator
 
             if (layout.UsesPushData)
             {
-                var arrayType = _module.TypeArray(_uintType, PushData.DwordCount);
-                _module.AddDecoration(arrayType, SpirvDecoration.ArrayStride, sizeof(uint));
+                var arrayType = _module.TypeArray(_uintType, PushData.DwordCount, sizeof(uint));
                 var block = _module.TypeStruct(arrayType);
                 _module.AddDecoration(block, SpirvDecoration.Block);
                 _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
@@ -268,6 +291,17 @@ public static partial class Gen5SpirvTranslator
                     _module.AddName(_deviceBufferWordScratch, "deviceBufferWord");
                     _interfaces.Add(_deviceBufferWordScratch);
                 }
+            }
+            else if (layout.UsesTessellationData)
+            {
+                _module.AddCapability(SpirvCapability.PhysicalStorageBufferAddresses);
+                _module.SetPhysicalStorageBuffer64MemoryModel();
+                _physicalUintPointer = _module.TypePointer(SpirvStorageClass.PhysicalStorageBuffer, _uintType);
+            }
+            if (request.TessellationHull is not null)
+            {
+                _tessellationVertexIndexScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _interfaces.Add(_tessellationVertexIndexScratch);
             }
 
             foreach (var memoryIndex in request.IndirectKeyMemoryIndices)

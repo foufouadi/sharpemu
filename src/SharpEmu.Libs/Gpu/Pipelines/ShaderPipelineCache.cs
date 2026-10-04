@@ -82,10 +82,18 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         bool depthBound)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        var tessellated = IsMergedTessellationMask(context.ShaderStages);
+        Gen5TessellationInfo? tessellation = null;
+        if (tessellated)
+        {
+            if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var configuration, out var error))
+                throw SubmissionScheduler.Fatal(error);
+            tessellation = configuration;
+        }
         var vertexSource = PrepareSource(
-            vertex.ExportAddress, ShaderStage.Vertex, "vertex", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
+            vertex.ExportAddress, tessellated ? ShaderStage.TessellationEvaluation : ShaderStage.Vertex, "vertex", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
             probeWrittenRegisters: true, VertexUserDataBase);
-        var vertexInfo = PrepareVertexInput(vertexSource, shaderInterface, context);
+        var vertexInfo = tessellated ? new VertexInputInfo { PositionExportControl = shaderInterface.VertexOutputControl } : PrepareVertexInput(vertexSource, shaderInterface, context);
         ShaderSource? pixelSource = null;
         PixelInputInfo? pixelInfo = null;
         Gen5PixelOutputBinding[] pixelOutputs = [];
@@ -146,7 +154,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
             if (!TryPrepareProgram(
                 vertexSource,
-                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount },
+                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount, Tessellation = tessellation },
                 ref pushDataCursor,
                 out vertexProgram,
                 out vertexStage))
@@ -158,10 +166,25 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         {
             pixelInfo.Stage = pixelStage;
         }
+        TessellationDrawPrograms? tessellationPrograms = null;
+        if (tessellated)
+        {
+            lock (_gate)
+            {
+                tessellationPrograms = PrepareTessellationHull(vertex, shaderInterface, tessellation!.Value);
+                var bridge = _programs.GetTessellationBridge(vertexStage.Program!.Bindings!, tessellation.Value.Domain);
+                vertexInfo = new VertexInputInfo
+                {
+                    PositionExportControl = vertexInfo.PositionExportControl, Stage = vertexStage,
+                    Tessellation = new(bridge.Control, vertexProgram, tessellationPrograms.HullConfiguration.InputControlPoints),
+                };
+                vertexProgram = bridge.Vertex;
+            }
+        }
 
         SolidColorClear? solidClear = null;
         var disableBlending = false;
-        if (pixelInfo is not null)
+        if (pixelInfo is not null && !tessellated)
         {
             var vertexProgramWords = _programs.Decode(vertexSource);
             var pixelProgramWords = _programs.Decode(pixelSource!);
@@ -179,6 +202,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return new GraphicsPrograms
         {
             Vertex = vertexProgram,
+            Tessellation = tessellationPrograms,
             Pixel = pixelProgramHandle,
             VertexInput = vertexInfo,
             PixelInput = pixelInfo ?? new PixelInputInfo(),
@@ -568,6 +592,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         return new GraphicsPipelineDescription
         {
+            Tessellation = vertexInput.Tessellation,
             Rendering = renderingState,
             VertexInput = BuildVertexInputState(vertexInput),
             VertexInfo = vertexInput,
@@ -585,6 +610,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         Rendering = description.Rendering,
         VertexProgramId = description.VertexProgram.Id,
         PixelProgramId = description.PixelInfo is not null ? description.PixelProgram.Id : 0,
+        Tessellation = description.Tessellation,
         VertexInput = description.VertexInput,
         StaticParameters = description.StaticParameters,
     };

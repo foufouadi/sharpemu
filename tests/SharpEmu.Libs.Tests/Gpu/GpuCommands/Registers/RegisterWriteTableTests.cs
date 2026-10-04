@@ -33,6 +33,22 @@ public sealed class RegisterWriteTableTests
     private static uint Float(float value) => BitConverter.SingleToUInt32Bits(value);
 
     [Fact]
+    public void HullUserDataAddress_PreservesSeparateLowHighRegistersAndCopiedState()
+    {
+        var banks = NewBanks();
+        WriteShader(banks, SpiShaderUserDataHs0, 0x1111, 0x20);
+        Assert.Equal(2u, WriteShader(banks, SpiShaderUserDataAddrLoHs, 0x1234_56BC, 0xFFFF_ABCD));
+        Assert.Equal(0xABCD_1234_56BCul, banks.Shader.Vertex.HullUserDataAddress);
+        var copy = banks.Shader.Vertex.Copy();
+        RegisterWriteTable.WriteShaderEntry(banks, SpiShaderUserDataAddrHiHs, 0x23, PacketAddress);
+        Assert.Equal(0x23_1234_56BCul, banks.Shader.Vertex.HullUserDataAddress);
+        RegisterWriteTable.WriteShaderEntry(banks, SpiShaderUserDataAddrLoHs, 0x8765_4304, PacketAddress);
+        Assert.Equal(0x23_8765_4304ul, banks.Shader.Vertex.HullUserDataAddress);
+        Assert.Equal(0xABCD_1234_56BCul, copy.HullUserDataAddress);
+        Assert.Equal(0x1111u, banks.Shader.Vertex.HullUserScalars.Values[0]);
+    }
+
+    [Fact]
     public void DirectWriters_DecodeDepthControlAndModeControl()
     {
         var banks = NewBanks();

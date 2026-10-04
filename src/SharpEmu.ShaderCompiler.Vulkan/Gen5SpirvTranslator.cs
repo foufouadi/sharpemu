@@ -67,6 +67,7 @@ public static partial class Gen5SpirvTranslator
 
         private readonly SpirvModuleBuilder _module = new();
         private readonly Gen5SpirvStage _stage;
+        private bool HasVertexOutputs => _stage is Gen5SpirvStage.Vertex or Gen5SpirvStage.TessellationEvaluation;
         private readonly IReadOnlyList<Gen5PixelOutputBinding> _pixelOutputBindings;
         private readonly bool _usesPixelValidMask;
         private readonly bool _enableGraphicsSubgroupOperations;
@@ -429,13 +430,17 @@ public static partial class Gen5SpirvTranslator
 
                 EmitDeviceFormatLoadFunctions();
 
+
                 var model = _stage switch
                 {
                     Gen5SpirvStage.Vertex => SpirvExecutionModel.Vertex,
+                    Gen5SpirvStage.TessellationEvaluation => SpirvExecutionModel.TessellationEvaluation,
                     Gen5SpirvStage.Pixel => SpirvExecutionModel.Fragment,
                     _ => SpirvExecutionModel.GLCompute,
                 };
                 _module.AddEntryPoint(model, main, "main", _interfaces);
+                if (_stage == Gen5SpirvStage.TessellationEvaluation)
+                    EmitTessellationExecutionModes(main);
                 if (_request.SupportsExactFloat16Conversions)
                 {
                     // The f16 conversions round to nearest even and keep f16 denormals, as
@@ -465,7 +470,7 @@ public static partial class Gen5SpirvTranslator
                         physicalSizes[2]);
                 }
 
-                var attributeCount = _stage == Gen5SpirvStage.Vertex
+                var attributeCount = HasVertexOutputs
                     ? (uint)_vertexOutputs.Count
                     : (uint)_pixelInputs.Count;
                 shader = new Gen5SpirvShader(_module.Build(), attributeCount);
@@ -601,6 +606,18 @@ public static partial class Gen5SpirvTranslator
         {
             if (!UsesWave64Exchange())
             {
+                return;
+            }
+
+            if (_request.CooperativeWave64Workgroup)
+            {
+                _wave64ExchangeElementPointer = _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
+                var array = _module.TypeArray(_uintType, Wave64ExchangeDwordCount * CooperativeWaveCount);
+                _wave64Exchange = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Workgroup, array), SpirvStorageClass.Workgroup);
+                _interfaces.Add(_wave64Exchange);
+                _module.AddName(_wave64Exchange, "wave64Exchange");
+                DeclareCooperativeWaveScratch();
                 return;
             }
 
@@ -783,29 +800,36 @@ public static partial class Gen5SpirvTranslator
                 }
             }
 
-            if (_stage == Gen5SpirvStage.Vertex)
+            if (HasVertexOutputs)
             {
-                DeclareVertexInputs();
+                if (_stage == Gen5SpirvStage.Vertex)
+                {
+                    DeclareVertexInputs();
 
-                var inputPointer =
-                    _module.TypePointer(SpirvStorageClass.Input, _uintType);
-                _vertexIndexInput = _module.AddGlobalVariable(
-                    inputPointer,
-                    SpirvStorageClass.Input);
-                _module.AddDecoration(
-                    _vertexIndexInput,
-                    SpirvDecoration.BuiltIn,
-                    (uint)SpirvBuiltIn.VertexIndex);
-                _interfaces.Add(_vertexIndexInput);
+                    var inputPointer =
+                        _module.TypePointer(SpirvStorageClass.Input, _uintType);
+                    _vertexIndexInput = _module.AddGlobalVariable(
+                        inputPointer,
+                        SpirvStorageClass.Input);
+                    _module.AddDecoration(
+                        _vertexIndexInput,
+                        SpirvDecoration.BuiltIn,
+                        (uint)SpirvBuiltIn.VertexIndex);
+                    _interfaces.Add(_vertexIndexInput);
 
-                _instanceIndexInput = _module.AddGlobalVariable(
-                    inputPointer,
-                    SpirvStorageClass.Input);
-                _module.AddDecoration(
-                    _instanceIndexInput,
-                    SpirvDecoration.BuiltIn,
-                    (uint)SpirvBuiltIn.InstanceIndex);
-                _interfaces.Add(_instanceIndexInput);
+                    _instanceIndexInput = _module.AddGlobalVariable(
+                        inputPointer,
+                        SpirvStorageClass.Input);
+                    _module.AddDecoration(
+                        _instanceIndexInput,
+                        SpirvDecoration.BuiltIn,
+                        (uint)SpirvBuiltIn.InstanceIndex);
+                    _interfaces.Add(_instanceIndexInput);
+                }
+                else
+                {
+                    DeclareTessellationInputs();
+                }
 
                 var outputPointer =
                     _module.TypePointer(SpirvStorageClass.Output, _vec4Type);
@@ -1110,7 +1134,7 @@ public static partial class Gen5SpirvTranslator
             // vertex count in bits 0-7, primitive count in bits 8-15. Left at zero, EXEC
             // becomes all 64 lanes, and a waterfall loop then waits forever for lanes that
             // do not exist to clear their bits (Astro Bot intro_next froze the GPU this way).
-            if (_stage == Gen5SpirvStage.Vertex && _request.UserDataBase > 3)
+            if (HasVertexOutputs && _request.UserDataBase > 3)
             {
                 uint laneCount;
                 if (_subgroupInvocationIdInput == 0)
@@ -1139,10 +1163,17 @@ public static partial class Gen5SpirvTranslator
                     UInt(0));
             }
 
-            if (_stage == Gen5SpirvStage.Vertex)
+            if (HasVertexOutputs)
             {
-                StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
-                StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                if (_stage == Gen5SpirvStage.Vertex)
+                {
+                    StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
+                    StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                }
+                else
+                {
+                    EmitTessellationInputState();
+                }
 
                 // Give every declared param output a defined starting value.
                 // Outputs the program actually exports overwrite this; the
@@ -1251,6 +1282,7 @@ public static partial class Gen5SpirvTranslator
                             UInt(checked(_localSizeX * _localSizeY * _localSizeZ)));
                     }
                 }
+                if (_request.TessellationHull is not null) EmitHullInputState();
             }
         }
 
@@ -6559,7 +6591,7 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (_stage != Gen5SpirvStage.Vertex)
+            if (!HasVertexOutputs)
             {
                 return true;
             }
@@ -7719,6 +7751,7 @@ public static partial class Gen5SpirvTranslator
             if (!_execKnownFull)
                 value = _module.AddInstruction(SpirvOp.Select, _uintType,
                     Load(_boolType, _exec), value, Load(_uintType, pointer));
+            if (_executingWave != 0) value = GuardCooperativeUint(value, Load(_uintType, pointer));
             Store(pointer, value);
         }
 
@@ -7755,6 +7788,7 @@ public static partial class Gen5SpirvTranslator
 
         private void StoreS(uint register, uint value)
         {
+            if (_executingWave != 0) value = GuardCooperativeUint(value, LoadS(register));
             Store(ScalarPointer(register), value);
 
             if (register is 106 or 107)
@@ -7823,12 +7857,15 @@ public static partial class Gen5SpirvTranslator
                     oldValue);
             }
 
+            if (_executingWave != 0) value = GuardCooperativeUint(value, LoadV(register));
             Store(VectorPointer(register), value);
 
         }
 
         private void StorePackedHalf(uint register, uint value)
         {
+            if (_executingWave != 0) value = _module.AddInstruction(SpirvOp.Select, _vec2Type,
+                _executingWave, value, Load(_vec2Type, PackedHalfPointer(register)));
             if (_execKnownFull)
             {
                 Store(PackedHalfPointer(register), value);
@@ -7891,6 +7928,11 @@ public static partial class Gen5SpirvTranslator
 
         private void Store(uint pointer, uint value)
         {
+            if (_executingWave != 0 && pointer == _exec) value = LogicalAnd(value, _executingWave);
+            if (_executingWave != 0 && (pointer == _scc || pointer == _programActive))
+                value = _module.AddInstruction(SpirvOp.Select, _boolType, _executingWave, value, Load(_boolType, pointer));
+            if (_executingWave != 0 && pointer == _programCounter)
+                value = GuardCooperativeUint(value, Load(_uintType, pointer));
             if (_flagVariables.Contains(pointer))
             {
                 value = _module.AddInstruction(
@@ -8198,9 +8240,12 @@ public static partial class Gen5SpirvTranslator
         {
             var parity = Load(_uintType, _wave64ExchangeParity);
             Store(_wave64ExchangeParity, BitwiseXor(parity, UInt(1)));
-            return IAdd(
+            var exchange = IAdd(
                 UInt(_wave64ExchangeOffset),
                 _module.AddInstruction(SpirvOp.IMul, _uintType, parity, UInt(Wave64ExchangeSlotCount)));
+            return _request.CooperativeWave64Workgroup
+                ? IAdd(exchange, _module.AddInstruction(SpirvOp.IMul, _uintType, CooperativeWaveId(), UInt(Wave64ExchangeDwordCount)))
+                : exchange;
         }
 
         private uint Wave64ExchangePointer(uint exchange, uint slot) =>
@@ -8342,6 +8387,7 @@ public static partial class Gen5SpirvTranslator
         private void EmitExecConditional(Action emit)
         {
             var active = Load(_boolType, _exec);
+            if (_executingWave != 0) active = LogicalAnd(active, _executingWave);
             EmitConditional(active, emit);
         }
 
@@ -8409,7 +8455,7 @@ public static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupOperations() =>
             _enableGraphicsSubgroupOperations &&
-            (UsesSubgroupShuffle() ||
+            (_request.CooperativeWave64Workgroup || UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _request.Program.Instructions.Any(static instruction =>
@@ -8462,7 +8508,7 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        private static IReadOnlyList<ShaderBlock> BuildBasicBlocks(
+        private IReadOnlyList<ShaderBlock> BuildBasicBlocks(
             IReadOnlyList<Gen5ShaderInstruction> instructions)
         {
             if (instructions.Count == 0)
@@ -8474,6 +8520,11 @@ public static partial class Gen5SpirvTranslator
             for (var index = 0; index < instructions.Count; index++)
             {
                 var instruction = instructions[index];
+                if (_request.CooperativeWave64Workgroup && instruction.Opcode == "SBarrier")
+                {
+                    leaders.Add(instruction.Pc);
+                    if (index + 1 < instructions.Count) leaders.Add(instructions[index + 1].Pc);
+                }
                 if (IsBranch(instruction.Opcode) &&
                     TryGetBranchTargetPc(instruction, out var targetPc))
                 {

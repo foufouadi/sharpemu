@@ -185,6 +185,7 @@ public enum SpirvOp : ushort
 public enum SpirvCapability : uint
 {
     Shader = 1,
+    Tessellation = 3,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
     ClipDistance = 32,
@@ -245,12 +246,24 @@ public enum SpirvStorageClass : uint
 public enum SpirvExecutionModel : uint
 {
     Vertex = 0,
+    TessellationControl = 1,
+    TessellationEvaluation = 2,
     Fragment = 4,
     GLCompute = 5,
 }
 
 public enum SpirvExecutionMode : uint
 {
+    SpacingEqual = 1,
+    SpacingFractionalEven = 2,
+    SpacingFractionalOdd = 3,
+    VertexOrderCw = 4,
+    VertexOrderCcw = 5,
+    PointMode = 10,
+    Triangles = 22,
+    Quads = 24,
+    Isolines = 25,
+    OutputVertices = 26,
     OriginUpperLeft = 7,
     DepthReplacing = 12,
     LocalSize = 17,
@@ -268,6 +281,7 @@ public enum SpirvDecoration : uint
     NoPerspective = 13,
     Flat = 14,
     PerVertexKhr = 5285,
+    Patch = 15,
     Location = 30,
     Binding = 33,
     DescriptorSet = 34,
@@ -286,6 +300,12 @@ public enum SpirvBuiltIn : uint
     ViewportIndex = 10,
     VertexIndex = 42,
     InstanceIndex = 43,
+    PrimitiveId = 7,
+    InvocationId = 8,
+    TessLevelOuter = 11,
+    TessLevelInner = 12,
+    TessCoord = 13,
+    PatchVertices = 14,
     FragCoord = 15,
     BaryCoordKhr = 5286,
     BaryCoordNoPerspKhr = 5287,
@@ -387,7 +407,7 @@ public sealed class SpirvModuleBuilder
         uint> _imageTypes = [];
     private readonly Dictionary<uint, uint> _sampledImageTypes = [];
     private readonly Dictionary<(SpirvStorageClass Storage, uint Type), uint> _pointerTypes = [];
-    private readonly Dictionary<(uint Element, uint Count), uint> _arrayTypes = [];
+    private readonly Dictionary<(uint Element, uint Count, uint? Stride), uint> _arrayTypes = [];
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
@@ -616,9 +636,12 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    public uint TypeArray(uint elementType, uint count)
+    public uint TypeArray(uint elementType, uint count, uint? arrayStride = null)
     {
-        var key = (elementType, count);
+        // Explicit block layout belongs to the type. Sharing it with an array
+        // in Workgroup storage would also share ArrayStride, which is invalid
+        // without the explicit workgroup layout extension.
+        var key = (elementType, count, arrayStride);
         if (_arrayTypes.TryGetValue(key, out var existing))
         {
             return existing;
@@ -627,6 +650,10 @@ public sealed class SpirvModuleBuilder
         var length = Constant(TypeInt(32, false), count);
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.TypeArray, id, elementType, length);
+        if (arrayStride is { } stride)
+        {
+            AddDecoration(id, SpirvDecoration.ArrayStride, stride);
+        }
         _arrayTypes.Add(key, id);
         return id;
     }

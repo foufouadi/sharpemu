@@ -164,6 +164,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public void Dispose()
     {
         Vk.DeviceWaitIdle(Device);
+        _deviceInfo?.Slabs.Destroy();
         Vk.DestroyDevice(Device, null);
         if (_debugUtils is { } debugUtils)
         {
@@ -171,6 +172,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         }
 
         Vk.DestroyInstance(Instance, null);
+        AssertNoValidationMessages();
     }
 
     private static uint DebugCallback(DebugUtilsMessageSeverityFlagsEXT severity, DebugUtilsMessageTypeFlagsEXT type, DebugUtilsMessengerCallbackDataEXT* data, void* userData)
@@ -335,6 +337,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         vk.GetPhysicalDeviceFeatures(physical, out var baseFeatures);
         var enabledFeatures = new PhysicalDeviceFeatures
         {
+            TessellationShader = baseFeatures.TessellationShader,
             SampleRateShading = baseFeatures.SampleRateShading,
             SamplerAnisotropy = baseFeatures.SamplerAnisotropy,
             ShaderStorageImageExtendedFormats = baseFeatures.ShaderStorageImageExtendedFormats,

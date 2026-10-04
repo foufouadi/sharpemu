@@ -182,12 +182,19 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         IReadOnlyDictionary<DescriptorBindingKind, DescriptorImageInfo[]>? boundImages = null,
         ulong shaderBase = 0,
         uint[]? dispatchThreadLimits = null,
-        uint[]? bufferStrides = null)
+        uint[]? bufferStrides = null,
+        uint[]? tessellationData = null)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
         var layout = _request.Bindings;
         var shaderData = new uint[layout.ShaderDataDwordCount];
+        if (layout.UsesTessellationData)
+        {
+            if (tessellationData is not { Length: (int)Gen5TessellationData.DwordCount })
+                throw new InvalidOperationException("The tessellation kernel requires its runtime data.");
+            tessellationData.CopyTo(shaderData, (int)layout.TessellationDataDword);
+        }
         for (var index = 0; index < layout.UserDataRegisters.Count; index++)
         {
             var register = layout.UserDataRegisters[index];

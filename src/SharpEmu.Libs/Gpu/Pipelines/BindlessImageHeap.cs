@@ -161,7 +161,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
                     _ => DescriptorType.Sampler,
                 },
                 DescriptorCount = _capacity[index],
-                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
+                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit | ShaderStageFlags.TessellationEvaluationBit,
             };
             flags[index] = DescriptorBindingFlags.PartiallyBoundBit |
                 DescriptorBindingFlags.UpdateAfterBindBit |

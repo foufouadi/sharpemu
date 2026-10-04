@@ -116,6 +116,8 @@ public interface IRenderHost
     BufferBinding NullBuffer { get; }
 
     BufferBinding ObtainBuffer(ulong address, ulong size, bool isWritten);
+    ulong ObtainBufferDeviceAddress(ulong address, ulong size, bool isWritten) =>
+        throw new NotSupportedException("The render host does not expose buffer addresses for tessellation.");
 
     // Resolve allocations that can overlap before descriptors or geometry capture their handles.
     void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges);
@@ -131,6 +133,8 @@ public interface IRenderHost
     IResourcePreparation BeginPreparation();
 
     IPreparedBindings PrepareBindings(ShaderStageResources stage);
+    void UpdateTessellationData(IPreparedBindings prepared, uint[] data) =>
+        throw new NotSupportedException("The render host does not support tessellation runtime data.");
 
     void PrepareDeviceAddresses();
 

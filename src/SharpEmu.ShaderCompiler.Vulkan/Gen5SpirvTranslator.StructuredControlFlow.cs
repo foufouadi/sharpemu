@@ -98,7 +98,7 @@ public static partial class Gen5SpirvTranslator
         private void PrepareControlFlow(IReadOnlyList<ShaderBlock> blocks)
         {
             var reason = "forced";
-            var forced = ForceDispatcher || _request.ForceDispatcher;
+            var forced = ForceDispatcher || _request.ForceDispatcher || _request.CooperativeWave64Workgroup;
             if (!forced && TryPlanStructuredControlFlow(blocks, out var plan, out reason))
             {
                 _structuredPlan = plan;
@@ -123,6 +123,7 @@ public static partial class Gen5SpirvTranslator
         private bool TryEmitControlFlow(IReadOnlyList<ShaderBlock> blocks, out string error)
         {
             error = string.Empty;
+            if (_request.CooperativeWave64Workgroup) return TryEmitCooperativeDispatcher(blocks, out error);
             if (_structuredPlan is null) return TryEmitDispatcher(blocks, out error);
             _module.AddInstruction(SpirvOp.FunctionCall, _voidType, _structuredBody);
             return true;

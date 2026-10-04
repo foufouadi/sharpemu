@@ -265,7 +265,7 @@ public static partial class Gen5ShaderTranslator
                 : instruction with { Pc = (uint)rebasedPc, AddressOffset = unchecked(continuationDistance + instruction.ProgramOffset) });
         }
 
-        program = new Gen5ShaderProgram(entryAddress, instructions);
+        program = new Gen5ShaderProgram(entryAddress, instructions) { FusedContinuationPc = continuationPc };
         error = string.Empty;
         return true;
     }

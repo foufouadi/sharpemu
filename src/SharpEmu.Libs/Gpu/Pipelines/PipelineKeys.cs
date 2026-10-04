@@ -209,16 +209,17 @@ public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
     public required PipelineRenderingState Rendering { get; init; }
     public ulong VertexProgramId { get; init; }
     public ulong PixelProgramId { get; init; }
+    public TessellationPipelineStages? Tessellation { get; init; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 
     public bool Equals(GraphicsPipelineKey? other) =>
         other is not null && Rendering.Equals(other.Rendering) && VertexProgramId == other.VertexProgramId && PixelProgramId == other.PixelProgramId &&
-        VertexInput.Equals(other.VertexInput) && StaticParameters.Equals(other.StaticParameters);
+        Tessellation == other.Tessellation && VertexInput.Equals(other.VertexInput) && StaticParameters.Equals(other.StaticParameters);
 
     public override bool Equals(object? obj) => Equals(obj as GraphicsPipelineKey);
 
-    public override int GetHashCode() => HashCode.Combine(Rendering, VertexProgramId, PixelProgramId, VertexInput, StaticParameters);
+    public override int GetHashCode() => HashCode.Combine(Rendering, VertexProgramId, PixelProgramId, VertexInput, StaticParameters, Tessellation);
 }
 
 public readonly record struct ComputePipelineKey(ulong ComputeProgramId);

@@ -53,7 +53,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public ulong ProfilePixelHash;
             public ulong ProfileComputeHash;
 
-            public bool RectangleList => Description is { StaticParameters.Topology: PrimitiveTopology.PatchList };
+            public bool RectangleList => Description is { Tessellation: null, StaticParameters.Topology: PrimitiveTopology.PatchList };
         }
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
@@ -660,7 +660,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 description.PixelStage?.Bindings?.UsesBindlessImages == true;
 
             var bindings = new List<DescriptorSetLayoutBinding>();
-            CollectLayoutBindings(bindings, description.VertexStage, ShaderStage.Vertex);
+            CollectLayoutBindings(bindings, description.VertexStage,
+                description.Tessellation is null ? ShaderStage.Vertex : ShaderStage.TessellationEvaluation);
+            if (description.Tessellation is not null)
+            {
+                var dataBinding = BindingLayout.NativeBindingIndex(ShaderStage.TessellationEvaluation, DescriptorBindingKind.ShaderData);
+                var index = bindings.FindIndex(binding => binding.Binding == dataBinding);
+                if (index < 0) throw SubmissionScheduler.Fatal("The tessellation pipeline has no runtime data binding.");
+                var binding = bindings[index];
+                binding.StageFlags |= ShaderStageFlags.TessellationControlBit;
+                bindings[index] = binding;
+            }
             if (description.PixelStage is { } pixelStage)
             {
                 CollectLayoutBindings(bindings, pixelStage, ShaderStage.Pixel);
@@ -671,7 +681,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SetLayout = setLayout,
                 Demand = demand,
-                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, usesBindlessImages),
+                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit |
+                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), usesBindlessImages),
                 UsesPushDescriptors = usesPushDescriptors,
                 UsesBindlessImages = usesBindlessImages,
                 Description = description,
@@ -827,7 +838,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
             {
-                var shaderStages = stackalloc PipelineShaderStageCreateInfo[2];
+                var shaderStages = stackalloc PipelineShaderStageCreateInfo[4];
                 var stageCount = 1u;
                 shaderStages[0] = new PipelineShaderStageCreateInfo
                 {
@@ -836,6 +847,29 @@ internal static unsafe partial class VulkanVideoPresenter
                     Module = vertexModule,
                     PName = entryPoint,
                 };
+                var tessellationState = new PipelineTessellationStateCreateInfo
+                {
+                    SType = StructureType.PipelineTessellationStateCreateInfo,
+                    PatchControlPoints = description.Tessellation?.InputControlPoints ?? 0,
+                };
+                if (description.Tessellation is { } tessellation)
+                {
+                    if (topology != PrimitiveTopology.PatchList || tessellation.InputControlPoints is 0 or > 32 ||
+                        tessellation.Control.Module == 0 || tessellation.Evaluation.Module == 0)
+                        throw SubmissionScheduler.Fatal("Invalid native tessellation pipeline stages or patch size.");
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationControlBit,
+                        Module = new ShaderModule(tessellation.Control.Module), PName = entryPoint,
+                    };
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationEvaluationBit,
+                        Module = new ShaderModule(tessellation.Evaluation.Module), PName = entryPoint,
+                    };
+                }
                 if (pixelModule.Handle != 0)
                 {
                     shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
@@ -998,6 +1032,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         PStages = shaderStages,
                         PVertexInputState = &vertexInput,
                         PInputAssemblyState = &inputAssembly,
+                        PTessellationState = description.Tessellation is null ? null : &tessellationState,
                         PViewportState = &viewportState,
                         PRasterizationState = &rasterization,
                         PMultisampleState = &multisample,
