@@ -40,7 +40,6 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
     public ShaderProgramCache Programs => _programs;
 
-    internal RegisteredShader ResolveRegisteredShader(ulong address) => _registry.Require(address, "unsupported-stage-diagnostic");
 
     public int GraphicsPipelineCount => _graphicsPipelines.Count;
 

@@ -54,7 +54,6 @@ public sealed partial class RenderExecutor
 
     private readonly IRenderHost _host;
     private readonly IShaderPipelineProvider _pipelines;
-    private readonly HashSet<(ulong, ulong, ulong)> _dumpedUnsupportedPrograms = [];
     private readonly bool _strictDrawResources;
     private readonly HashSet<(ulong ShaderHash, ImageType ImageType, ImageViewType ViewType)> _reportedDrawImageTypeMismatches = [];
 
@@ -564,54 +563,6 @@ public sealed partial class RenderExecutor
         if (!unsupportedStageMask && !unsupportedGeometryStage && !geometryRegisters)
         {
             return false;
-        }
-
-        var dumpDirectory = Environment.GetEnvironmentVariable("SHARPEMU_UNSUPPORTED_SHADER_DUMP_DIR");
-        if (!string.IsNullOrEmpty(dumpDirectory) && _dumpedUnsupportedPrograms.Add((vertex.LocalAddress, vertex.HullAddress, vertex.ExportAddress)))
-        {
-            Directory.CreateDirectory(dumpDirectory);
-            var prefix = Path.Combine(dumpDirectory, $"{stages:X8}-{vertex.HullAddress:X16}-{vertex.ExportAddress:X16}");
-            File.WriteAllText(prefix + ".json", System.Text.Json.JsonSerializer.Serialize(new { Stages = stages, Vertex = vertex, Interface = shaderInterface },
-                new System.Text.Json.JsonSerializerOptions { IncludeFields = true, WriteIndented = true }));
-            foreach (var (label, address) in new[] { ("local", vertex.LocalAddress), ("hull", vertex.HullAddress), ("export", vertex.ExportAddress) })
-            {
-                if (address == 0) continue;
-                if (_pipelines is Pipelines.ShaderPipelineCache shaderCache)
-                {
-                    var registered = shaderCache.ResolveRegisteredShader(address);
-                    File.WriteAllText(prefix + "." + label + ".registered.json", System.Text.Json.JsonSerializer.Serialize(registered));
-                    if (registered.IsFused)
-                    {
-                        var continuation = new byte[registered.ContinuationSizeBytes];
-                        if (_host.TryReadGuest(registered.ContinuationAddress, continuation))
-                            File.WriteAllBytes(prefix + "." + label + ".continuation.bin", continuation);
-                    }
-                }
-                var headerAddress = Agc.AgcExports.GetShaderHeaderAddress(address);
-                var header = new byte[128];
-                if (headerAddress != 0 && _host.TryReadGuest(headerAddress, header))
-                {
-                    File.WriteAllBytes(prefix + "." + label + ".header.bin", header);
-                    if (label == "local")
-                    {
-                        foreach (var region in new[] { headerAddress & ~0xFFFFUL, address > 0x100000 ? (address - 0x100000) & ~0xFFFFUL : address })
-                        {
-                            for (ulong offset = 0; offset < 0x200000; offset += 0x10000)
-                            {
-                                var bytes = new byte[0x10000];
-                                if (_host.TryReadGuest(region + offset, bytes))
-                                    File.WriteAllBytes(prefix + $".region-{region + offset:X16}.bin", bytes);
-                            }
-                        }
-                    }
-                    var size = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0x44));
-                    if (size > 0 && size <= 1024 * 1024)
-                    {
-                        var code = new byte[size];
-                        if (_host.TryReadGuest(address, code)) File.WriteAllBytes(prefix + "." + label + ".bin", code);
-                    }
-                }
-            }
         }
 
         if (Interlocked.Exchange(ref _geometryWarningShown, 1) == 0)

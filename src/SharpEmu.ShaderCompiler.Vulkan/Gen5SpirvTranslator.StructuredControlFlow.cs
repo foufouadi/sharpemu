@@ -34,10 +34,6 @@ public static partial class Gen5SpirvTranslator
             "dispatcher",
             StringComparison.OrdinalIgnoreCase);
 
-        private static readonly bool TraceControlFlow = string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_CONTROL_FLOW"),
-            "1",
-            StringComparison.Ordinal);
 
         private enum TerminatorKind
         {
@@ -103,20 +99,9 @@ public static partial class Gen5SpirvTranslator
             {
                 _structuredPlan = plan;
                 _structuredBody = _module.AllocateId();
-                if (TraceControlFlow)
-                {
-                    Console.Error.WriteLine(
-                        $"[SHADER][CFG] structured address=0x{_request.Program.Address:X16} blocks={blocks.Count} loops={plan.LoopsByHeader.Count}");
-                }
-
                 return;
             }
 
-            if (TraceControlFlow)
-            {
-                Console.Error.WriteLine(
-                    $"[SHADER][CFG] dispatcher address=0x{_request.Program.Address:X16} blocks={blocks.Count} reason={reason}");
-            }
 
         }
 
