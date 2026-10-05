@@ -492,6 +492,13 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
+        AwaitPublishingDownloads(image.Description.Data);
+        if (!ReferenceEquals(_slots.TryGet(imageIdentifier), image))
+        {
+            // The image went away while the cache waited.
+            return;
+        }
+
         var measureUpload = RenderPhaseProfile.ImageUploadDetailsEnabled;
         var watchStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         WatchImage(imageIdentifier);
@@ -951,6 +958,8 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.EndRendering();
         VulkanSynchronization.PipelineBarrier(_device.Vk,new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
         var backing = _backing;
+        var publishing = new PublishingDownload(range.Address, range.Size, _scheduler.CurrentTick);
+        lock (_publishingDownloads) _publishingDownloads.Add(publishing);
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             try
@@ -961,9 +970,52 @@ public sealed unsafe partial class GuestImageCache
                     throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
                 }
             }
-            finally { temporary?.Dispose(); }
+            finally
+            {
+                temporary?.Dispose();
+                lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
+            }
         });
         return true;
+    }
+
+    private sealed record PublishingDownload(ulong Address, ulong Size, ulong Tick);
+
+    // Readbacks whose guest bytes are written only when their tick completes. Until then guest
+    // memory holds the contents they supersede.
+    private readonly List<PublishingDownload> _publishingDownloads = new();
+
+    // Waits until every readback that will publish into the range has written guest memory, so
+    // an upload does not read the bytes it replaces. The cache lock is released while waiting.
+    private void AwaitPublishingDownloads(GuestSpan range)
+    {
+        ulong tick = 0;
+        lock (_publishingDownloads)
+        {
+            foreach (var download in _publishingDownloads)
+            {
+                if (download.Address < range.Address + range.Size && range.Address < download.Address + download.Size)
+                    tick = Math.Max(tick, download.Tick);
+            }
+        }
+
+        if (tick == 0)
+        {
+            return;
+        }
+
+        if (_scheduler.InsideTickCallback)
+        {
+            throw SubmissionScheduler.Fatal($"An image upload cannot wait for a pending readback from a completion callback: address=0x{range.Address:X16} size=0x{range.Size:X}.");
+        }
+
+        _lock.Exit();
+        try
+        {
+            _scheduler.Wait(tick);
+            _scheduler.WaitForPriorityOperations(tick);
+        }
+        finally { _lock.Enter(); }
     }
 
     // Clears the one image that owns exactly this range; false when no single owner or clear value fits.

@@ -152,6 +152,56 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A tiled image retired under pressure is published only when its readback completes. Asked
+    // for again before then, the image must not be rebuilt from the guest bytes it supersedes.
+    [Fact]
+    public void Pressure_TiledImageFoundAgainBeforeItsReadbackCompletes_KeepsItsGpuContents()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const ulong size = 0x10000;
+        const uint clear = 0x3f200000, stale = 0xdeadbeef;
+        var address = harness.MapBacked(size, ReadWrite);
+        harness.Write(address, Bytes(Enumerable.Repeat(stale, (int)(size / 4)).ToArray()));
+        ImageRequest Request()
+        {
+            var request = AsDepthTarget(LinearRequest(address, size, Format.D32Sfloat,
+                GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(3, 2, 1), 1, 4, 1), Format.D32Sfloat);
+            request.Description.Pitch = 4;
+            request.Description.TileMode = GuestTileMode.Depth;
+            request.Description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size, Pitch = 4, Height = 2 };
+            return request;
+        }
+
+        var first = Request();
+        var image = harness.Find(ref first);
+        harness.Worker.Run(() =>
+        {
+            Assert.True(harness.Images.TryClearImageFromBuffer(address, size, clear));
+            harness.Images.SetCollectionThresholds(0, 0, 1, 2);
+            harness.Images.ResetRecency([image], 2);
+            harness.Images.RunGarbageCollector();
+            Assert.False(harness.Images.Contains(image));
+            harness.Images.SetCollectionThresholds(ulong.MaxValue, ulong.MaxValue, ulong.MaxValue, 3);
+        });
+        var second = Request();
+        var again = harness.Acquire(ref second);
+
+        // Publish the second image's contents the same way and compare with the GPU's value.
+        harness.Finish();
+        harness.MarkGpuWritten(again);
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, 1, 4);
+            harness.Images.ResetRecency([again], 4);
+            harness.Images.RunGarbageCollector();
+        });
+        harness.Finish();
+        var result = harness.Read(address, (int)size).Chunk(4).Select(bytes => BitConverter.ToUInt32(bytes)).ToArray();
+        Assert.Equal(6, result.Count(value => value == clear));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void Pressure_CompletesTiledReadbackBatchesBeforeAllocatingMoreScratch()
     {
