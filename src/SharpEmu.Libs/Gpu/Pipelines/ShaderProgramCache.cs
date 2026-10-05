@@ -90,6 +90,7 @@ internal sealed class ProgramSourceEntry
     public required bool HasBitwiseExclusiveOr { get; init; }
     public ConstantFill? ConstantFill { get; init; }
     public BoundedFill? BoundedFill { get; init; }
+    public BoundedCopy? BoundedCopy { get; init; }
     public EmbeddedVertexFetchPlan? EmbeddedFetch { get; init; }
     public ShaderVertexInput[] VertexInputs { get; init; } = [];
     public List<ProgramPermutation> Permutations { get; } = new(8);
@@ -426,6 +427,7 @@ internal sealed class ShaderProgramCache
             HasBitwiseExclusiveOr = exclusiveOr,
             ConstantFill = source.Stage == ShaderStage.Compute ? ConstantFillDetector.Detect(program) : null,
             BoundedFill = source.Stage == ShaderStage.Compute ? BoundedFillDetector.Detect(program) : null,
+            BoundedCopy = source.Stage == ShaderStage.Compute ? BoundedFillDetector.DetectCopy(program) : null,
             EmbeddedFetch = fetch,
             VertexInputs = vertexInputs,
         };
@@ -920,6 +922,7 @@ internal sealed class ShaderProgramCache
             HasBitwiseExclusiveOr = entry.HasBitwiseExclusiveOr,
             ConstantFill = entry.ConstantFill,
             BoundedFill = entry.BoundedFill,
+            BoundedCopy = entry.BoundedCopy,
             Buffers = buffers,
             Images = images,
             SamplerCount = info.Samplers.Count,

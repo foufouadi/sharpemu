@@ -122,6 +122,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint), clean: false))
             {
                 if (TryGetAliasPointer(address, sizeof(uint), out var alias))
@@ -154,6 +155,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         return false;
                     }
+
+                    synchronized = true;
                 }
                 else
                 {
@@ -168,6 +171,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (Diagnostics.GpuReadTrace.Enabled && synchronized)
+            {
+                Diagnostics.GpuReadTrace.RecordValue(address, word);
+            }
+
             return true;
         }
 
