@@ -133,9 +133,8 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         var indexAddress = ctx[CpuRegister.Rdx];
-        var modifier = (uint)ctx[CpuRegister.Rcx];
 
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
@@ -238,8 +237,7 @@ public static partial class AgcExports
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
-        var modifier = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
