@@ -694,6 +694,8 @@ internal sealed class ShaderProgramCache
             case ShaderStage.Pixel:
             {
                 var info = options.PixelInfo!;
+                if (info.EarlyDepth && info.ShaderSampleExclusionMask != 0 && !_host.PostDepthCoverageSupported)
+                    throw SubmissionScheduler.Fatal("Sample exclusion requires post-depth coverage support.");
                 var interpolators = new uint[info.InputCount];
                 Array.Copy(info.InterpolatorSettings, interpolators, interpolators.Length);
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
@@ -709,6 +711,7 @@ internal sealed class ShaderProgramCache
                     ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
                     PixelOutputs = options.PixelOutputs,
                     EarlyFragmentTests = info.EarlyDepth,
+                    PixelShaderSampleExclusionMask = info.EarlyDepth ? info.ShaderSampleExclusionMask : 0u,
                     PixelDepthExportEnable = info.DepthExportEnable,
                     PixelSampleMaskExportEnable = info.SampleMaskExportEnable,
                     PixelMaskExportSamples = info.MaskExportSamples,

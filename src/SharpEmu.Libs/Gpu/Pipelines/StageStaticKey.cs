@@ -76,6 +76,7 @@ public static class StageStaticKey
         key.Add(info.SampleMaskExportEnable ? info.RasterizationSamples : 0u);
         key.Add(info.InterpolationSample ?? uint.MaxValue);
         key.Add(Bit(info.EarlyDepth));
+        key.Add(info.EarlyDepth ? info.ShaderSampleExclusionMask : 0u);
         for (var index = 0; index < info.TargetOutputModes.Length; index++)
         {
             key.Add(info.TargetOutputModes[index] | (uint)info.TargetExportFormats[index] << 8);

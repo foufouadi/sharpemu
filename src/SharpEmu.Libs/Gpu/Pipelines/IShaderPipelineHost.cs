@@ -59,6 +59,7 @@ internal interface IShaderPipelineHost
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
+    bool PostDepthCoverageSupported => false;
 
     // True when this device's GLSL UnpackHalf2x16 / PackHalf2x16 were measured bit-exact
     // against the translator's own f16 conversion. False for every host that did not measure it.

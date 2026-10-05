@@ -113,6 +113,8 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.SupportsDualSourceBlend => _supportsDualSourceBlend;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
         bool IShaderPipelineHost.ClipDistanceEnabled => _supportsShaderClipDistance;
+        private bool _postDepthCoverageEnabled;
+        bool IShaderPipelineHost.PostDepthCoverageSupported => _postDepthCoverageEnabled;
 
         bool IShaderPipelineHost.NativeHalfConversionExact => NativeHalfConversionExact;
 
