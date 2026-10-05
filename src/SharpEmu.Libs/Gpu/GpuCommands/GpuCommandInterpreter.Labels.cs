@@ -440,7 +440,9 @@ public sealed partial class GpuCommandInterpreter
                 var result = readyBit | SyntheticOcclusionCounter;
                 for (var depthBlock = 0u; depthBlock < 16u; depthBlock++)
                 {
-                    WriteQword(eventAddress + ((ulong)depthBlock * 2 * sizeof(ulong)), result);
+                    var destination = eventAddress + ((ulong)depthBlock * 2 * sizeof(ulong));
+                    _host.FillBuffer(destination, sizeof(uint), (uint)result, false);
+                    _host.FillBuffer(destination + sizeof(uint), sizeof(uint), (uint)(result >> 32), false);
                 }
 
                 SyntheticOcclusionCounter = (SyntheticOcclusionCounter + 1) & (readyBit - 1);
