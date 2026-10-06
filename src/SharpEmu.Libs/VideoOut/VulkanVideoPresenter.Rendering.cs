@@ -685,6 +685,11 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
             _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
             _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+            if (_supportsDepthBounds)
+            {
+                _vk.CmdSetDepthBounds(command, state.DepthMinBounds, state.DepthMaxBounds);
+            }
+
             if (state.DepthBiasEnabled)
             {
                 _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);

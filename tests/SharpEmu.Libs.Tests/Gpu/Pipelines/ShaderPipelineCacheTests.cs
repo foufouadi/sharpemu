@@ -228,6 +228,17 @@ public sealed class ShaderPipelineCacheTests : IDisposable
         Assert.Equal(new PipelineVertexAttribute(0, 1), state.Attributes[2]);
     }
 
+    // Depth bounds are dynamic state: a game that moves them per draw (light volumes) must not
+    // create a pipeline for every value.
+    [Fact]
+    public void DepthBounds_DoNotSplitTheGraphicsPipeline()
+    {
+        var near = Describe(banks => { banks.Context.DepthBoundsMin = 0.1f; banks.Context.DepthBoundsMax = 0.4f; }, withDepth: true);
+        var far = Describe(banks => { banks.Context.DepthBoundsMin = 0.6f; banks.Context.DepthBoundsMax = 0.9f; }, withDepth: true);
+
+        Assert.Equal(ShaderPipelineCache.KeyOf(near), ShaderPipelineCache.KeyOf(far));
+    }
+
     [Fact]
     public void GraphicsPipelineKey_FoldsAll166StaticBytes()
     {
