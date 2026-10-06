@@ -111,7 +111,8 @@ public static class Videodec2Exports
         return SetReturn(ctx, Ok);
     }
 
-    // An output info with isValid clear tells the player "no buffered pictures remain".
+    // A decoded picture fills the whole output info; without one only the ready flag at
+    // offset 8 is cleared and the caller's size prefix and other fields are preserved.
     [SysAbiExport(
         Nid = "l1hXwscLuCY",
         ExportName = "sceVideodec2Flush",
@@ -121,7 +122,7 @@ public static class Videodec2Exports
     {
         var handle = ctx[CpuRegister.Rdi];
         var outputInfoAddress = ctx[CpuRegister.Rdx];
-        if (outputInfoAddress == 0 || !WriteOutputInfo(ctx, outputInfoAddress, valid: false, 0, 0))
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress + 0x08, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
@@ -169,8 +170,8 @@ public static class Videodec2Exports
         return SetReturn(ctx, Ok);
     }
 
-    // rcx is the SceVideodec2OutputInfo; its isValid flag lives in uninitialized
-    // stack and must always be written explicitly.
+    // rcx is the SceVideodec2OutputInfo: a picture fills it, no picture clears only the
+    // ready flag at offset 8 and preserves the size prefix and the other fields.
     [SysAbiExport(
         Nid = "852F5+q6+iM",
         ExportName = "sceVideodec2Decode",
@@ -183,7 +184,7 @@ public static class Videodec2Exports
         var outputSlotObj = ctx[CpuRegister.Rdx];
         var outputInfoAddress = ctx[CpuRegister.Rcx];
 
-        if (outputInfoAddress == 0 || !WriteOutputInfo(ctx, outputInfoAddress, valid: false, 0, 0))
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress + 0x08, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
@@ -242,6 +243,8 @@ public static class Videodec2Exports
 
         return ctx.Memory.TryWrite(address + 0x08, info);
     }
+
+    private static readonly byte[] NoPicture = [0];
 
     private static int SetReturn(CpuContext ctx, int result)
     {
