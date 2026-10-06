@@ -58,6 +58,7 @@ internal interface IShaderPipelineHost
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;
+    bool ClipDistanceEnabled => false;
 
     RenderHostLimits Limits { get; }
 

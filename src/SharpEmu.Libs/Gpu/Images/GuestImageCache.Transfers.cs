@@ -915,30 +915,19 @@ public sealed unsafe partial class GuestImageCache
 
         var range = image.Description.Data;
         var ring = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
-        GpuBuffer? temporary = null;
-        GpuBuffer download;
-        ulong offset;
-        if (range.Size > ring.Size)
-        {
-            // An image can exceed the fixed utility ring. Its readback owns exact
-            // storage until the completion callback publishes the guest contents.
-            temporary = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, range.Size);
-            download = temporary;
-            offset = 0;
-        }
-        else if (ring.TryMap(range.Size, out offset, Math.Max(image.Description.BytesPerBlock, 4u)))
+        GpuBuffer download = ring;
+        if (ring.TryMap(range.Size, out var offset, Math.Max(image.Description.BytesPerBlock, 4u)))
         {
             ring.Commit();
-            download = ring;
         }
         else
         {
-            throw SubmissionScheduler.Fatal($"The reusable download ring cannot map the image: address=0x{range.Address:X16} size=0x{range.Size:X} ring_size=0x{ring.Size:X}.");
+            download = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, range.Size);
         }
 
         if (!_backing.TryReadBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
         {
-            temporary?.Dispose();
+            if (download != ring) download.Dispose();
             return false;
         }
 
@@ -972,10 +961,11 @@ public sealed unsafe partial class GuestImageCache
             }
             finally
             {
-                temporary?.Dispose();
                 lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
             }
         });
+        // Completion actions wait for the priority readback before freeing spill buffers.
+        if (download != ring) _scheduler.QueueCompletionAction(download.Dispose);
         return true;
     }
 
