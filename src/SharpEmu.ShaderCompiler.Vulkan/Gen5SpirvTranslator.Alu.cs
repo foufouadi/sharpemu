@@ -5092,6 +5092,14 @@ public static partial class Gen5SpirvTranslator
                     selectedLane);
                 StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
             }
+            else if (_subgroupInvocationIdInput != 0)
+            {
+                // A graphics wave is a group of up to 32 host lanes (GuestWaveLane). Read the
+                // selected lane of the invocation's own group, whatever its EXEC state.
+                var groupBase = BitwiseAnd(Load(_uintType, _subgroupInvocationIdInput), UInt(~31u));
+                var read = ShuffleLane(sourceValue, IAdd(groupBase, BitwiseAnd(selectedLane, UInt(31))));
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, read));
+            }
             else
             {
                 // Fallback: no subgroup ops, read current lane's value, or the
