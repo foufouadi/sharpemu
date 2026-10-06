@@ -228,6 +228,10 @@ public static class Videodec2Exports
 
     // SceVideodec2OutputInfo after the caller's thisSize: isValid +0x08, isErrorFrame +0x09,
     // pictureCount +0x0A, codecType +0x0C, frameWidth +0x10, framePitch +0x14, frameHeight +0x18.
+    // frameWidth (+0x10) and frameHeight (+0x18) are 32-bit fields; framePitch (+0x14) lies between them.
+    internal static bool TryWritePictureDimensions(CpuContext ctx, ulong address, uint width, uint height) =>
+        ctx.TryWriteUInt32(address + 0x10, width) && ctx.TryWriteUInt32(address + 0x18, height);
+
     private static bool WriteOutputInfo(CpuContext ctx, ulong address, bool valid, ulong width, ulong height)
     {
         Span<byte> info = stackalloc byte[0x18];
