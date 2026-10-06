@@ -60,6 +60,8 @@ public sealed class Gen5ScalarAbsoluteTests
         registers[15] = 0xC0000123;
         Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Samplers[0].Source, Inputs(registers), out var result));
         Assert.Equal(changesMask ? 0u : registers[15], result.Dwords[3]);
+        // The null descriptor stands in for the loop-carried one, and the plan reports it.
+        Assert.Equal(changesMask ? 1 : 0, plan.Info.NullDescriptorFallbacks.Count);
     }
 
     public static TheoryData<uint, uint, uint> QuadmaskValues => new()

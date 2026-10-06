@@ -414,6 +414,14 @@ internal sealed class ShaderProgramCache
             throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={exception.Message}.");
         }
 
+        if (plan.Info.NullDescriptorFallbacks.Count != 0)
+        {
+            Console.Error.WriteLine(
+                $"[GPU][WARN][NULL_DESCRIPTOR] stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} " +
+                $"accesses={plan.Info.NullDescriptorFallbacks.Count} [{string.Join(", ", plan.Info.NullDescriptorFallbacks.Select(access => $"pc=0x{access.Pc:X} {access.Kind}"))}]: " +
+                "no plan-time descriptor source; these accesses read the null descriptor, so their texels read as zero.");
+        }
+
         var exclusiveOr = false;
         foreach (var instruction in program.Instructions)
         {

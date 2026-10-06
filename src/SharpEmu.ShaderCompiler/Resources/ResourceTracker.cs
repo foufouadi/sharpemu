@@ -515,6 +515,7 @@ public sealed partial class ResourceTracker
                  (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
             if (dynamicImageFallback)
             {
+                _info.NullDescriptorFallbacks.Add((pc, expected == ScalarValueKind.ImageHandle ? $"image {memoryOpcode ?? "access"}" : $"sampler {memoryOpcode ?? "access"}"));
                 source = new DescriptorSource
                 {
                     Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),

@@ -190,6 +190,10 @@ public sealed class ShaderResourceInfo
     // Some sampled access reads its descriptors through the runtime descriptor table.
     public bool UsesRuntimeDescriptors { get; set; }
 
+    // Descriptor accesses with no plan-time source that read the null descriptor instead
+    // (their texels read as zero); the host reports them so the loss is visible.
+    public List<(uint Pc, string Kind)> NullDescriptorFallbacks { get; set; } = [];
+
     public ShaderResourceInfo Clone() => new()
     {
         Buffers = Buffers.Select(buffer => buffer.Clone()).ToList(),
@@ -205,6 +209,7 @@ public sealed class ShaderResourceInfo
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
         UsesRuntimeDescriptors = UsesRuntimeDescriptors,
+        NullDescriptorFallbacks = [.. NullDescriptorFallbacks],
     };
 }
 
