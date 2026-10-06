@@ -8138,6 +8138,38 @@ public static partial class Gen5SpirvTranslator
                 ? value
                 : _module.AddInstruction(SpirvOp.GroupNonUniformShuffle, _uintType, UInt(3), value, lane);
 
+        // Fragment subgroups are allowed to be only partly populated. The missing
+        // lanes still exist on the guest wave, while SPIR-V cannot shuffle from
+        // them. For a graphics guest wave, make that read a duplicate of the
+        // caller's value. This is neutral for the idempotent lane reductions used
+        // by the guest (min/max/and/or), unlike the undefined SPIR-V result or the
+        // old zero substitute. A physically present lane remains readable even if
+        // guest EXEC disabled it; callers decide whether that needs a zero result.
+        private uint ShuffleGuestLaneOrSelf(uint value, uint guestLane, out uint sourcePresent)
+        {
+            if (_stage == Gen5SpirvStage.Compute || _subgroupInvocationIdInput == 0)
+            {
+                sourcePresent = _module.ConstantBool(true);
+                return ShuffleLane(value, guestLane);
+            }
+
+            var sourceLane = BitwiseAnd(guestLane, UInt(31));
+            var presenceMask = OwnHalfBallot(_module.ConstantBool(true));
+            sourcePresent = IsNotZero(BitwiseAnd(
+                presenceMask,
+                ShiftLeftLogical(UInt(1), sourceLane)));
+            var currentLane = Load(_uintType, _subgroupInvocationIdInput);
+            var groupBase = BitwiseAnd(currentLane, UInt(~31u));
+            var sourceHostLane = IAdd(groupBase, sourceLane);
+            var safeSourceLane = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourcePresent,
+                sourceHostLane,
+                currentLane);
+            return ShuffleLane(value, safeSourceLane);
+        }
+
         private uint CurrentLaneBit()
         {
             if (_subgroupInvocationIdInput == 0)
