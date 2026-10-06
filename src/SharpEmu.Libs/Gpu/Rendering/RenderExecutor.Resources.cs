@@ -264,7 +264,7 @@ public sealed partial class RenderExecutor
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
         DropUnwrittenColorTargets(context, ref state, pixelProgram);
-        state.Rendering = AcquireAttachments(ref state);
+        state.Rendering = AcquireAttachments(ref state, context);
         // Attachment uploads can submit work. Finish every allocation merge before any
         // shader descriptor, vertex binding or index binding takes a buffer handle.
         PrepareDrawBufferAllocations(vertexInput, in indexSource, emission.IndirectArgumentsAddress);
@@ -332,6 +332,7 @@ public sealed partial class RenderExecutor
             _host.PrepareMemoryWritingDraw();
         }
 
+        _host.PrepareGraphicsPipeline(in pipeline);
         _host.BeginRendering(in state.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)

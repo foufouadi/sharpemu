@@ -320,7 +320,7 @@ public sealed partial class RenderExecutor
         ((pixelColorExportMasks >> (int)(slot * 4)) & 0xFu) == 0;
 
     // Acquires every attachment through the host and assembles the rendering scope.
-    private RenderingState AcquireAttachments(ref DrawState state)
+    private RenderingState AcquireAttachments(ref DrawState state, ContextRegisters context)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawAttachmentPreparation);
         var rendering = new RenderingState
@@ -397,7 +397,12 @@ public sealed partial class RenderExecutor
             }
             else if (attachmentSamples != target.Samples)
             {
-                throw _host.Fatal($"Mixed color and depth sample counts are not supported: color={attachmentSamples} depth={target.Samples}.");
+                if (_host.NativeTwoSampleMixedSupported && context.AntialiasingConfig.SampleCountLog2 == 1 && attachmentSamples == 1 && target.Samples == 2)
+                {
+                    attachmentSamples = target.Samples;
+                }
+                else
+                    throw _host.Fatal($"Mixed color and depth sample counts are not supported: color={attachmentSamples} depth={target.Samples}.");
             }
 
             var loadState = depth.LoadState;
@@ -406,7 +411,10 @@ public sealed partial class RenderExecutor
                 target.Format,
                 _host.SamplesDepthAttachment(in depth),
                 _host.DepthAttachmentLayout(in depth));
-            _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
+            if (_host.NativeTwoSampleMixedSupported && target.Samples == 2)
+                _host.ConfigureDepthSampleLocations(in depth, context.SampleLocations.Locations, layout, loadState.AttachmentWriteAspects(target.Format));
+            else
+                _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
             var view = target.Request.View;
             rendering.Width = Math.Min(rendering.Width, depth.HostWidth);
             rendering.Height = Math.Min(rendering.Height, depth.HostHeight);

@@ -121,6 +121,9 @@ public interface IRenderHost
     DepthAttachmentAcquisition AcquireDepthAttachment(in DepthAttachmentState depth);
 
     void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects);
+    bool NativeTwoSampleMixedSupported => false;
+    void ConfigureDepthSampleLocations(in DepthAttachmentState depth, ReadOnlySpan<uint> words, ImageLayout layout, ImageAspectFlags writeAspects)
+        => TransitionDepthAttachment(in depth, layout, writeAspects);
 
     BufferBinding NullBuffer { get; }
 
@@ -166,6 +169,7 @@ public interface IRenderHost
     // The next draw stores to buffers or storage images; called before its BeginRendering.
     void PrepareMemoryWritingDraw() { }
 
+    void PrepareGraphicsPipeline(in PipelineHandle pipeline) { }
     void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline);
 
     void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance);
