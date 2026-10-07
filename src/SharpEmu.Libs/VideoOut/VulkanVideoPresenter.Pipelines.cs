@@ -255,10 +255,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 CleanReadVerifications++;
                 if (!_guestMemory.CanRead(address, size) ||
                     _bufferCache.HasGpuDirtyBytes(address, size) ||
-                    (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+                    (clean && _imageCache.HasGpuModifiedImageBytes(address, size)))
                 {
                     return false;
                 }
+
+                // GPU ownership is tracked in bytes, but protection covers whole pages.
+                // Read disjoint CPU-owned bytes through the backing alias so a protected
+                // guest view cannot trigger a download of neighboring GPU-owned bytes.
+                if (clean && _bufferCache.HasGpuDirtyPages(address, size))
+                    return _guestBacking.TryReadBacking(address, destination);
 
                 NoteCleanReadPage(address, size, clean);
             }

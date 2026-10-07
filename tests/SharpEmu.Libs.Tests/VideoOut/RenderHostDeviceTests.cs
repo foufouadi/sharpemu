@@ -1007,6 +1007,17 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
                 Assert.True(renderHost.TryReadCleanGuestBytes(address, arguments));
                 Assert.Equal(0xCAFEF00Du, BitConverter.ToUInt32(arguments));
 
+                // CPU-owned bytes on a page that also holds GPU-owned bytes are read through the
+                // backing alias, without bringing the neighbouring GPU bytes back.
+                _ = harness.Cache.ObtainBuffer(address, 0x1000, isWritten: false);
+                _ = harness.Cache.ObtainBuffer(address + 0x800, 4, isWritten: true);
+                Assert.True(harness.Cache.HasGpuDirtyPages(address, 4));
+                Assert.False(harness.Cache.HasGpuDirtyBytes(address, 4));
+                Span<byte> resident = stackalloc byte[4];
+                Assert.True(host.TryReadResidentGuestBytes(address, resident, clean: true));
+                Assert.Equal(0xCAFEF00Du, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(resident));
+                Assert.True(harness.Cache.HasGpuDirtyBytes(address + 0x800, 4));
+
                 // A clean word read brings GPU-owned bytes back first; byte reads still refuse them.
                 _ = harness.Cache.ObtainBuffer(address, 0x1000, isWritten: true);
                 Assert.False(renderHost.TryReadCleanGuestBytes(address, arguments));
