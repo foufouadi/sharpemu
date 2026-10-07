@@ -414,6 +414,15 @@ internal sealed class ShaderProgramCache
             throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={exception.Message}.");
         }
 
+        // Descriptors read at run time index the persistent heap. Without it the plan cannot be
+        // bound, which is a rejected plan like any other rather than an invalid layout.
+        if (plan.Info.UsesRuntimeDescriptors && !_host.UsesBindlessImages)
+        {
+            const string error = "runtime image descriptors need the persistent bindless heap";
+            if (dumpPlanning) ShaderPlanningDump.WriteFailure(source, error);
+            throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
+        }
+
         if (plan.Info.NullDescriptorFallbacks.Count != 0)
         {
             Console.Error.WriteLine(

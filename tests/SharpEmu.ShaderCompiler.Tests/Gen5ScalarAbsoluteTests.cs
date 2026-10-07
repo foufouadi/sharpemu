@@ -84,6 +84,27 @@ public sealed class Gen5ScalarAbsoluteTests
         Assert.Contains(plan.Memory.Entries, entry => entry.RuntimeDescriptor);
     }
 
+    // Like the sampler case above, an image descriptor carried around the loop has no
+    // plan-time source. ImageLoad must use the runtime descriptor table rather than make
+    // the old null-descriptor fallback (which reads zero texels).
+    [Fact]
+    public void LoopCarriedImageLoadIsReadAtRuntime()
+    {
+        var load = Image(28, "ImageLoad", 8, vectorAddress: 0, dmask: 1);
+        var program = Program(
+            Decode(0x7D840A81), Decode(0xBEEA2D6A) with { Pc = 4 },
+            Decode(0x8F388C6A) with { Pc = 8 }, MoveScalar(12, 24, 0),
+            Decode(0xBE8B030F) with { Pc = 20 }, Decode(0x880B380B) with { Pc = 24 }, load,
+            Sop2(36, "SAddI32", 56, Gen5Operand.Scalar(56), Operand(1)), Sopc(40, "SCmpLgU32", Gen5Operand.Scalar(24), Operand(4)),
+            Branch(44, "SCbranchScc1", -7), EndProgram(48));
+
+        var plan = Extract(program, userDataCount: 16);
+
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        Assert.Contains(plan.Memory.Entries, entry => entry.Pc == 28 && entry.RuntimeDescriptor);
+    }
+
     public static TheoryData<uint, uint, uint> QuadmaskValues => new()
     {
         { 0, 0, 0 }, { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF },

@@ -20,7 +20,7 @@ namespace SharpEmu.Libs.Tests.Gpu.Vulkan;
 
 // Images and samplers bound through the class arrays of a compile request: element
 // selection, the duplicated point sampler, and the per-mip storage descriptors.
-public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestOutputHelper output) : IClassFixture<HeadlessVulkanFixture>
+public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestOutputHelper? output) : IClassFixture<HeadlessVulkanFixture>
 {
     private const uint Format32Uint = 20;
     private const uint Format32Sint = 21;
@@ -91,6 +91,17 @@ public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestO
         instructions.Add(EndProgram(pc));
         return Program([.. instructions]);
     }
+
+    // The descriptor's first dword comes from a lane. It is zero for this one-lane dispatch and
+    // is valid at execution, but has no plan-time scalar source for the resource tracker.
+    // With inactiveLane the load runs with EXEC cleared, as a lane whose result is unused.
+    private static Gen5ShaderProgram RuntimeImageLoadProgram(bool inactiveLane = false) => Program(
+        ReadFirstLane(0, FirstImageRegister, 1),
+        MoveVector(8, 0, 0),
+        MoveScalar(12, inactiveLane ? 126u : 100u, 0),
+        Image(16, "ImageLoad", FirstImageRegister, vectorAddress: 0, dmask: 1),
+        BufferAccess(24, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 4),
+        EndProgram(32));
 
     private static ImageDescription Describe(ulong guestOffset, Format format, GuestPixelFormat guestFormat, uint width, uint height, uint levels)
     {
@@ -255,6 +266,139 @@ public sealed class LayoutImageShaderTests(HeadlessVulkanFixture fixture, ITestO
         Assert.Equal(BitConverter.SingleToUInt32Bits(0.75f), run.ResultWord(1));
         run.Harness.AssertNoValidationMessages();
         output.WriteLine($"Verified sampled class arrays on {vulkan.DeviceName}; validation={vulkan.ValidationEnabled}.");
+    }
+
+    [Fact]
+    public void RuntimeImageLoad_UsesTheRegisteredUnsignedHeapViewAfterItsMiss()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan) || !vulkan!.SupportsRuntimeDescriptorArrays)
+        {
+            return;
+        }
+
+        uint[] words = [0, Format32Uint << 20, 3 | (3 << 14), 0xFAC | (ImageType2D << 28), 0, 0, 0, 0];
+        var program = RuntimeImageLoadProgram();
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, 0x5255_4E54_494D_47, 0, 64);
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info,
+            BindingLayout.CollectUserDataRegisters(program, 0, 64), false,
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false,
+            usesBindlessImages: true);
+        var request = new ShaderCompileRequest(plan, resources, layout) { ThreadCountX = 1, ThreadCountY = 1, ThreadCountZ = 1 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        using var harness = new ImageTestHarness(vulkan);
+        using var heap = new RuntimeDescriptorImageHeap(harness);
+        var zero = harness.CreateImage(Describe(0, Format.R32Uint, GuestPixelFormat.Bits32UInt, 1, 1, 1));
+        var value = harness.CreateImage(Describe(0x10000, Format.R32Uint, GuestPixelFormat.Bits32UInt, 1, 1, 1));
+        harness.UploadImage(zero, MemoryMarshal.AsBytes<uint>([0u]), ImageTestHarness.WholeImageCopies(zero.Description, 0));
+        harness.UploadImage(value, MemoryMarshal.AsBytes<uint>([0xCAFE_BABEu]), ImageTestHarness.WholeImageCopies(value.Description, 0));
+        var zeroView = SampledView(zero).ImageView;
+        var valueView = SampledView(value).ImageView;
+        heap.Write(0, zeroView);
+        heap.Write(1, valueView);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv, heap.Layout);
+        var result = runner.CreateBuffer(ResultBytes);
+        var registers = new uint[256];
+        words[1..].CopyTo(registers, (int)FirstImageRegister + 1);
+        registers[ResultRegister + 2] = ResultBytes;
+        var key = new uint[1 + words.Length];
+        key[0] = RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint);
+        words.CopyTo(key, 1);
+
+        var firstMisses = runner.CreateBuffer((ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint));
+        harness.Run(() =>
+        {
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            zero.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            value.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            runner.Dispatch(registers, new Dictionary<DescriptorBindingKind, GpuBuffer[]>
+            {
+                [DescriptorBindingKind.Buffers] = [result],
+                [DescriptorBindingKind.RuntimeDescriptorTable] = [runner.CreateBuffer(MemoryMarshal.AsBytes<uint>(RuntimeDescriptorTable.Build([], [])))],
+                [DescriptorBindingKind.RuntimeDescriptorMisses] = [firstMisses],
+            }, 1, globalSet: heap.Set);
+        });
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, 4)));
+        var firstMissWords = MemoryMarshal.Cast<byte, uint>(runner.ReadBack(firstMisses, 0, (ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint)));
+        Assert.Equal(1u, firstMissWords[(int)RuntimeDescriptorTable.ImageMissCountDword]);
+        Assert.Equal(key, firstMissWords.Slice((int)RuntimeDescriptorTable.ImageMissOffset, key.Length).ToArray());
+
+        // The miss is what causes the host to insert the already-created typed R32_UINT view
+        // for the next dispatch. Slot zero remains the null texture for the first dispatch.
+        harness.Finish();
+        var secondMisses = runner.CreateBuffer((ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint));
+        harness.Run(() =>
+        {
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            zero.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            value.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            runner.Dispatch(registers, new Dictionary<DescriptorBindingKind, GpuBuffer[]>
+            {
+                [DescriptorBindingKind.Buffers] = [result],
+                [DescriptorBindingKind.RuntimeDescriptorTable] = [runner.CreateBuffer(MemoryMarshal.AsBytes<uint>(RuntimeDescriptorTable.Build([(key, 1)], [])))],
+                [DescriptorBindingKind.RuntimeDescriptorMisses] = [secondMisses],
+            }, 1, globalSet: heap.Set);
+        });
+
+        var secondMissWords = MemoryMarshal.Cast<byte, uint>(runner.ReadBack(secondMisses, 0, (ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint)));
+        Assert.Equal(0u, secondMissWords[(int)RuntimeDescriptorTable.ImageMissCountDword]);
+        Assert.Equal(0xCAFE_BABEu, BinaryPrimitives.ReadUInt32LittleEndian(runner.ReadBack(result, 0, 4)));
+        harness.AssertNoValidationMessages();
+        output?.WriteLine($"Verified runtime R32_UINT ImageLoad after descriptor registration on {vulkan.DeviceName}.");
+    }
+
+    // A lane EXEC disables does not access its image, so its descriptor is not a miss.
+    [Fact]
+    public void RuntimeImageLoad_InactiveLaneRecordsNoMiss()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan) || !vulkan!.SupportsRuntimeDescriptorArrays)
+        {
+            return;
+        }
+
+        uint[] words = [0, Format32Uint << 20, 3 | (3 << 14), 0xFAC | (ImageType2D << 28), 0, 0, 0, 0];
+        var program = RuntimeImageLoadProgram(inactiveLane: true);
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, 0x5255_4E54_494D_48, 0, 64);
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info,
+            BindingLayout.CollectUserDataRegisters(program, 0, 64), false,
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false,
+            usesBindlessImages: true);
+        var request = new ShaderCompileRequest(plan, resources, layout) { ThreadCountX = 1, ThreadCountY = 1, ThreadCountZ = 1 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+
+        using var harness = new ImageTestHarness(vulkan);
+        using var heap = new RuntimeDescriptorImageHeap(harness);
+        var zero = harness.CreateImage(Describe(0, Format.R32Uint, GuestPixelFormat.Bits32UInt, 1, 1, 1));
+        harness.UploadImage(zero, MemoryMarshal.AsBytes<uint>([0u]), ImageTestHarness.WholeImageCopies(zero.Description, 0));
+        heap.Write(0, SampledView(zero).ImageView);
+        heap.Write(1, SampledView(zero).ImageView);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv, heap.Layout);
+        var registers = new uint[256];
+        words[1..].CopyTo(registers, (int)FirstImageRegister + 1);
+        registers[ResultRegister + 2] = ResultBytes;
+        var misses = runner.CreateBuffer((ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint));
+        harness.Run(() =>
+        {
+            var command = new CommandBuffer(harness.Scheduler.Current.Handle);
+            zero.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
+            runner.Dispatch(registers, new Dictionary<DescriptorBindingKind, GpuBuffer[]>
+            {
+                [DescriptorBindingKind.Buffers] = [runner.CreateBuffer(ResultBytes)],
+                [DescriptorBindingKind.RuntimeDescriptorTable] = [runner.CreateBuffer(MemoryMarshal.AsBytes<uint>(RuntimeDescriptorTable.Build([], [])))],
+                [DescriptorBindingKind.RuntimeDescriptorMisses] = [misses],
+            }, 1, globalSet: heap.Set);
+        });
+
+        var missWords = MemoryMarshal.Cast<byte, uint>(runner.ReadBack(misses, 0, (ulong)RuntimeDescriptorTable.MissBufferDwords * sizeof(uint)));
+        Assert.Equal(0u, missWords[(int)RuntimeDescriptorTable.ImageMissCountDword]);
+        harness.AssertNoValidationMessages();
     }
 
     [Fact]

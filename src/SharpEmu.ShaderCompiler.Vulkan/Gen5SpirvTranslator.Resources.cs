@@ -101,7 +101,10 @@ public static partial class Gen5SpirvTranslator
         private uint _runtimeDescriptorMisses;
         private uint _runtimeSamplerArray;
         private uint _runtimeSamplerPointer;
-        private readonly Dictionary<ImageDimension, (uint Variable, uint ImageType, uint ElementPointer, SpirvImageDim Dimension, bool Arrayed)> _runtimeImageArrays = [];
+        private readonly Dictionary<(ImageDimension Dimension, ImageNumericClass NumericClass),
+            (uint Variable, uint ImageType, uint ElementPointer, uint ComponentType, uint VectorType,
+                ImageComponentKind Kind, SpirvImageDim Dimension, bool Arrayed)> _runtimeImageArrays = [];
+        private uint _runtimeImageNumericClassTable;
         private uint _globalDataShare;
         private uint _samplerArray;
         private uint _samplerType;
@@ -510,10 +513,11 @@ public static partial class Gen5SpirvTranslator
 
         // ---- runtime descriptors ----
 
-        // A sampled access whose descriptors have no plan-time source: the image and sampler
-        // words in its registers are looked up in the host's table (RuntimeDescriptorTable),
-        // and the access samples the persistent heap through the slots found. A missing
-        // descriptor samples slot 0 (null) and is recorded for the host.
+        // An access whose image descriptor has no plan-time source looks its words up in the
+        // host's table (RuntimeDescriptorTable). Sampling accesses retain the historical float
+        // view key. Image loads derive their numeric view from the descriptor format, then fetch
+        // through the matching bindless image array. A missing descriptor reads slot 0 and is
+        // recorded for the host.
         private bool TryEmitRuntimeDescriptorImage(Gen5ShaderInstruction instruction, Gen5ImageControl image, MemoryAccessInfo entry, out string error)
         {
             if (_runtimeDescriptorTable == 0 || _runtimeDescriptorMisses == 0)
@@ -522,21 +526,48 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var view = RuntimeImageArray(entry.ImageDimension);
             var imageKey = new uint[1 + RuntimeDescriptorTable.ImageWordCount];
-            imageKey[0] = UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension));
             for (uint word = 0; word < RuntimeDescriptorTable.ImageWordCount; word++)
             {
                 // A 128-bit descriptor has four words; the rest of the key is zero.
                 imageKey[1 + word] = entry.ImageR128 && word >= 4 ? UInt(0) : LoadS(image.ScalarResource + word);
             }
 
+            if (!entry.NeedsSampler)
+            {
+                // The PS5 descriptor controls the numeric interpretation of an image load.
+                // Keep its format-driven class in the key so an R32_UINT and an R32_SINT view
+                // of the same image cannot alias each other in the table.
+                var numericClass = RuntimeImageNumericClass(imageKey[2]);
+                imageKey[0] = BitwiseOr(
+                    UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension)),
+                    ShiftLeftLogical(numericClass, UInt(RuntimeDescriptorTable.ViewClassNumericShift)));
+                var runtimeImageSlot = LookupRuntimeDescriptor(imageKey, image: true);
+                _module.AddCapability(SpirvCapability.ShaderNonUniform);
+                _module.AddCapability(SpirvCapability.SampledImageArrayNonUniformIndexing);
+                _module.AddDecoration(runtimeImageSlot, SpirvDecoration.NonUniform);
+
+                string? branchError = null;
+                // A descriptor array element has one numeric view. Fetch only from the array
+                // matching that view rather than issuing invalid loads through the other typed
+                // declarations. Unknown formats use float and remain absent from the host table.
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(0)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Float));
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(1)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Uint));
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(2)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Sint));
+                error = branchError ?? string.Empty;
+                return branchError is null;
+            }
+
+            var view = RuntimeImageArray(entry.ImageDimension, ImageNumericClass.Float);
+            imageKey[0] = UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension));
             var samplerKey = new uint[RuntimeDescriptorTable.SamplerWordCount];
             for (uint word = 0; word < samplerKey.Length; word++)
             {
                 samplerKey[word] = LoadS(image.ScalarSampler + word);
             }
-
             var imageSlot = LookupRuntimeDescriptor(imageKey, image: true);
             var samplerSlot = LookupRuntimeDescriptor(samplerKey, image: false);
 
@@ -559,9 +590,9 @@ public static partial class Gen5SpirvTranslator
                 imagePointer,
                 view.ImageType,
                 objectType,
-                _floatType,
-                _module.TypeVector(_floatType, 4),
-                ImageComponentKind.Float,
+                view.ComponentType,
+                view.VectorType,
+                view.Kind,
                 IsStorage: false,
                 view.Arrayed,
                 Dimension: view.Dimension,
@@ -569,10 +600,39 @@ public static partial class Gen5SpirvTranslator
             return EmitImageOperation(instruction, image, resource, imageObject, DescriptorConstants.IdentityImageSwizzle, UInt(0), out error);
         }
 
-        // The heap's sampled float images of one view class, declared once per module.
-        private (uint Variable, uint ImageType, uint ElementPointer, SpirvImageDim Dimension, bool Arrayed) RuntimeImageArray(ImageDimension dimension)
+        private string? EmitRuntimeDescriptorFetch(Gen5ShaderInstruction instruction, Gen5ImageControl image,
+            MemoryAccessInfo entry, uint imageSlot, ImageNumericClass numericClass)
         {
-            if (_runtimeImageArrays.TryGetValue(dimension, out var declared))
+            var view = RuntimeImageArray(entry.ImageDimension, numericClass);
+            var imagePointer = _module.AddInstruction(SpirvOp.AccessChain, view.ElementPointer, view.Variable, imageSlot);
+            var imageValue = Load(view.ImageType, imagePointer);
+            _module.AddDecoration(imagePointer, SpirvDecoration.NonUniform);
+            _module.AddDecoration(imageValue, SpirvDecoration.NonUniform);
+            var resource = new SpirvImageResource(
+                imagePointer,
+                view.ImageType,
+                view.ImageType,
+                view.ComponentType,
+                view.VectorType,
+                view.Kind,
+                IsStorage: false,
+                view.Arrayed,
+                Dimension: view.Dimension,
+                ShaderSwizzle: DescriptorConstants.IdentityImageSwizzle);
+            var mipLevel = instruction.Opcode == "ImageLoadMip"
+                ? LoadImageIntegerAddress(image, (int)ImageCoordinateComponentCount(resource))
+                : UInt(0);
+            return EmitImageOperation(instruction, image, resource, imageValue,
+                DescriptorConstants.IdentityImageSwizzle, mipLevel, out var error) ? null : error;
+        }
+
+        // The heap's sampled images of one dimension and numeric view, declared once per module.
+        private (uint Variable, uint ImageType, uint ElementPointer, uint ComponentType, uint VectorType,
+            ImageComponentKind Kind, SpirvImageDim Dimension, bool Arrayed) RuntimeImageArray(
+                ImageDimension dimension, ImageNumericClass numericClass)
+        {
+            var key = (dimension, numericClass);
+            if (_runtimeImageArrays.TryGetValue(key, out var declared))
             {
                 return declared;
             }
@@ -589,18 +649,59 @@ public static partial class Gen5SpirvTranslator
             }
 
             var arrayed = dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray;
-            var imageType = _module.TypeImage(_floatType, spirvDimension, depth: false, arrayed, multisampled: false, sampled: 1u, SpirvImageFormat.Unknown);
+            var kind = numericClass switch
+            {
+                ImageNumericClass.Uint => ImageComponentKind.Uint,
+                ImageNumericClass.Sint => ImageComponentKind.Sint,
+                _ => ImageComponentKind.Float,
+            };
+            var componentType = kind switch
+            {
+                ImageComponentKind.Uint => _uintType,
+                ImageComponentKind.Sint => _intType,
+                _ => _floatType,
+            };
+            var vectorType = _module.TypeVector(componentType, 4);
+            var imageType = _module.TypeImage(componentType, spirvDimension, depth: false, arrayed, multisampled: false, sampled: 1u, SpirvImageFormat.Unknown);
             _module.AddCapability(SpirvCapability.RuntimeDescriptorArray);
             var arrayType = _module.TypeRuntimeArray(imageType);
             var elementPointer = _module.TypePointer(SpirvStorageClass.UniformConstant, imageType);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.UniformConstant, arrayType), SpirvStorageClass.UniformConstant);
-            _module.AddName(variable, $"runtimeImages{dimension}");
+            _module.AddName(variable, $"runtimeImages{dimension}{numericClass}");
             _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(variable, SpirvDecoration.Binding, BindingLayout.BindlessSampledImageBinding);
             _interfaces.Add(variable);
-            declared = (variable, imageType, elementPointer, spirvDimension, arrayed);
-            _runtimeImageArrays.Add(dimension, declared);
+            declared = (variable, imageType, elementPointer, componentType, vectorType, kind, spirvDimension, arrayed);
+            _runtimeImageArrays.Add(key, declared);
             return declared;
+        }
+
+        // Runtime descriptors are intentionally not specialized to the format observed while a
+        // pipeline is compiled. Use the same format classification as the host's descriptor
+        // materializer, represented compactly as float=0, uint=1 and sint=2.
+        private uint RuntimeImageNumericClass(uint descriptorWord1)
+        {
+            if (_runtimeImageNumericClassTable == 0)
+            {
+                var entries = new uint[GuestImageFormat.MaxFormat + 1];
+                for (uint tableFormat = 0; tableFormat < entries.Length; tableFormat++)
+                {
+                    entries[tableFormat] = RuntimeDescriptorTable.NumericClassCode(GuestImageFormat.SampledNumericClass(tableFormat));
+                }
+
+                var type = _module.TypeArray(_uintType, (uint)entries.Length);
+                _runtimeImageNumericClassTable = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, type), SpirvStorageClass.Private,
+                    _module.ConstantComposite(type, entries.Select(UInt).ToArray()));
+                _module.AddName(_runtimeImageNumericClassTable, "runtimeImageNumericClasses");
+                _interfaces.Add(_runtimeImageNumericClassTable);
+            }
+
+            var descriptorFormat = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(20)), UInt(0x1ff));
+            var inRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, descriptorFormat, UInt(GuestImageFormat.MaxFormat + 1));
+            var safeFormat = _module.AddInstruction(SpirvOp.Select, _uintType, inRange, descriptorFormat, UInt(0));
+            return Load(_uintType, _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer,
+                _runtimeImageNumericClassTable, safeFormat));
         }
 
         private uint RuntimeSamplerArray()
@@ -657,7 +758,9 @@ public static partial class Gen5SpirvTranslator
             }
 
             var missing = _module.AddInstruction(SpirvOp.IEqual, _boolType, slotPlusOne, UInt(0));
-            EmitConditional(missing, () => RecordRuntimeDescriptorMiss(key, image));
+            // Only an active lane reads its descriptor; an inactive one may hold anything.
+            EmitConditional(_module.AddInstruction(SpirvOp.LogicalAnd, _boolType, missing, Load(_boolType, _exec)),
+                () => RecordRuntimeDescriptorMiss(key, image));
             return _module.AddInstruction(SpirvOp.Select, _uintType, missing, UInt(0),
                 _module.AddInstruction(SpirvOp.ISub, _uintType, slotPlusOne, UInt(1)));
         }

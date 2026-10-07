@@ -91,6 +91,10 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
 
     public bool ShaderInt64 { get; }
 
+    // The runtime-descriptor GPU tests need an unbounded, dynamically indexed sampled-image
+    // array. Keep it opt-in: hosts without the descriptor-indexing feature simply skip them.
+    public bool SupportsRuntimeDescriptorArrays { get; private init; }
+
     // Created with shaderFloat16 and f16 float controls (VulkanFloat16Support).
     public bool ExactFloat16Conversions { get; private init; }
 
@@ -335,10 +339,21 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SType = StructureType.PhysicalDeviceTimelineSemaphoreFeatures,
             PNext = &addressFeatures,
         };
-        var features = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &timelineFeatures };
+        var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+        {
+            SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+            PNext = &timelineFeatures,
+        };
+        var features = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &descriptorIndexingFeatures };
         vk.GetPhysicalDeviceFeatures2(physical, &features);
         var dynamicRendering = vulkan13Features.DynamicRendering && vulkan13Features.Synchronization2 &&
             HasDeviceExtensions(vk, physical, RenderingExtensionNames);
+        var runtimeDescriptorArrays = descriptorIndexingFeatures.ShaderSampledImageArrayNonUniformIndexing &&
+            descriptorIndexingFeatures.RuntimeDescriptorArray &&
+            descriptorIndexingFeatures.DescriptorBindingPartiallyBound &&
+            descriptorIndexingFeatures.DescriptorBindingSampledImageUpdateAfterBind &&
+            descriptorIndexingFeatures.DescriptorBindingUpdateUnusedWhilePending &&
+            descriptorIndexingFeatures.DescriptorBindingVariableDescriptorCount;
         if (family == uint.MaxValue || !timelineFeatures.TimelineSemaphore || !addressFeatures.BufferDeviceAddress ||
             !vulkan13Features.Synchronization2)
         {
@@ -380,6 +395,17 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             PNext = &vulkan13Features,
         };
         timelineFeatures.PNext = &addressFeatures;
+        descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+        {
+            SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+            ShaderSampledImageArrayNonUniformIndexing = runtimeDescriptorArrays,
+            RuntimeDescriptorArray = runtimeDescriptorArrays,
+            DescriptorBindingPartiallyBound = runtimeDescriptorArrays,
+            DescriptorBindingSampledImageUpdateAfterBind = runtimeDescriptorArrays,
+            DescriptorBindingUpdateUnusedWhilePending = runtimeDescriptorArrays,
+            DescriptorBindingVariableDescriptorCount = runtimeDescriptorArrays,
+            PNext = &timelineFeatures,
+        };
         if (barycentric)
         {
             barycentricFeatures.PNext = vulkan13Features.PNext;
@@ -408,7 +434,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var deviceInfo = new DeviceCreateInfo
         {
             SType = StructureType.DeviceCreateInfo,
-            PNext = &timelineFeatures,
+            PNext = &descriptorIndexingFeatures,
             QueueCreateInfoCount = 1,
             PQueueCreateInfos = &queueInfo,
             PEnabledFeatures = &enabledFeatures,
@@ -433,6 +459,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsFragmentShaderBarycentric = barycentric,
             SupportsFillRectangle = fillRectangle,
             ExactFloat16Conversions = exactFloat16,
+            SupportsRuntimeDescriptorArrays = runtimeDescriptorArrays,
         };
         if (validation)
         {

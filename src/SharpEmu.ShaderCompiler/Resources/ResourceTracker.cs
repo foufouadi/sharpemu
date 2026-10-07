@@ -1154,12 +1154,14 @@ public sealed partial class ResourceTracker
         AddMemoryPatch(index, image, sampler, memory.NeedsSampler, memory.Pc);
     }
 
-    // A plain sampled access of a float view the host can create from the words alone.
-    // Depth compares, the adjusted (LOD-biased) sampler forms and cube views keep their
-    // planned path.
+    // A plain sampled access or an image load that the host can create from descriptor words
+    // alone. Depth compares, adjusted (LOD-biased) sampler forms, cube views, storage writes
+    // and atomics keep their planned path.
     private bool CanReadDescriptorsAtRuntime(MemoryAccessInfo memory, MemoryAccessBinding access) =>
-        memory.ImageClass == ImageResourceClass.Sampled && memory.NeedsSampler && access.SamplerHandle is not null &&
-        (memory.ImageSampleFlags & (ImageSampleFlags.Compare | ImageSampleFlags.Adjust)) == 0 &&
+        memory.ImageClass == ImageResourceClass.Sampled &&
+        ((memory.NeedsSampler && access.SamplerHandle is not null &&
+            (memory.ImageSampleFlags & (ImageSampleFlags.Compare | ImageSampleFlags.Adjust)) == 0) ||
+            (!memory.NeedsSampler && memory.Opcode is "ImageLoad" or "ImageLoadMip")) &&
         RuntimeDescriptorTable.SupportsRuntimeView(memory.ImageDimension) &&
         _graph.Program.Instructions.FirstOrDefault(instruction => instruction.Pc == memory.Pc)?.Control is Gen5ImageControl { Dimension: not CubeDimension };
 

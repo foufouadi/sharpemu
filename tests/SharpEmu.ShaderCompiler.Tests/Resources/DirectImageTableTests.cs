@@ -208,11 +208,16 @@ public sealed class DirectImageTableTests
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
     }
 
+    // Without the restored EXEC the loop is no waterfall: no wave-indexed table is planned,
+    // and the load reads the descriptor its registers hold at run time.
     [Fact]
     public void ReadLaneWithoutRestoredExecutionIsNotWaveIndexed()
     {
-        Assert.Throws<ResourcePlanException>(() =>
-            ShaderResourcePlan.Extract(CreateWaveIndexedReadLaneProgram(selfAddressed: true, restoreExec: false), ShaderStage.Compute, Hash, 0, 2));
+        var plan = ShaderResourcePlan.Extract(CreateWaveIndexedReadLaneProgram(selfAddressed: true, restoreExec: false), ShaderStage.Compute, Hash, 0, 2);
+
+        Assert.Empty(plan.IndirectImages);
+        Assert.Contains(plan.Memory.Entries, entry => entry.RuntimeDescriptor);
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
     }
 
     private static bool ReadWaveIndexedMemory(ulong address, out uint word)
@@ -358,10 +363,15 @@ public sealed class DirectImageTableTests
         }
     }
 
+    // An unbounded index still plans no direct table; the load reads its descriptor at run time.
     [Fact]
-    public void UnboundedDirectTableIsStillRejected()
+    public void UnboundedDirectTableIsReadAtRuntime()
     {
-        Assert.Throws<ResourcePlanException>(() => ShaderResourcePlan.Extract(CreateProgram(bitScan: false), ShaderStage.Compute, Hash, 0, 2));
+        var plan = ShaderResourcePlan.Extract(CreateProgram(bitScan: false), ShaderStage.Compute, Hash, 0, 2);
+
+        Assert.Empty(plan.IndirectImages);
+        Assert.Contains(plan.Memory.Entries, entry => entry.RuntimeDescriptor);
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
     }
 
     [Theory]
