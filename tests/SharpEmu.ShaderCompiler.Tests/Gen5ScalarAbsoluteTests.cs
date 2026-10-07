@@ -64,6 +64,26 @@ public sealed class Gen5ScalarAbsoluteTests
         Assert.Equal(changesMask ? 1 : 0, plan.Info.NullDescriptorFallbacks.Count);
     }
 
+    // A plain sampled float access whose sampler is loop-carried reads its descriptors at run
+    // time, as the hardware does, instead of reading the null descriptor.
+    [Fact]
+    public void LoopCarriedSamplerOfAPlainSampleIsReadAtRuntime()
+    {
+        var sample = Image(28, "ImageSample", 0, 8);
+        var program = Program(
+            Decode(0x7D840A81), Decode(0xBEEA2D6A) with { Pc = 4 },
+            Decode(0x8F388C6A) with { Pc = 8 }, MoveScalar(12, 24, 0),
+            Decode(0xBE8B030F) with { Pc = 20 }, Decode(0x880B380B) with { Pc = 24 }, sample,
+            Sop2(36, "SAddI32", 56, Gen5Operand.Scalar(56), Operand(1)), Sopc(40, "SCmpLgU32", Gen5Operand.Scalar(24), Operand(4)),
+            Branch(44, "SCbranchScc1", -7), EndProgram(48));
+
+        var plan = Extract(program, userDataCount: 16);
+
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        Assert.Contains(plan.Memory.Entries, entry => entry.RuntimeDescriptor);
+    }
+
     public static TheoryData<uint, uint, uint> QuadmaskValues => new()
     {
         { 0, 0, 0 }, { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF },

@@ -480,7 +480,8 @@ public sealed partial class ResourceTracker
         bool sampler = false,
         bool sampleAdjust = false,
         string? memoryOpcode = null,
-        MemoryAccess memoryAccess = MemoryAccess.Read)
+        MemoryAccess memoryAccess = MemoryAccess.Read,
+        bool allowNullFallback = true)
     {
         if (handle is null || handle.Kind != expected)
         {
@@ -510,7 +511,7 @@ public sealed partial class ResourceTracker
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
             // descriptor). Buffer/sampler-adjacent handles or any other validation failure
             // still hard-fail, since those aren't safe to silently zero.
-            var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
+            var dynamicImageFallback = allowNullFallback && expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
                 (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
                  (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
             if (dynamicImageFallback)
@@ -1101,12 +1102,15 @@ public sealed partial class ResourceTracker
 
         uint imageSource;
         uint samplerSource = 0;
+        // The hardware reads both descriptors from memory when the access runs. An access the
+        // runtime descriptor table can serve does the same instead of reading the null descriptor.
+        var runtimeReadable = CanReadDescriptorsAtRuntime(memory, access);
         try
         {
             var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
             imageSource = indirect is not null
                 ? indirect.Source
-                : GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc);
+                : GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc, allowNullFallback: !runtimeReadable);
             if (memory.NeedsSampler)
             {
                 if (access.SamplerHandle is null)
@@ -1117,10 +1121,11 @@ public sealed partial class ResourceTracker
                 var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
                 samplerSource = !sampleAdjust && TryMakePointerTableSampler(access.SamplerHandle, memory.Pc, out var pointerSampler)
                     ? pointerSampler
-                    : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
+                    : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust,
+                        allowNullFallback: !runtimeReadable);
             }
         }
-        catch (ResourcePlanException) when (CanReadDescriptorsAtRuntime(memory, access))
+        catch (ResourcePlanException) when (runtimeReadable)
         {
             // No plan-time source: the shader reads both descriptors from its registers.
             memory.RuntimeDescriptor = true;
