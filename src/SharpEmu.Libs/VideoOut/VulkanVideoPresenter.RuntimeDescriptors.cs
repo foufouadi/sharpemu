@@ -157,7 +157,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 var key = RuntimeDescriptorKey.From(miss.Key);
                 if (miss.Image)
                 {
-                    if (!descriptors.Images.ContainsKey(key) && RuntimeDescriptorTable.SupportsRuntimeView((ImageDimension)miss.Key[0]))
+                    // A descriptor that describes no host texture (a null base or an invalid format)
+                    // stays out of the table, so the shader keeps reading the null descriptor for
+                    // it, as the hardware does.
+                    if (!descriptors.Images.ContainsKey(key) && RuntimeDescriptorTable.SupportsRuntimeView((ImageDimension)miss.Key[0]) &&
+                        ImageRequestBuilders.DescribesHostTexture(miss.Key.AsSpan(1)))
                     {
                         descriptors.Images.Add(key, new RuntimeImageEntry(miss.Key));
                         descriptors.TableDirty = true;

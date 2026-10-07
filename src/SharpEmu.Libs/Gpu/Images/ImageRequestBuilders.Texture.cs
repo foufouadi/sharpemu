@@ -179,6 +179,20 @@ public static partial class ImageRequestBuilders
     [ThreadStatic]
     private static Dictionary<TextureKey, TextureRequestResolution>? _textureCache;
 
+    // Whether the T# describes a texture the host can create: a non-null base and a format with
+    // a host equivalent. The hardware reads any other descriptor as the null texture.
+    public static bool DescribesHostTexture(ReadOnlySpan<uint> words)
+    {
+        if (words.Length < 4)
+        {
+            return false;
+        }
+
+        var descriptor = new TextureDescriptorWords(words);
+        return !descriptor.IsNull &&
+            GuestPixelFormats.HostFormat(GuestPixelFormats.RemapTextureFormat(descriptor.Format)) != Format.Undefined;
+    }
+
     // Builds the request for a sampled or storage texture; the words are the eight T# dwords.
     public static TextureRequestResolution Texture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
     {
