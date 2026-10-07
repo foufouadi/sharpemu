@@ -1325,12 +1325,28 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (resourceCount < 2 || exemplar == DescriptorConstants.NoIndex)
+            if (resourceCount < 2)
             {
-                return Fail("indirect image specialization has no typed candidate");
+                return Fail("indirect image specialization has fewer than two candidates");
             }
 
-            var imageClass = images[(int)exemplar];
+            var declaredImage = info.Images[rootIndex];
+            // A bounded table can contain only descriptors from another image family. Keep
+            // the instruction's declared type and bind every candidate as a typed null.
+            var imageClass = exemplar == DescriptorConstants.NoIndex
+                ? images[rootIndex] with
+                {
+                    NumericClass = declaredImage.NumericClass == ImageNumericClass.Unsupported
+                        ? declaredImage.Atomic ? ImageNumericClass.Uint : ImageNumericClass.Float
+                        : declaredImage.NumericClass,
+                    Dimension = declaredDimension,
+                    MipCount = declaredImage.MipCount,
+                    ConversionFormat = declaredImage.ConversionFormat,
+                    ShaderSwizzle = declaredImage.ShaderSwizzle,
+                    Cube = declaredCube,
+                    EmulatedCompareFunction = declaredImage.EmulatedCompareFunction,
+                }
+                : images[(int)exemplar];
             var separateSampledDimensions = info.Images[rootIndex].ResourceClass == ImageResourceClass.Sampled;
             for (var candidate = 0; candidate < images.Count; candidate++)
             {

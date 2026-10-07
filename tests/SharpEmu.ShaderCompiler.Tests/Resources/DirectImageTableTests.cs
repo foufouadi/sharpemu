@@ -184,6 +184,29 @@ public sealed class DirectImageTableTests
         Assert.Single(snapshot.Images, image => image.All(word => word == 0));
     }
 
+    [Fact]
+    public void IndirectTableWithOnlyIncompatibleDimensionsBindsTypedNullCandidates()
+    {
+        var program = CreateWaveIndexedDescriptorProgram();
+        program = program with
+        {
+            Instructions = program.Instructions.Select(instruction =>
+                instruction.Pc == 64
+                    ? Image(64, "ImageLoad", 4, dimension: 6, dmask: 1, vectorAddress: 1)
+                    : instruction).ToArray(),
+        };
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 2);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(
+            plan, Inputs([0x1000, 0], readCleanMemory: ReadWaveIndexedMemory),
+            ref snapshot, ref specialization, out var failure), $"materialize {failure}");
+        Assert.Equal(2, snapshot.Images.Length);
+        Assert.All(snapshot.Images, image => Assert.All(image, word => Assert.Equal(0u, word)));
+        Assert.All(specialization.Images, image => Assert.Equal(ImageDimension.Dim2DMsaa, image.Dimension));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
