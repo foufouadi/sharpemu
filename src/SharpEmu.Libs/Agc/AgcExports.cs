@@ -491,7 +491,61 @@ public static partial class AgcExports
     private static bool TryAllocateCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, out ulong commandAddress)
         => TryPrepareCommandDwords(ctx, commandBufferAddress, sizeDwords, true, out commandAddress);
 
+    // Guest threads run HLE exports concurrently. Two exports appending to one command buffer
+    // both read its cursor before either stores it back, and the second packet overwrites the
+    // first (a Yōtei DCB lost the header of a SET_SH_REG to a concurrent PopMarker). The
+    // cursor update is made atomic per buffer; the lock is not held across the guest's
+    // buffer-full callback.
+    private static readonly object[] _commandBufferLocks = CreateCommandBufferLocks();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte> _reportedConcurrentCommandBuffers = new();
+
+    private static object[] CreateCommandBufferLocks()
+    {
+        var locks = new object[64];
+        for (var index = 0; index < locks.Length; index++)
+        {
+            locks[index] = new object();
+        }
+
+        return locks;
+    }
+
+    // The buffer each stripe's holder is appending to, so contention between two buffers that
+    // share a stripe is not reported as a race on one buffer.
+    private static readonly ulong[] _commandBufferLockOwners = new ulong[64];
+
     private static bool TryPrepareCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, bool advanceCursor, out ulong commandAddress)
+    {
+        // Worker threads keep their command buffer objects at the same offset of stacks 16 MiB
+        // apart; a multiplicative hash keeps them on different stripes.
+        var stripe = (int)((commandBufferAddress * 0x9E3779B97F4A7C15UL) >> 58);
+        var gate = _commandBufferLocks[stripe];
+        if (!Monitor.TryEnter(gate))
+        {
+            if (Volatile.Read(ref _commandBufferLockOwners[stripe]) == commandBufferAddress &&
+                _reportedConcurrentCommandBuffers.TryAdd(commandBufferAddress, 0))
+            {
+                Console.Error.WriteLine(
+                    $"[AGC][WARN] Two threads append to one command buffer: buf=0x{commandBufferAddress:X16} thread={Environment.CurrentManagedThreadId}.");
+            }
+
+            Monitor.Enter(gate);
+        }
+
+        try
+        {
+            Volatile.Write(ref _commandBufferLockOwners[stripe], commandBufferAddress);
+            return TryPrepareCommandDwordsLocked(ctx, commandBufferAddress, sizeDwords, advanceCursor, gate, out commandAddress);
+        }
+        finally
+        {
+            Volatile.Write(ref _commandBufferLockOwners[stripe], 0);
+            Monitor.Exit(gate);
+        }
+    }
+
+    private static bool TryPrepareCommandDwordsLocked(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, bool advanceCursor, object gate,
+        out ulong commandAddress)
     {
         commandAddress = 0;
         if (sizeDwords == 0 ||
@@ -511,19 +565,31 @@ public static partial class AgcExports
             var scheduler = GuestThreadExecution.Scheduler;
             ulong callbackResult = 0;
             string? callbackError = null;
-            if (callback == 0 ||
-                scheduler is null ||
-                !scheduler.TryCallGuestFunction(
-                    ctx,
-                    callback,
-                    commandBufferAddress,
-                    (ulong)sizeDwords + reservedDwords,
-                    userData,
-                    0,
-                    0,
-                    "agc_command_buffer_full",
-                    out callbackResult,
-                    out callbackError))
+            bool called;
+            // The callback is guest code; it may block or append to this buffer itself.
+            Monitor.Exit(gate);
+            try
+            {
+                called = callback != 0 &&
+                    scheduler is not null &&
+                    scheduler.TryCallGuestFunction(
+                        ctx,
+                        callback,
+                        commandBufferAddress,
+                        (ulong)sizeDwords + reservedDwords,
+                        userData,
+                        0,
+                        0,
+                        "agc_command_buffer_full",
+                        out callbackResult,
+                        out callbackError);
+            }
+            finally
+            {
+                Monitor.Enter(gate);
+            }
+
+            if (!called)
             {
                 TraceAgc(
                     $"agc.cmd_alloc_callback_failed buf=0x{commandBufferAddress:X16} " +
