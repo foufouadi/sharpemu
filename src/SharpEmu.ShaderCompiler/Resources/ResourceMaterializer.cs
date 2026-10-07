@@ -1244,7 +1244,7 @@ public static class ResourceMaterializer
             var storage = baseImage.ResourceClass == ImageResourceClass.Storage;
             var conversionFormat = ImageConversionFormat(format);
             var shaderSwizzle = storage || conversionFormat != GuestImageFormat.Invalid ? descriptor[3] & 0xFFF : image.ShaderSwizzle;
-            var rawSintStorage = storage && GuestImageFormat.SampledNumericClass(format) == ImageNumericClass.Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
+            var rawSintStorage = storage && format == GuestImageFormat.Format32Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
             var numericClass = GuestImageFormat.SampledNumericClass(format);
             if (storage)
             {
