@@ -1989,7 +1989,8 @@ public static partial class Gen5SpirvTranslator
                 _module.AddDecoration(imageValue, SpirvDecoration.NonUniform);
             }
             uint objectType;
-            if (UsesSampler(instruction.Opcode))
+            // A multisample image is never sampled through a sampler (see EmitImageOperation).
+            if (UsesSampler(instruction.Opcode) && !imageClass.Multisampled)
             {
                 if (_samplerArray == 0)
                 {

@@ -594,14 +594,16 @@ public sealed class DirectImageTableTests
         Assert.Same(originalSpecialization, specialization);
     }
 
+    // Vulkan cannot sample a multisample image. A sample instruction reads sample 0 of the texel
+    // its coordinate falls in (as shadPS4 lowers it); a gather has no such reading and is refused.
     [Theory]
-    [InlineData("ImageSampleA", false)]
-    [InlineData("ImageSampleLz", false)]
+    [InlineData("ImageSampleA", true)]
+    [InlineData("ImageSampleLz", true)]
     [InlineData("ImageGather4Lz", false)]
     [InlineData("ImageLoad", true)]
     public void MultisampleDescriptorsRequireLoadsInsteadOfInvalidSamplingModules(string opcode, bool accepted)
     {
-        var sampled = opcode != "ImageLoad";
+        var gather = opcode.StartsWith("ImageGather", StringComparison.Ordinal);
         var program = Program([Image(0, opcode, 0, samplerRegister: 8, dmask: 1), EndProgram(8)]);
         var plan = ShaderResourcePlan.Extract(program, ShaderStage.Pixel, Hash, 0, 12);
         var inputs = new ResourceRuntimeInputs { UserData = [0x1000, GuestImageFormat.Format32Float << 20, 0,
@@ -613,8 +615,9 @@ public sealed class DirectImageTableTests
         Assert.Equal(ImageDimension.Dim2DMsaa, resources.Info.Images[0].Dimension);
         var layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, 12),
             false, ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false);
-        Assert.Equal(accepted, Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out _, out var error));
-        if (sampled) Assert.Contains("multisample sampling semantics", error);
+        Assert.Equal(accepted, Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out var shader, out var error));
+        if (gather) Assert.Contains("multisample sampling semantics", error);
+        if (accepted) Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
     }
 
     // A table in a scalar buffer, indexed by a lane value: planned as a dense table it binds
