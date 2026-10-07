@@ -294,7 +294,8 @@ public static partial class Gen5SpirvTranslator
                 _deviceStoreBytesScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
                 _module.AddName(_deviceStoreBytesScratch, "deviceStoreBytes");
                 _interfaces.Add(_deviceStoreBytesScratch);
-                if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
+                if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor) ||
+                    request.Program.Instructions.Any(instruction => IsFormatBufferLoad(instruction.Opcode)))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
                     _module.AddName(_deviceBufferWordScratch, "deviceBufferWord");
