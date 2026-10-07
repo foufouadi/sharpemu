@@ -87,11 +87,17 @@ internal static unsafe partial class VulkanVideoPresenter
             Dimension = entry.Dimension,
         };
 
-        // Registers hold whatever a lane computed, so a runtime descriptor can name memory that is
-        // not mapped, or no longer is. An image there would have no guest bytes to track.
+        // Registers hold whatever a lane computed, so a runtime descriptor can describe no valid
+        // view (the hardware reads the null texture then) or name memory that is not mapped, or no
+        // longer is. An image there would have no guest bytes to track.
         private bool IsBackedRuntimeTexture(RuntimeImageEntry entry)
         {
-            var data = ImageRequestBuilders.Texture(entry.Key.AsSpan(1), ShapeOf(RuntimeImageResource(entry))).Request.Description.Data;
+            if (!ImageRequestBuilders.TryTexture(entry.Key.AsSpan(1), ShapeOf(RuntimeImageResource(entry)), out var resolution))
+            {
+                return false;
+            }
+
+            var data = resolution.Request.Description.Data;
             return ImageDescription.IsEmptyRange(data) || _guestMemory.CanRead(data.Address, data.Size);
         }
 
