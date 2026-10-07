@@ -331,9 +331,11 @@ public sealed partial class RenderExecutor
     }
 
     // Fans, polygons and legacy rectangle/quad lists are drawn from their vertex counts, so
-    // those read the indirect arguments on the CPU. Rectangle lists draw through the host's
-    // general rectangle-list variant, as indexed indirect draws do.
+    // those read the indirect arguments on the CPU, as merged tessellation does: it counts its
+    // patches from the vertex count. Rectangle lists draw through the host's general
+    // rectangle-list variant, as indexed indirect draws do.
     private static bool CanDrawAutoIndirectOnGpu(RegisterBanks banks) =>
+        !Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages) &&
         (GuestPrimitiveType)banks.UserConfig.PrimitiveType is
             GuestPrimitiveType.PointList or GuestPrimitiveType.LineList or GuestPrimitiveType.LineStrip or
             GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleStrip or GuestPrimitiveType.RectangleList;

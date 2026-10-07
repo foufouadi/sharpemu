@@ -133,6 +133,23 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.Contains(_host.Calls, c => c.StartsWith("draw ", StringComparison.Ordinal));
     }
 
+    // The merged tessellation path counts patches from the vertex count on the CPU, so an
+    // indirect tessellation draw must read its arguments there, not leave them to the GPU.
+    [Fact]
+    public void IndirectAutoTessellation_ReadsTheArgumentsOnTheCpu()
+    {
+        WriteIndirectArguments(6, 2, 0, 0);
+        var banks = Banks();
+        banks.Context.ShaderStages = TessellationStages;
+        banks.Context.ShaderInterface.TessellationFactorParameter = 0x45;
+        banks.Context.ShaderInterface.LocalHullConfiguration = 0xC301;
+        var arguments = Auto(1, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawAuto(7, banks, arguments);
+
+        Assert.Contains("debug DrawIndexAuto 7 6 0 0 2 0", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indirect", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void AutoDraw_RecordsThePhasesAndTheVertexOffsets()
     {
