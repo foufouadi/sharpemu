@@ -142,6 +142,26 @@ public sealed class ShaderPrewarmListTests : IDisposable
     }
 
     [Fact]
+    public void APrewarmFileFromAnOlderPlannerVersionIsDiscarded()
+    {
+        using (var list = Open())
+        {
+            CompileAtRuntime(list, BufferDescriptorWords.Format32UInt);
+        }
+
+        var path = Path.Combine(_directory, ShaderPrewarmList.FileName);
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read))
+        {
+            stream.Position = sizeof(uint);
+            stream.Write(BitConverter.GetBytes(1u));
+        }
+
+        using var reloaded = Open();
+        Assert.Empty(reloaded.LoadedComputes());
+        Assert.Equal(3 * sizeof(uint), new FileInfo(path).Length);
+    }
+
+    [Fact]
     public void TheStampMatchesOnlyTheTextLastWritten()
     {
         using var list = Open();
