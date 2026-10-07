@@ -616,4 +616,24 @@ public sealed class DirectImageTableTests
         Assert.Equal(accepted, Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out _, out var error));
         if (sampled) Assert.Contains("multisample sampling semantics", error);
     }
+
+    // A table in a scalar buffer, indexed by a lane value: planned as a dense table it binds
+    // every record of the buffer on each draw. An access the runtime table can read binds only
+    // the records it reads; one it cannot (a storage write) keeps the dense table.
+    [Theory]
+    [InlineData("ImageLoad", true)]
+    [InlineData("ImageStore", false)]
+    public void BufferTableImagesAreReadAtRuntimeWhenTheAccessAllowsIt(string opcode, bool runtime)
+    {
+        var program = Program(
+            ReadFirstLane(0, 106, 0),
+            Sop2(4, "SMulI32", 106, Gen5Operand.Scalar(106), Operand(384)),
+            ScalarBufferLoad(12, 0, 16, 8, dynamicOffsetRegister: 106),
+            Image(20, opcode, 16, dmask: 1, vectorAddress: 4),
+            EndProgram(28));
+        var plan = Extract(program, userDataCount: 4);
+
+        Assert.Equal(runtime, plan.Info.UsesRuntimeDescriptors);
+        Assert.Equal(!runtime, plan.DescriptorSources.Any(source => source.IndirectImage?.BufferTableStride == 384));
+    }
 }

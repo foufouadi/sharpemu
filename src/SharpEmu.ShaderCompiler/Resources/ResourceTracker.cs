@@ -1276,15 +1276,18 @@ public sealed partial class ResourceTracker
         for (var index = 0; index < _plan.Memory.Count; index++)
         {
             var memory = _plan.Memory[index];
-            if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index]?.Handle is not { } handle ||
+            if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index] is not { Handle: { } handle } access ||
                 _indirectImages.Any(plan => ReferenceEquals(plan.Handle, handle)))
             {
                 continue;
             }
 
+            // A table in a buffer materializes every record it holds, and each draw binds them all:
+            // thousands for a material table. An access the runtime table can read binds only the
+            // records the shader actually reads.
             if (TryMakeIndirectImage(handle, memory.Pc, out var plan) ||
                 TryMakeDenseIndirectImage(handle, memory.Pc, out plan) ||
-                TryMakeBufferTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
+                (!CanReadDescriptorsAtRuntime(memory, access) && TryMakeBufferTableImage(handle, memory.Pc, memory.ImageR128, out plan)) ||
                 TryMakePointerTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
                 TryMakeDirectImage(handle, out plan))
             {
