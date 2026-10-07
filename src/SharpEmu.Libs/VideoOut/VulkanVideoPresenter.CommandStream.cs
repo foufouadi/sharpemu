@@ -322,6 +322,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void NoteMemoryVisibilityPoint() => _bufferCache.NoteMemoryVisibilityPoint();
 
+        public void NoteCommandProcessorWrite(ulong address, ulong size) => _bufferCache.NoteCommandProcessorWrite(address, size);
+
         public void Flush()
         {
             using var flushScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.Flush);

@@ -285,7 +285,8 @@ public sealed class GuestPageTracker
     }
 
     // Region locks stay held across the upload only for a written range, which turns GPU-dirty.
-    public void ForEachUploadRange<TSink>(ulong vaddr, ulong size, bool isWritten, ref TSink sink, bool preserveCpuWriteHotPages = true)
+    public void ForEachUploadRange<TSink>(ulong vaddr, ulong size, bool isWritten, ref TSink sink, bool preserveCpuWriteHotPages = true,
+        bool skipCpuWriteHotPages = false)
         where TSink : struct, IUploadRangeSink
     {
         RejectUploadCallbackReentry();
@@ -319,7 +320,8 @@ public sealed class GuestPageTracker
 
                     region.Lock.Enter();
                     held.Add(region);
-                    region.ForEachCpuUploadRange(preserveHotPages, region.BaseAddress + offset, bytes, ref visitor);
+                    region.ForEachCpuUploadRange(preserveHotPages, region.BaseAddress + offset, bytes, ref visitor,
+                        skipHotPages: !isWritten && skipCpuWriteHotPages);
                     if (!isWritten)
                     {
                         region.Lock.Exit();

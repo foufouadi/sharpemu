@@ -180,6 +180,12 @@ public unsafe class GpuBuffer : IDisposable
 
     public void AddStreamScore(int score) => StreamScore += score;
 
+    // The guest range whose CPU-write-hot pages a device-address read copied in the current
+    // memory visibility generation; the render thread owns these.
+    public long HotSyncGeneration;
+    public ulong HotSyncStart;
+    public ulong HotSyncEnd;
+
     // The highest scheduler tick whose command buffer may write this buffer on the GPU.
     // A readback of it only has to wait for that tick, not for all queued work.
     public ulong LastGpuWriteTick { get; private set; }

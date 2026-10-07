@@ -169,11 +169,19 @@ public sealed class TrackedRegion
     }
 
     // Hot read-only pages stay writable and dirty, so each obtain observes current CPU bytes.
-    public void ForEachCpuUploadRange<TVisitor>(bool preserveHotPages, ulong address, ulong size, ref TVisitor visitor)
+    // skipHotPages leaves them out entirely, for a caller that already copied them since the
+    // last memory visibility point.
+    public void ForEachCpuUploadRange<TVisitor>(bool preserveHotPages, ulong address, ulong size, ref TVisitor visitor,
+        bool skipHotPages = false)
         where TVisitor : struct, ICpuUploadVisitor
     {
         var (start, end) = GetPageRange(address, size);
         var upload = new PageMask(_cpuDirty, start, end);
+        if (skipHotPages)
+        {
+            upload &= ~_hotCpuWrites;
+        }
+
         var cleared = preserveHotPages ? upload & ~_hotCpuWrites : upload;
         foreach (var (runStart, runEnd) in cleared)
         {

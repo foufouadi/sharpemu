@@ -892,8 +892,105 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool SweepBdaOnEveryDraw =
         Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_EVERY_DRAW") == "1";
 
-    public void NoteMemoryVisibilityPoint() => _bdaVisibilityPending = true;
+    public void NoteMemoryVisibilityPoint()
+    {
+        _bdaVisibilityPending = true;
+        _visibilityGeneration++;
+        _reportedVisibilityPoints++;
+    }
+
+    // A command-processor write (labels, EOP and WRITE_DATA payloads) is ordered in the stream:
+    // only buffers holding the written bytes must copy their hot pages again. Advancing the
+    // generation here instead would restart every buffer thousands of times a second.
+    public void NoteCommandProcessorWrite(ulong guestAddress, ulong size)
+    {
+        _bdaVisibilityPending = true;
+        _reportedProcessorWrites++;
+        var end = guestAddress + size;
+        var index = _registry.FindFirstOverlappingIndex(guestAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
+        {
+            _registry.GetBuffer(_registry.GetRegisteredIdentifier(index)).HotSyncGeneration = 0;
+        }
+    }
+
+    private static long _reportedProcessorWrites;
+
     private ulong _bdaSweepMapping;
+
+    // Advances at every memory visibility point; starts above a new buffer's zero generation.
+    private long _visibilityGeneration = 1;
+
+    private static readonly bool ResyncHotPagesOnEveryDraw =
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_RESYNC_HOT_EVERY_DRAW") == "1";
+
+    private static long _reportedVisibilityPoints;
+    private static long _reportedHotSyncFull;
+    private static long _reportedHotSyncSkipped;
+
+    public static string TakeDeviceAddressSyncReport() => FormattableString.Invariant(
+        $"[PERF][BDA_SYNC] visibility_points={Interlocked.Exchange(ref _reportedVisibilityPoints, 0)} processor_writes={Interlocked.Exchange(ref _reportedProcessorWrites, 0)} full_syncs={Interlocked.Exchange(ref _reportedHotSyncFull, 0)} hot_skipped_syncs={Interlocked.Exchange(ref _reportedHotSyncSkipped, 0)}");
+
+    // A draw's read-only device-address range. CPU-write-hot pages stay writable, so they
+    // read as dirty on every draw; copying them again for each draw of one visibility
+    // generation re-reads bytes the guest had to finish writing before that point (the
+    // same ordering rule the PrepareBda sweep relies on). Each buffer remembers the range
+    // it copied hot pages for in the current generation and skips them inside it; pages
+    // that fault dirty are still copied on every call.
+    public void SynchronizeDeviceAddressRange(ulong guestAddress, ulong size)
+    {
+        if (ResyncHotPagesOnEveryDraw || GuestGpuMemoryHook.TraceAddress != 0)
+        {
+            SynchronizeBuffersInRange(guestAddress, size);
+            return;
+        }
+
+        var end = guestAddress + size;
+        var generation = _visibilityGeneration;
+        var index = _registry.FindFirstOverlappingIndex(guestAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
+        {
+            var identifier = _registry.GetRegisteredIdentifier(index);
+            var buffer = _registry.GetBuffer(identifier);
+            var start = Math.Max(buffer.CpuAddress, guestAddress);
+            var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            if (start >= finish)
+            {
+                continue;
+            }
+
+            TouchBuffer(identifier);
+            if (!_tracker.HasCpuDirtyPages(start, finish - start))
+            {
+                continue;
+            }
+
+            var covered = buffer.HotSyncGeneration == generation && start >= buffer.HotSyncStart && finish <= buffer.HotSyncEnd;
+            if (covered)
+            {
+                _reportedHotSyncSkipped++;
+            }
+            else
+            {
+                _reportedHotSyncFull++;
+                // Grow the remembered range when the new one touches it; otherwise restart it.
+                if (buffer.HotSyncGeneration == generation && start <= buffer.HotSyncEnd && finish >= buffer.HotSyncStart)
+                {
+                    buffer.HotSyncStart = Math.Min(buffer.HotSyncStart, start);
+                    buffer.HotSyncEnd = Math.Max(buffer.HotSyncEnd, finish);
+                }
+                else
+                {
+                    buffer.HotSyncGeneration = generation;
+                    buffer.HotSyncStart = start;
+                    buffer.HotSyncEnd = finish;
+                }
+            }
+
+            _ = SynchronizeBuffer(buffer, start, finish - start, false, false,
+                preserveCpuWriteHotPages: PreserveHotPagesInSweeps, skipCpuWriteHotPages: covered);
+        }
+    }
 
     private void TouchBuffersInRange(ulong guestAddress, ulong size)
     {
@@ -2260,7 +2357,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,
-        bool preserveCpuWriteHotPages = true, bool readImageBacking = false)
+        bool preserveCpuWriteHotPages = true, bool readImageBacking = false, bool skipCpuWriteHotPages = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -2279,7 +2376,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         copies.Clear();
         var sink = new UploadSink(_uploader, buffer, copies, guestAddress, size,
             readImageBacking ? _tryReadImageSource ??= TryReadImageSource : null);
-        _tracker.ForEachUploadRange(guestAddress, size, isWritten, ref sink, preserveCpuWriteHotPages);
+        _tracker.ForEachUploadRange(guestAddress, size, isWritten, ref sink, preserveCpuWriteHotPages, skipCpuWriteHotPages);
         var source = sink.Source;
         if (source != null)
         {

@@ -114,6 +114,10 @@ public interface ICommandStreamHost
     {
     }
 
+    // A command-processor write of these bytes: only they changed, so a host may keep what it
+    // already synchronized for the rest of memory.
+    void NoteCommandProcessorWrite(ulong address, ulong size) => NoteMemoryVisibilityPoint();
+
     void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount);
 
     void RecordEndOfPipe(in EndOfPipeWrite write);

@@ -827,7 +827,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     // Stream buffers do not populate the device-address page table.
                     _ = _bufferCache.FindBuffer(range.Base, size);
-                    _bufferCache.SynchronizeBuffersInRange(range.Base, size);
+                    _bufferCache.SynchronizeDeviceAddressRange(range.Base, size);
                 }
             }
         }
