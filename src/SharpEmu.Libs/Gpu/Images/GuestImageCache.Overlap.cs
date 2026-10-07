@@ -666,8 +666,17 @@ public sealed partial class GuestImageCache
             }
         }
 
+        // The replaced plane belongs to another depth image. What the GPU wrote to it reaches
+        // guest memory before the association goes, as when a depth image changes planes.
         foreach (var imageIdentifier in stale)
         {
+            var proxy = _slots[imageIdentifier];
+            if (proxy.IsGpuModified)
+            {
+                WriteBackStencilPlane(_slots[proxy.DepthOwner], proxy.Description.Data);
+                proxy.ClearGpuModified();
+            }
+
             DeleteImage(imageIdentifier);
         }
 

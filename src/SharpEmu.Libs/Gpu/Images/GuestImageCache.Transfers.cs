@@ -359,12 +359,23 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.EndRendering();
         VulkanSynchronization.PipelineBarrier(_device.Vk, new CommandBuffer(_scheduler.Current.Handle), PipelineStageFlags.AllCommandsBit, PipelineStageFlags.HostBit, 0, 0, null, 1, &barrier, 0, null);
         var backing = _backing;
+        // Until the tick completes guest memory holds the plane this replaces; an upload of the
+        // range waits for it (AwaitPublishingDownloads).
+        var publishing = new PublishingDownload(plane.Address, plane.Size, _scheduler.CurrentTick);
+        lock (_publishingDownloads) _publishingDownloads.Add(publishing);
         _scheduler.QueuePriorityCompletionAction(() =>
         {
-            download.Invalidate(offset, plane.Size);
-            if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+            try
             {
-                throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+                download.Invalidate(offset, plane.Size);
+                if (!backing.TryWriteBacking(plane.Address, download.Mapped.Slice((int)offset, (int)plane.Size)))
+                {
+                    throw SubmissionScheduler.Fatal($"The stencil plane could not be written to guest memory: address=0x{plane.Address:X16} size=0x{plane.Size:X}.");
+                }
+            }
+            finally
+            {
+                lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
             }
         });
     }
