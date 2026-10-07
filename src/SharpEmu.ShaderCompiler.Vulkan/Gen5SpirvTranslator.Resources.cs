@@ -568,6 +568,11 @@ public static partial class Gen5SpirvTranslator
             {
                 samplerKey[word] = LoadS(image.ScalarSampler + word);
             }
+
+            if ((entry.ImageSampleFlags & ImageSampleFlags.Adjust) != 0)
+            {
+                samplerKey[3] = BitwiseAnd(samplerKey[3], UInt(~DescriptorConstants.SamplerDword3ReservedMask));
+            }
             var imageSlot = LookupRuntimeDescriptor(imageKey, image: true);
             var samplerSlot = LookupRuntimeDescriptor(samplerKey, image: false);
 

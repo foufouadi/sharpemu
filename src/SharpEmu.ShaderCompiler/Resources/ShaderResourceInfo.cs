@@ -36,6 +36,9 @@ public static class DescriptorConstants
     public const uint IdentityImageSwizzle = 0xFAC;
     public const uint InvalidFormat = 0;
     public const uint NoIndex = uint.MaxValue;
+    // GFX10 S# dword 3 bits 12-29 are reserved. The adjusted sample forms carry their
+    // adjustment there; the sampler itself ignores them.
+    public const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 }
 
 // One buffer resource of a program and how the program uses it.
