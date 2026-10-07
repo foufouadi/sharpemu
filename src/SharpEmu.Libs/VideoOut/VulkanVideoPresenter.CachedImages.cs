@@ -104,7 +104,6 @@ internal static unsafe partial class VulkanVideoPresenter
     // One shader image binding: a cached image, or a host movie plane with its own image.
     private sealed class TextureResource
     {
-        public TextureRequestResolution Resolution;
         public ulong Address;
         public ResourceSlotIdentifier ImageIdentifier;
         public ImageRequest Request;
