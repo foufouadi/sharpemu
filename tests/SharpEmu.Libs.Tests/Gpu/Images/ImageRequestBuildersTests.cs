@@ -18,15 +18,6 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
 {
     private const ulong Base = 0x1_0000_0000;
 
-    // A runtime descriptor read from memory can be anything; only one the host can create is
-    // registered, and the rest read as the null texture as on the hardware.
-    [Fact]
-    public void OnlyDescriptorsWithABaseAndAHostFormatDescribeAHostTexture()
-    {
-        Assert.True(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
-        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Invalid, 32, 32)));
-        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(0, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
-        Assert.False(ImageRequestBuilders.DescribesHostTexture(new uint[8]));
     [Theory]
     [InlineData(0x100u)]
     [InlineData(0x800u)]
@@ -42,6 +33,17 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(GuestTileMode.Standard4KB, request.Description.TileMode);
         Assert.Equal(Format.R16G16B16A16Sfloat, request.Description.PixelFormat);
         Assert.Equal(0UL, request.Description.MipLayout[0].Offset);
+    }
+
+    // A runtime descriptor read from memory can be anything; only one the host can create is
+    // registered, and the rest read as the null texture as on the hardware.
+    [Fact]
+    public void OnlyDescriptorsWithABaseAndAHostFormatDescribeAHostTexture()
+    {
+        Assert.True(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Invalid, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(0, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(new uint[8]));
     }
 
     [Fact]
