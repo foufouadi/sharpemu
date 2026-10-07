@@ -1083,12 +1083,7 @@ public static class KernelPthreadCompatExports
         }
 
         if (canCooperativelyBlock && waiter is not null &&
-            GuestThreadExecution.RequestCurrentThreadBlock(
-                ctx,
-                "pthread_mutex_lock",
-                waiter.WakeKey,
-                () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
-                () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
+            RequestBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter))
         {
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -1098,6 +1093,21 @@ public static class KernelPthreadCompatExports
         TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, hostResult);
         return hostResult;
     }
+
+    // The continuations capture the lock's arguments in a closure; keeping them out of
+    // PthreadMutexLockCore spares every uncontended lock that allocation.
+    private static bool RequestBlockedMutexLock(
+        CpuContext ctx,
+        ulong mutexAddress,
+        ulong resolvedAddress,
+        PthreadMutexState state,
+        PthreadMutexWaiter waiter) =>
+        GuestThreadExecution.RequestCurrentThreadBlock(
+            ctx,
+            "pthread_mutex_lock",
+            waiter.WakeKey,
+            () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
+            () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter));
 
     private static int PthreadMutexUnlockCore(CpuContext ctx, ulong mutexAddress, bool requireOwner)
     {
@@ -2029,7 +2039,7 @@ public static class KernelPthreadCompatExports
                     break;
                 }
 
-                var waitDuration = TimeSpan.FromMilliseconds(10);
+                var waitMilliseconds = 10;
                 if (timed)
                 {
                     var remaining = GetRemainingTimeout(deadline);
@@ -2039,13 +2049,14 @@ public static class KernelPthreadCompatExports
                         break;
                     }
 
-                    if (remaining < waitDuration)
-                    {
-                        waitDuration = remaining;
-                    }
+                    // Monitor.Wait truncates to whole milliseconds, so a sub-millisecond remainder
+                    // became a zero timeout and the wait spun until the deadline. UE's game thread
+                    // waits for the render fence in 1 ms slices, which kept a core busy. A timed wait
+                    // may wake late, so round up instead.
+                    waitMilliseconds = (int)Math.Min(waitMilliseconds, Math.Ceiling(remaining.TotalMilliseconds));
                 }
 
-                _ = Monitor.Wait(state.SyncRoot, waitDuration);
+                _ = Monitor.Wait(state.SyncRoot, waitMilliseconds);
                 if (waiter.CompletionState == 0 &&
                     timed &&
                     GetRemainingTimeout(deadline) <= TimeSpan.Zero)

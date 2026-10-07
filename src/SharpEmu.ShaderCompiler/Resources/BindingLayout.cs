@@ -355,8 +355,15 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     // Vulkan can put image arrays in one persistent descriptor set. The per-draw
     // flattened table then starts with the local-image -> heap-slot mapping.
     public bool UsesBindlessImages { get; init; }
+
+    // The module reads the internal-resolution dwords: the factor that maps a guest pixel
+    // onto host texels, its reciprocal, the mask of scaled image resources and the factor
+    // the pixel position is divided by.
+    public bool UsesRenderScale { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
+
+    public const uint RenderScaleDwordCount = 5;
 
     public uint BufferStrideDword => MemoryOffsetDword + (MemoryOffsetCount + 3) / 4;
 
@@ -365,7 +372,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint DispatchThreadLimitsDword => BufferStrideDword + BufferStrideDwordCount;
 
     public uint TessellationDataDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
-    public uint ShaderDataDwordCount => TessellationDataDword + (UsesTessellationData ? Gen5TessellationData.DwordCount : 0u);
+    public uint RenderScaleDword => TessellationDataDword + (UsesTessellationData ? Gen5TessellationData.DwordCount : 0u);
+
+    public uint ShaderDataDwordCount => RenderScaleDword + (UsesRenderScale ? RenderScaleDwordCount : 0u);
 
     public static uint ImageSlotTableDwordCount(ShaderResourceInfo info)
     {
@@ -598,6 +607,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesShaderBase,
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
+        bool usesRenderScale = false,
         bool usesBindlessImages = false,
         bool usesRuntimeBufferStrides = false,
         bool usesTessellationData = false)
@@ -608,7 +618,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         usesRuntimeBufferStrides &= memoryOffsetCount != 0;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 +
             (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u) +
-            (usesTessellationData ? Gen5TessellationData.DwordCount : 0u);
+            (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + (usesRenderScale ? RenderScaleDwordCount : 0u);
         // The fixed-function control bridge shares the domain stage's runtime
         // buffer. Keep that ABI independent of per-stage push-data packing.
         var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
@@ -706,6 +716,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             // still place its buffers on set 1 when another stage uses set 0 for
             // the persistent image heap.
             UsesBindlessImages = usesBindlessImages,
+            UsesRenderScale = usesRenderScale,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -722,13 +733,14 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         UsesTessellationData == other.UsesTessellationData &&
         UsesRuntimeBufferStrides == other.UsesRuntimeBufferStrides &&
         UsesBindlessImages == other.UsesBindlessImages &&
+        UsesRenderScale == other.UsesRenderScale &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
 
     public override bool Equals(object? obj) => Equals(obj as BindingLayout);
 
-    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount, Descriptors.Count, UsesDispatchThreadLimits);
+    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount, Descriptors.Count, UsesDispatchThreadLimits, UsesRenderScale);
 }
 
 // Recomputes the layout an emitter was given from the same inputs and the same push
@@ -750,7 +762,7 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesBindlessImages, layout.UsesRuntimeBufferStrides, layout.UsesTessellationData);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesRenderScale, layout.UsesBindlessImages, layout.UsesRuntimeBufferStrides, layout.UsesTessellationData);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

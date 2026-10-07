@@ -11,7 +11,7 @@ using Xunit;
 namespace SharpEmu.Libs.Tests.Agc;
 
 // Direct draws carry a modifier naming the shader stage and the user registers of the pipeline.
-// Every modifier must still produce the draw; rejecting the others dropped whole passes silently.
+// Every modifier must still produce the draw: Unreal's volume passes use a geometry-stage modifier.
 public sealed class AgcDirectDrawModifierTests
 {
     private const ulong BaseAddress = 0x2_1000_0000;

@@ -564,7 +564,7 @@ internal sealed class ShaderProgramCache
         {
             resources = ResourceMaterializer.ApplyTo(plan, specialization);
             layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
-                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
+                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions, source.Stage,
                 options.Tessellation is not null || options.TessellationHull is not null);
         }
         catch (ResourcePlanException exception)
@@ -647,6 +647,8 @@ internal sealed class ShaderProgramCache
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         var exactFloat16Conversions = _host.ExactFloat16ConversionsEnabled;
         var nonUniformImageIndexing = _host.NonUniformImageIndexingEnabled;
+        var nativeHalfConversion = _host.NativeHalfConversionExact;
+        var zeroOutOfBoundsReads = _host.ZeroOutOfBoundsBufferReads;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -663,6 +665,8 @@ internal sealed class ShaderProgramCache
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
+                    NativeHalfConversionExact = nativeHalfConversion,
+                    ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
@@ -692,6 +696,8 @@ internal sealed class ShaderProgramCache
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
+                    NativeHalfConversionExact = nativeHalfConversion,
+                    ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
@@ -715,6 +721,8 @@ internal sealed class ShaderProgramCache
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
+                    NativeHalfConversionExact = nativeHalfConversion,
+                    ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalDataShareDwords = info.LocalDataShareDwords,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
@@ -726,7 +734,14 @@ internal sealed class ShaderProgramCache
     }
 
     private BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
-        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, bool usesTessellationData = false) =>
+        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage,
+        bool usesTessellationData = false) =>
+        AllocateLayout(program, plan, resources, userDataBase, userDataCount, pushDataCursor, usesDispatchThreadLimits, stage,
+            _host, usesTessellationData);
+
+    private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
+        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage,
+        IShaderPipelineHost host, bool usesTessellationData = false) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount),
@@ -735,14 +750,20 @@ internal sealed class ShaderProgramCache
             BindingLayout.ReadsShaderBase(program),
             pushDataCursor,
             usesDispatchThreadLimits: usesDispatchThreadLimits,
-            usesBindlessImages: _host.UsesBindlessImages,
-            usesRuntimeBufferStrides: _host.RuntimeBufferStridesEnabled,
-            usesTessellationData: usesTessellationData);
+            usesBindlessImages: host.UsesBindlessImages,
+            usesRuntimeBufferStrides: host.RuntimeBufferStridesEnabled,
+            usesTessellationData: usesTessellationData,
+            // A pixel program reads its position in guest pixels; any program that samples or
+            // fetches an image needs to know which of them the host holds at another size.
+            usesRenderScale: Images.RenderScalePolicy.Enabled &&
+                             (stage == ShaderStage.Pixel || resources.Info.Images.Count != 0));
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, IShaderPipelineHost host) =>
         new(plan, resources, layout)
         {
+            NativeHalfConversionExact = host.NativeHalfConversionExact,
+            ZeroOutOfBoundsBufferReads = host.ZeroOutOfBoundsBufferReads,
             WaveSize = info.WaveSize,
             EnableExecGuardElision = info.WaveSize != 64 || host.ExecGuardElisionEnabled,
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
@@ -772,12 +793,8 @@ internal sealed class ShaderProgramCache
             var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
                 waveSize: record.Info.WaveSize);
             var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
-            layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, record.UserDataBase, record.UserDataCount),
-                BindingLayout.UsesGlobalDataShare(program), ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
-                BindingLayout.ReadsShaderBase(program), record.PushDataCursor,
-                usesDispatchThreadLimits: record.Info.DispatchThreadDimensions,
-                usesBindlessImages: host.UsesBindlessImages,
-                usesRuntimeBufferStrides: host.RuntimeBufferStridesEnabled);
+            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
+                record.Info.DispatchThreadDimensions, ShaderStage.Compute, host);
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
                 host);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;

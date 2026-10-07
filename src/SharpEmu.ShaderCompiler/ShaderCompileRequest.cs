@@ -193,6 +193,22 @@ public sealed class ShaderCompileRequest
     // Formatted buffer accesses whose format is known when the shader is translated still
     // go through the run-time format decoder. For tests that compare the two.
     public bool ForceGenericBufferFormats { get; init; }
+
+    // True only when the host measured GLSL UnpackHalf2x16 / PackHalf2x16 to be bit-exact
+    // against the emulator's own f16 conversion on this device, for every half bit pattern
+    // and every rounding boundary. The packed-f16 paths then convert with those two ext
+    // instructions instead of the branchless integer sequences, which is what a driver
+    // lowers to one hardware convert. Default false: the spec leaves f16 rounding and
+    // subnormal behaviour to the implementation, so the exact emulation is the only safe
+    // default and native is opted into by a device probe, never by a capability bit.
+    public bool NativeHalfConversionExact { get; init; }
+
+    // True only when the host measured that a storage-buffer read past the end of its descriptor
+    // range reads zero on this device (robustBufferAccess2 that the device actually honours).
+    // Every guest buffer word is then loaded directly: the range test, the address clamp and the
+    // zero select around it exist only to produce the zero the device already returns. Default
+    // false, because an out-of-range read is undefined without that promise.
+    public bool ZeroOutOfBoundsBufferReads { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
