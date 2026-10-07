@@ -74,6 +74,12 @@ public sealed partial class GuestImageCache
 
     // An allocation failed despite the budget. Retire every image collection allows, then let
     // the retired ones be destroyed and return unused pool memory to the device.
+    public void ReclaimForAllocation()
+    {
+        using var held = _lock.Hold();
+        ReclaimAfterFailedAllocation();
+    }
+
     private void ReclaimAfterFailedAllocation()
     {
         _allocationCollectionBlocked = false;

@@ -1514,4 +1514,29 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         {
         }
     }
+
+    // The device can run out of memory for a buffer as for an image (Ghost of Tsushima's
+    // gameplay). The cache frees the images it can and tries the allocation once more.
+    [Fact]
+    public void BufferAllocation_RetriesOnceAfterTheDeviceRunsOutOfMemory()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        const ulong size = 64UL * 1024 * 1024;
+        using var harness = new CacheHarness(_vulkan, backingBytes: 80UL * 1024 * 1024);
+        var address = harness.MapBacked(size, ReadWrite);
+        var attempts = 0;
+        harness.Vulkan.DeviceInfo.AllocationFailure = bytes => bytes >= size && attempts++ == 0;
+        try
+        {
+            harness.Worker.Run(() => harness.Cache.FindBuffer(address, size));
+            Assert.Equal(2, attempts);
+        }
+        finally
+        {
+            harness.Vulkan.DeviceInfo.AllocationFailure = null;
+        }
+
+        harness.Shutdown();
+    }
 }
