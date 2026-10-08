@@ -251,6 +251,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
         }
 
+        if (isWritten && isTexelBuffer)
+        {
+            // Preserving a partial image write can merge this buffer with the image's whole
+            // backing range. Finish that before returning a handle the shader will write.
+            RequireImageCache().InvalidateMemoryFromGpu(guestAddress, size);
+        }
+
         if (!requiresDeviceAddress && !isWritten &&
             !_tracker.HasGpuDirtyPages(guestAddress, size) &&
             _tracker.HasCpuDirtyPages(guestAddress, size) &&
