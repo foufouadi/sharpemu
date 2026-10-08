@@ -485,6 +485,11 @@ public sealed partial class GuestImageCache
             return new OverlapResolution(mergedImageIdentifier);
         }
 
+        // Resolving can allocate a replacement, and an allocation under memory pressure collects
+        // images not used this tick. The image being resolved is the copy source of that
+        // replacement; touching it keeps it out of the collection.
+        TouchImage(cached);
+
         ref var cachedInfo = ref cached.Description;
         var currentTick = _scheduler.CurrentTick;
         var safeToDelete = currentTick - Math.Min(currentTick, cached.LastAccessTick) > TicksBeforeRemoval;
