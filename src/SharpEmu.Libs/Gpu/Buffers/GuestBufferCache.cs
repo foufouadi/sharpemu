@@ -1267,6 +1267,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private const ulong ReadbackWindowBytes = 512 * 1024;
+    private const ulong MappedReadbackWindowBytes = 16 * 1024;
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
@@ -1550,6 +1551,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         if (copies.Count != 0 && _unifiedBuffers && AreMapped(copies, out var writer))
         {
+            // The mapping is device-local memory the CPU reads uncached across the bus, so a
+            // mapped read copies only the pages around the request, not the whole window.
+            copies = CollectReadbackWindow(copies[0].Buffer, guestAddress, size, MappedReadbackWindowBytes, out windowBegin, out windowEnd);
             if (writer == 0 || _scheduler.IsTickComplete(writer))
             {
                 ApplyMappedRead(copies, windowBegin, windowEnd, guestAddress, size, isWrite, readbackStarted, source);
@@ -1970,9 +1974,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private List<DownloadPiece> CollectReadbackWindow(ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd) =>
         CollectReadbackWindow(_registry.GetBuffer(FindBuffer(guestAddress, size)), guestAddress, size, out windowBegin, out windowEnd);
 
-    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd)
+    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd) =>
+        CollectReadbackWindow(buffer, guestAddress, size, ReadbackWindowBytes, out windowBegin, out windowEnd);
+
+    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, ulong windowSize,
+        out ulong windowBegin, out ulong windowEnd)
     {
-        const ulong windowSize = ReadbackWindowBytes;
         var bufferEnd = buffer.CpuAddress + buffer.Size;
         windowBegin = Math.Max(guestAddress & ~(windowSize - 1), buffer.CpuAddress);
         windowEnd = Math.Min(Math.Max(windowBegin + windowSize, guestAddress + size), bufferEnd);
