@@ -1291,7 +1291,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private const ulong ReadbackWindowBytes = 512 * 1024;
-    private const ulong MappedReadbackWindowBytes = 16 * 1024;
+    // Uncached reads of device-local memory run near 300 MB/s, and most mapped reads want one
+    // descriptor word or packet dword: one tracker page is the smallest window that can turn clean.
+    // SHARPEMU_MAPPED_READBACK_KB overrides it (a power of two) for comparisons.
+    private static readonly ulong MappedReadbackWindowBytes =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_READBACK_KB"), out var mappedKb) && mappedKb != 0 &&
+        (mappedKb & (mappedKb - 1)) == 0 ? mappedKb * 1024 : TrackerLayout.PageBytes;
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
