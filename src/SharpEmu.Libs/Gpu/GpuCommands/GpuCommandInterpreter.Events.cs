@@ -211,9 +211,25 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
-    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Images.ImageDropTrace.Enabled)
+        {
+            Images.ImageDropTrace.PushMarker(this, payload);
+        }
 
-    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+        return packet.Length - 1;
+    }
+
+    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Images.ImageDropTrace.Enabled)
+        {
+            Images.ImageDropTrace.PopMarker(this);
+        }
+
+        return packet.Length - 1;
+    }
 
     internal uint FlipPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

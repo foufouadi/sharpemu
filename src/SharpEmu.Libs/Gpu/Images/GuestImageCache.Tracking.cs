@@ -139,12 +139,14 @@ public sealed partial class GuestImageCache
         return retiredImages;
     }
 
-    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)
+    private void ReleaseImage(ResourceSlotIdentifier imageIdentifier,
+        [System.Runtime.CompilerServices.CallerFilePath] string file = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0)
     {
         var image = _slots[imageIdentifier];
         if (image.IsGpuModified)
         {
-            image.ClearGpuModified();
+            image.ClearGpuModified(file, line);
         }
 
         DeleteImage(imageIdentifier);
@@ -480,20 +482,29 @@ public sealed partial class GuestImageCache
         }
 
         using var held = _lock.Hold();
-        foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
+        ImageDropTrace.CauseAddress = address;
+        ImageDropTrace.CauseSize = size;
+        try
         {
-            var image = _slots[imageIdentifier];
-            if (!image.Overlaps(address, size))
+            foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true))
             {
-                continue;
-            }
+                var image = _slots[imageIdentifier];
+                if (!image.Overlaps(address, size))
+                {
+                    continue;
+                }
 
-            if (image.IsGpuModified)
-            {
-                image.ClearGpuModified();
-            }
+                if (image.IsGpuModified)
+                {
+                    image.ClearGpuModified();
+                }
 
-            image.MarkBufferModified();
+                image.MarkBufferModified();
+            }
+        }
+        finally
+        {
+            ImageDropTrace.CauseSize = 0;
         }
     }
 
