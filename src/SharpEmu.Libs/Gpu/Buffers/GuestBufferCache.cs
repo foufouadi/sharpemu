@@ -1272,6 +1272,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
     private readonly HashSet<ulong> _eagerCandidates = new();
     private readonly List<PendingDownload> _eagerDownloads = new();
+    // Consecutive eager readbacks of a window the GPU rewrote before the CPU read them.
+    // A window that keeps wasting its copies stops getting them until the counts reset.
+    private readonly Dictionary<ulong, int> _eagerMisses = new();
+    private const int MaxEagerMisses = 2;
+    private const long EagerMissResetBatches = 256;
+    private static long _reportedEagerSkipped;
     private long _batchSerial;
     private static long _reportedEagerStarted;
     private static long _reportedEagerUsed;
@@ -1326,8 +1332,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 if (!CompleteReadMemoryOnGpu(pending, retrySynchronously: false))
                 {
                     Interlocked.Increment(ref _reportedEagerStale);
+                    NoteEagerMiss(pending.GuestAddress);
                 }
             }
+        }
+
+        if (_batchSerial % EagerMissResetBatches == 0)
+        {
+            _eagerMisses.Clear();
         }
 
         if ((_batchSerial & 1023) == 0)
@@ -1348,6 +1360,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (_eagerDownloads.Count >= MaxEagerReadbacks)
             {
                 break;
+            }
+
+            if (_eagerMisses.TryGetValue(key, out var misses) && misses >= MaxEagerMisses)
+            {
+                Interlocked.Increment(ref _reportedEagerSkipped);
+                continue;
             }
 
             if (_hotWindows.TryGetValue(key, out var hot))
@@ -1421,12 +1439,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (!CompleteReadMemoryOnGpu(pending, retrySynchronously: false))
         {
             Interlocked.Increment(ref _reportedEagerStale);
+            NoteEagerMiss(pending.GuestAddress);
             return false;
         }
 
+        _eagerMisses.Remove(pending.GuestAddress & ~(ReadbackWindowBytes - 1));
         EagerReadbacksUsed++;
         Interlocked.Increment(ref _reportedEagerUsed);
         return !HasGpuDirtyBytes(guestAddress, size);
+    }
+
+    private void NoteEagerMiss(ulong guestAddress)
+    {
+        var key = guestAddress & ~(ReadbackWindowBytes - 1);
+        _eagerMisses[key] = _eagerMisses.TryGetValue(key, out var misses) ? misses + 1 : 1;
     }
 
     private void AbandonEagerReadbacks()
@@ -1477,7 +1503,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_skipped={Interlocked.Exchange(ref _reportedEagerSkipped, 0)}");
 
     // Ticket is set when the readback queue carries the download; otherwise the main queue
     // does, into MainQueueBuffer, and MainQueueTick is the submission the guest thread waits for.
