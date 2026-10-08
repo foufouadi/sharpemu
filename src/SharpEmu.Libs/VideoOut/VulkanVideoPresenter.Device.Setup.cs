@@ -1453,6 +1453,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
             _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device, _memoryBudgetEnabled) { ImageViewMinLodSupported = _supportsImageViewMinLod, CustomTwoSampleLocationsSupported = _supportsNativeTwoSampleMixed };
+            _deviceInfo.NameObject = SetDebugName;
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);
