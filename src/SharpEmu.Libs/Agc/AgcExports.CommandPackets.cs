@@ -824,6 +824,25 @@ public static partial class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
+    // Ghost of Yotei 1.512 calls Push/PopMarker from a second guest thread on a DCB the main
+    // thread is filling with inline-written packets; appending a marker NOP there overwrites
+    // the game's packets. Markers are tool-only NOPs on PS5, so by default they leave the
+    // buffer alone. SHARPEMU_AGC_MARKERS=1 writes them again for the pass names the command
+    // interpreter decodes in image-drop traces and RenderDoc captures.
+    private static readonly bool MarkerPacketsFromEnvironment =
+        Environment.GetEnvironmentVariable("SHARPEMU_AGC_MARKERS") == "1";
+
+    internal static bool? MarkerPacketsOverride;
+
+    private static bool MarkerPacketsEnabled => MarkerPacketsOverride ?? MarkerPacketsFromEnvironment;
+
+    // Hands back the current write position without allocating, so callers that inspect the
+    // returned pointer still see an address inside the buffer.
+    private static int ReturnCommandBufferCursor(CpuContext ctx, ulong commandBufferAddress) =>
+        TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorUpOffset, out var cursorUp)
+            ? ReturnPointer(ctx, cursorUp)
+            : ReturnPointer(ctx, 0);
+
     [SysAbiExport(
         Nid = "+kSrjIVxKFE",
         ExportName = "sceAgcDcbPushMarker",
@@ -837,6 +856,11 @@ public static partial class AgcExports
             !TryReadGuestCString(ctx, markerAddress, 4095, out var marker))
         {
             return ReturnPointer(ctx, 0);
+        }
+
+        if (!MarkerPacketsEnabled)
+        {
+            return ReturnCommandBufferCursor(ctx, commandBufferAddress);
         }
 
         var payloadDwords = Math.Max(((uint)marker.Length + 4) / 4, 1);
@@ -883,6 +907,11 @@ public static partial class AgcExports
     public static int DcbPopMarker(CpuContext ctx)
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
+        if (commandBufferAddress != 0 && !MarkerPacketsEnabled)
+        {
+            return ReturnCommandBufferCursor(ctx, commandBufferAddress);
+        }
+
         if (commandBufferAddress == 0 ||
             !TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItNop, RPopMarker)) ||
