@@ -892,6 +892,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool SweepBdaOnEveryDraw =
         Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_EVERY_DRAW") == "1";
 
+    // Called once per presented frame; see GuestPageTracker.DecayCpuWriteHeat.
+    public void DecayCpuWriteHeat()
+    {
+        if (!KeepCpuWriteHeatAcrossFrames)
+        {
+            _tracker.DecayCpuWriteHeat();
+        }
+    }
+
+    private static readonly bool KeepCpuWriteHeatAcrossFrames =
+        Environment.GetEnvironmentVariable("SHARPEMU_KEEP_CPU_WRITE_HEAT") == "1";
+
     public void NoteMemoryVisibilityPoint()
     {
         _bdaVisibilityPending = true;
