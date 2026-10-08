@@ -79,6 +79,11 @@ public sealed partial class RenderExecutor
         var originalHullStage = input.Stage;
         var originalDomainStage = state.Programs.VertexInput.Stage;
         var pipeline = _pipelines.CreateComputePipeline(input, hull.Program);
+        if (RenderPhaseProfile.Enabled)
+        {
+            TessellationProfile.RecordDraw(instances, patches, (long)instances * ((patches + batchCapacity - 1) / batchCapacity), groupsPerBatch == 1);
+        }
+
         Span<GuestSpan> ranges = stackalloc GuestSpan[2];
         try
         {
