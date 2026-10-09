@@ -76,6 +76,15 @@ public sealed partial class GuestImageCache
     // the retired ones be destroyed and return unused pool memory to the device.
     public void ReclaimForAllocation()
     {
+        // A buffer can be created while this thread resolves an image overlap under the cache
+        // lock. Collecting then could free the image being resolved, so no reclaim happens and
+        // the caller's retry reports the allocation failure itself.
+        if (_lock.HeldByCurrentThread)
+        {
+            Console.Error.WriteLine("[GPU][WARN] Device memory is full during an image-cache operation; images cannot be reclaimed here.");
+            return;
+        }
+
         using var held = _lock.Hold();
         ReclaimAfterFailedAllocation();
     }
