@@ -363,6 +363,20 @@ internal static unsafe partial class VulkanVideoPresenter
             RecordGlobalBarrier(BeginBatchedGuestCommands());
         }
 
+        // SHARPEMU_DIAG_BARRIER_EVERY_CALL=1 (diagnostic): a full memory barrier before every draw and
+        // dispatch, so no shader can overlap or read past an earlier one's writes. Very slow.
+        private static readonly bool BarrierEveryCall =
+            Environment.GetEnvironmentVariable("SHARPEMU_DIAG_BARRIER_EVERY_CALL") == "1";
+
+        private void DiagnosticBarrier()
+        {
+            if (BarrierEveryCall)
+            {
+                EndRendering();
+                RecordGlobalBarrier(BeginBatchedGuestCommands());
+            }
+        }
+
         private void RecordGlobalBarrier(CommandBuffer commandBuffer)
         {
             var barrier = new MemoryBarrier2
@@ -492,6 +506,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
+                DiagnosticBarrier();
                 _translation.DrawIndexed(submitId, in arguments);
             }
             finally
@@ -506,6 +521,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
+                DiagnosticBarrier();
                 _translation.DrawAuto(submitId, in arguments);
             }
             finally
@@ -537,6 +553,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
+                DiagnosticBarrier();
                 _translation.Dispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
             }
             finally
