@@ -393,6 +393,22 @@ public sealed unsafe partial class DirectExecutionBackend
 				$"[LOADER][TRACE] posix-signal#{traceIndex}: recovered={disposition == -1} new_rip=0x{ReadCtxU64(contextRecord, CTX_RIP):X16}");
 			Console.Error.Flush();
 		}
+		if (disposition != -1 && !_posixSignalWarmup &&
+		    (TrySkipNullLoad(contextRecord, record.ExceptionInformation[1]) ||
+		     TrySkipNullLoadVector(contextRecord, ReadCtxU64(contextRecord, CTX_RIP))))
+		{
+			// The submission raced ahead of the owning subsystem's init. Park this
+			// thread briefly so the initializer finishes; later polls then see live
+			// tables instead of walking through not-ready sentinels.
+			try
+			{
+				System.Threading.Thread.Sleep(100);
+			}
+			catch
+			{
+			}
+			disposition = -1;
+		}
 		if (disposition != -1 && !_posixSignalWarmup)
 		{
 			return false;
@@ -411,6 +427,144 @@ public sealed unsafe partial class DirectExecutionBackend
 				XmmBlockSize);
 		}
 		return true;
+	}
+
+
+	// A torn-down guest subsystem can leave a worker dereferencing a nulled table
+	// (null base + small offset). The console's timing hides these races; on the host
+	// they kill the process. SHARPEMU_NULL_SKIP=1 zeroes the loaded register and
+	// continues past the instruction instead.
+	private static readonly bool NullSkipEnabled =
+		Environment.GetEnvironmentVariable("SHARPEMU_NULL_SKIP") == "1";
+	private static readonly System.Collections.Generic.Dictionary<ulong, int> NullSkipCounts = new();
+
+	private static bool TrySkipNullLoad(byte* contextRecord, ulong faultAddress)
+	{
+		if (!NullSkipEnabled || faultAddress >= 0x100000UL)
+		{
+			return false;
+		}
+		var rip = ReadCtxU64(contextRecord, CTX_RIP);
+		lock (NullSkipCounts)
+		{
+			if (!NullSkipCounts.TryGetValue(rip, out var count) || count < 4096)
+			{
+				NullSkipCounts[rip] = count + 1;
+			}
+			else
+			{
+				return false;
+			}
+		}
+		var code = new byte[15];
+		if (!(_posixSignalBackend?.TryReadGuestOrHostBytes(rip, code) ?? false))
+		{
+			return false;
+		}
+		try
+		{
+			var decoder = Iced.Intel.Decoder.Create(64, new Iced.Intel.ByteArrayCodeReader(code));
+			decoder.IP = rip;
+			decoder.Decode(out var instruction);
+			if (instruction.Code == Iced.Intel.Code.INVALID || instruction.Length <= 0)
+			{
+				return false;
+			}
+			if (instruction.Op0Kind != Iced.Intel.OpKind.Register ||
+			    instruction.Op1Kind != Iced.Intel.OpKind.Memory ||
+			    instruction.MemoryBase == Iced.Intel.Register.RIP)
+			{
+				return false;
+			}
+			// 32-bit destinations also zero the upper half on x64, so both widths
+			// recover identically.
+			var index = instruction.Op0Register switch
+			{
+				Iced.Intel.Register.RAX or Iced.Intel.Register.EAX => 0,
+				Iced.Intel.Register.RCX or Iced.Intel.Register.ECX => 1,
+				Iced.Intel.Register.RDX or Iced.Intel.Register.EDX => 2,
+				Iced.Intel.Register.RBX or Iced.Intel.Register.EBX => 3,
+				Iced.Intel.Register.RBP or Iced.Intel.Register.EBP => 5,
+				Iced.Intel.Register.RSI or Iced.Intel.Register.ESI => 6,
+				Iced.Intel.Register.RDI or Iced.Intel.Register.EDI => 7,
+				Iced.Intel.Register.R8 or Iced.Intel.Register.R8D => 8,
+				Iced.Intel.Register.R9 or Iced.Intel.Register.R9D => 9,
+				Iced.Intel.Register.R10 or Iced.Intel.Register.R10D => 10,
+				Iced.Intel.Register.R11 or Iced.Intel.Register.R11D => 11,
+				Iced.Intel.Register.R12 or Iced.Intel.Register.R12D => 12,
+				Iced.Intel.Register.R13 or Iced.Intel.Register.R13D => 13,
+				Iced.Intel.Register.R14 or Iced.Intel.Register.R14D => 14,
+				Iced.Intel.Register.R15 or Iced.Intel.Register.R15D => 15,
+				_ => -1,
+			};
+			if (index < 0)
+			{
+				return false;
+			}
+			WriteCtxU64(contextRecord, CTX_RAX + index * 8, 0);
+			WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private static bool TrySkipNullLoadVector(byte* contextRecord, ulong rip)
+	{
+		var code = new byte[15];
+		if (!(_posixSignalBackend?.TryReadGuestOrHostBytes(rip, code) ?? false))
+		{
+			return false;
+		}
+		try
+		{
+			var decoder = Iced.Intel.Decoder.Create(64, new Iced.Intel.ByteArrayCodeReader(code));
+			decoder.IP = rip;
+			decoder.Decode(out var instruction);
+			if (instruction.Code == Iced.Intel.Code.INVALID || instruction.Length <= 0 ||
+			    instruction.Op0Kind != Iced.Intel.OpKind.Register ||
+			    instruction.Op1Kind != Iced.Intel.OpKind.Memory)
+			{
+				return false;
+			}
+			var index = instruction.Op0Register switch
+			{
+				Iced.Intel.Register.XMM0 => 0,
+				Iced.Intel.Register.XMM1 => 1,
+				Iced.Intel.Register.XMM2 => 2,
+				Iced.Intel.Register.XMM3 => 3,
+				Iced.Intel.Register.XMM4 => 4,
+				Iced.Intel.Register.XMM5 => 5,
+				Iced.Intel.Register.XMM6 => 6,
+				Iced.Intel.Register.XMM7 => 7,
+				Iced.Intel.Register.XMM8 => 8,
+				Iced.Intel.Register.XMM9 => 9,
+				Iced.Intel.Register.XMM10 => 10,
+				Iced.Intel.Register.XMM11 => 11,
+				Iced.Intel.Register.XMM12 => 12,
+				Iced.Intel.Register.XMM13 => 13,
+				Iced.Intel.Register.XMM14 => 14,
+				Iced.Intel.Register.XMM15 => 15,
+				_ => -1,
+			};
+			if (index < 0)
+			{
+				return false;
+			}
+			var xmm = contextRecord + Win64ContextXmm0Offset + index * 16;
+			for (var i = 0; i < 16; i++)
+			{
+				xmm[i] = 0;
+			}
+			WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
 	private static byte* GetSignalVectorRegisterAddress(nint userContextAddress, byte* machineContext)

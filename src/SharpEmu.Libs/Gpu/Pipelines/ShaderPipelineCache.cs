@@ -397,7 +397,22 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
-        var program = _programs.Decode(source);
+        Gen5ShaderProgram program;
+        try
+        {
+            program = _programs.Decode(source);
+        }
+        catch (ShaderProgramCache.ShaderProgramRejectedException exception)
+        {
+            // Unimplemented guest instructions reach here; skip this dispatch rather
+            // than letting the rejection kill the command-stream slice.
+            if (_reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize)))
+            {
+                Console.Error.WriteLine($"[GPU][WARN][COMPUTE_SKIPPED] {exception.Message} The operation was not executed.");
+            }
+
+            return new ComputeProgram { Available = false };
+        }
         if (TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
         {
             if (RenderTrace.Enabled)

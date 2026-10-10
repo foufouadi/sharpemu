@@ -2344,6 +2344,45 @@ public static partial class Gen5SpirvTranslator
                     StoreV(instruction.Destinations[0].Value, Bitcast(_uintType, signedByte));
                     return true;
                 }
+                case "DsReadU8":
+                case "DsReadI16":
+                case "DsReadU16":
+                {
+                    // Narrow LDS loads share the I8 path; only the extract width and
+                    // signedness differ (U8/I16/U16 were unimplemented DS opcodes).
+                    if (instruction.Destinations.Count < 1 || instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS narrow read operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var byteAddress = control.SingleOffsetBytes == 0
+                        ? address
+                        : IAdd(address, UInt(control.SingleOffsetBytes));
+                    var word = Load(_uintType, LdsPointer(address, control.SingleOffsetBytes));
+                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+                    var packed = ShiftRightLogical(word, shift);
+                    var signed = instruction.Opcode is "DsReadI16";
+                    var width = instruction.Opcode is "DsReadI16" or "DsReadU16" ? 16u : 8u;
+                    var extracted = signed
+                        ? Bitcast(
+                            _uintType,
+                            _module.AddInstruction(
+                                SpirvOp.BitFieldSExtract,
+                                _intType,
+                                Bitcast(_intType, packed),
+                                UInt(0),
+                                UInt(width)))
+                        : _module.AddInstruction(
+                            SpirvOp.BitFieldUExtract,
+                            _uintType,
+                            packed,
+                            UInt(0),
+                            UInt(width));
+                    StoreV(instruction.Destinations[0].Value, extracted);
+                    return true;
+                }
                 case "DsReadB64":
                 case "DsReadB96":
                 case "DsReadB128":
@@ -2394,6 +2433,38 @@ public static partial class Gen5SpirvTranslator
                             EffectiveDsPairOffsetBytes(control.Offset1, st64)));
                     StoreV(instruction.Destinations[0].Value, first);
                     StoreV(instruction.Destinations[1].Value, second);
+                    return true;
+                }
+                case "DsWrxchg2St64RtnB32":
+                {
+                    // Pair exchange: swap both dwords independently and return the
+                    // two previous values. The stride-64 addressing only changes the
+                    // offsets, mirroring the read2/write2 pair handlers.
+                    if (instruction.Destinations.Count < 2 || instruction.Sources.Count < 3)
+                    {
+                        error = "missing LDS wrxchg2 operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var firstPointer = LdsPointer(address, EffectiveDsPairOffsetBytes(control.Offset0, st64: true));
+                    var secondPointer = LdsPointer(address, EffectiveDsPairOffsetBytes(control.Offset1, st64: true));
+                    var firstOld = _module.AddInstruction(
+                        SpirvOp.AtomicExchange,
+                        _uintType,
+                        firstPointer,
+                        _module.Constant(_uintType, 1u /* device scope */),
+                        _module.Constant(_uintType, 0u /* relaxed semantics */),
+                        GetRawSource(instruction, 1));
+                    var secondOld = _module.AddInstruction(
+                        SpirvOp.AtomicExchange,
+                        _uintType,
+                        secondPointer,
+                        _module.Constant(_uintType, 1u),
+                        _module.Constant(_uintType, 0u),
+                        GetRawSource(instruction, 2));
+                    StoreV(instruction.Destinations[0].Value, firstOld);
+                    StoreV(instruction.Destinations[1].Value, secondOld);
                     return true;
                 }
                 default:

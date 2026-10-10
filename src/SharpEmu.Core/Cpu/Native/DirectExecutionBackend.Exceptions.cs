@@ -393,10 +393,56 @@ public sealed partial class DirectExecutionBackend
 						{
 							Console.Error.WriteLine("[LOADER][INFO]   Code before RIP: " + BitConverter.ToString(before).Replace("-", " "));
 						}
+						try
+						{
+							const ulong dumpBase = 0x800000000UL;
+							const ulong dumpLength = 0x2000000UL;
+							var guestCode = new byte[dumpLength];
+							for (ulong off = 0; off < dumpLength; off += 0x10000)
+							{
+								var chunk = new byte[0x10000];
+								if (!TryReadGuestOrHostBytes(dumpBase + off, chunk))
+								{
+									Array.Clear(chunk);
+								}
+								Array.Copy(chunk, 0, guestCode, (long)off, chunk.Length);
+							}
+							System.IO.File.WriteAllBytes("/tmp/guest_code.bin", guestCode);
+						try
+						{
+							const ulong dataBase = 0x700000000F000UL;
+							const ulong dataLength = 0x4000UL;
+							var guestData = new byte[dataLength];
+							for (ulong off = 0; off < dataLength; off += 0x1000)
+							{
+								var chunk = new byte[0x1000];
+								if (!TryReadGuestOrHostBytes(dataBase + off, chunk)) Array.Clear(chunk);
+								Array.Copy(chunk, 0, guestData, (long)off, chunk.Length);
+							}
+							System.IO.File.WriteAllBytes("/tmp/guest_data.bin", guestData);
+						}
+						catch { }
+						}
+						catch (Exception ex)
+						{
+							Console.Error.WriteLine("[dump] failed: " + ex.Message);
+						}
 						byte[] window = new byte[64];
 						if (rip > 32 && TryReadGuestOrHostBytes(rip - 32, window))
 						{
 							Console.Error.WriteLine("[LOADER][INFO]   Code window [RIP-0x20..]: " + BitConverter.ToString(window).Replace("-", " "));
+						}
+						{
+							byte[] wide = new byte[1024];
+							if (rip > 1024 && TryReadGuestOrHostBytes(rip - 1024, wide))
+							{
+								Console.Error.WriteLine("[LOADER][INFO]   Code wide [RIP-0x400..]: " + BitConverter.ToString(wide).Replace("-", " "));
+							}
+							byte[] frame = new byte[512];
+							if (TryReadGuestOrHostBytes(rbp - 256, frame))
+							{
+								Console.Error.WriteLine("[LOADER][INFO]   Frame [RBP-0x100..+0x100]: " + BitConverter.ToString(frame).Replace("-", " "));
+							}
 						}
 						for (var stackIndex = 0; stackIndex < 16; stackIndex++)
 						{

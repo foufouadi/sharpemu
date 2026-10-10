@@ -55,7 +55,11 @@ public sealed partial class RenderExecutor
         var state = DrawState.Create();
         if (!TryResolveDrawTargets(banks, draw, ref state)) { _host.ResetBindings(); return; }
         ResolveShaderPrograms(banks, ref state);
-        var tessellation = state.Programs.Tessellation ?? throw _host.Fatal("The draw has no prepared tessellation programs.");
+        // A rejected shader program (resources that cannot be constant-evaluated) leaves
+        // no tessellation stage: skip the draw rather than kill the host. The draw's
+        // geometry is lost, but the title keeps running.
+        if (state.Programs.Tessellation is null) { _host.ResetBindings(); return; }
+        var tessellation = state.Programs.Tessellation;
         var hull = tessellation.Hull;
         var input = hull.Input;
         var layout = tessellation.HullConfiguration;

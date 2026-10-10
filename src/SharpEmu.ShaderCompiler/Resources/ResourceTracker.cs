@@ -528,6 +528,21 @@ public sealed partial class ResourceTracker
                     Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
                 };
             }
+            else if (allowNullFallback && expected == ScalarValueKind.BufferHandle &&
+                     Environment.GetEnvironmentVariable("SHARPEMU_DYNAMIC_BUFFER_FALLBACK") == "1" &&
+                     (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "")))
+            {
+                // A buffer handle read from memory written at runtime (descriptor
+                // indirection) has no compile-time source either. Opt-in: bind the null
+                // descriptor so the dispatch runs against a zero buffer instead of being
+                // skipped entirely — a compute whose output the title waits on must
+                // execute, even with wrong data.
+                _info.NullDescriptorFallbacks.Add((pc, $"buffer {memoryOpcode ?? "access"}"));
+                source = new DescriptorSource
+                {
+                    Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
+                };
+            }
             else
             {
                 throw Failure(

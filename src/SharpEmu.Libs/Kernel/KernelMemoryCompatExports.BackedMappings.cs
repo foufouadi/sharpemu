@@ -297,7 +297,7 @@ public static partial class KernelMemoryCompatExports
             address = requested;
             return true;
         }
-        var desired = requested != 0 ? requested : DefaultMapSearchBase;
+        var desired = requested != 0 ? requested : GuestMapSearchBase;
         while (true)
         {
             var hintedRegions = reuseReservation && desired == requested && requested != 0
@@ -307,7 +307,13 @@ public static partial class KernelMemoryCompatExports
             if (!reusableHint)
                 desired = FindAvailableMappingAddress(desired, length, alignment);
             if (desired == 0 || !space.TryHoldRangeAtOrAbove(desired, length, alignment, out address))
+            {
+                if (ShouldTraceDirectMemory())
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] select failed detail: find=0x{desired:X} hold={(desired != 0 ? "failed" : "n/a")} " +
+                        $"len=0x{length:X} align=0x{alignment:X} requested=0x{requested:X}");
                 return false;
+            }
             var overlap = GetMappingSlices(address, length, clip: false);
             if (overlap.Length == 0 || (reuseReservation && address == requested &&
                 MappingsCoverRange(GetMappingSlices(address, length), address, length) && overlap.All(region => region.IsReserved)))

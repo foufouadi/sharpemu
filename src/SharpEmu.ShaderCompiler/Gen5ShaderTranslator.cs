@@ -1306,6 +1306,7 @@ public static partial class Gen5ShaderTranslator
             0x1E1 => "VCosF16",
             0x1D6 => "VRsqF16",
             0x303 => "VAddNcU16",
+            0x305 => "VMulLoU16",
             0x34B => "VFmaF16",
             0x351 => "VMin3F16",
             0x354 => "VMax3F16",
@@ -1411,6 +1412,9 @@ public static partial class Gen5ShaderTranslator
         {
             0x02 => "VPkAddI16",
             0x03 => "VPkSubI16",
+            0x04 => "VPkLshlrevB16",
+            0x05 => "VPkLshrrevB16",
+            0x06 => "VPkAshrrevI16",
             0x0E => "VPkFmaF16",
             0x0F => "VPkAddF16",
             0x10 => "VPkMulF16",
@@ -1451,6 +1455,7 @@ public static partial class Gen5ShaderTranslator
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
             0x10 => "DsCmpstB32",
+            0x1F => "DsWrxchg2St64RtnB32",
             0x12 => "DsMinF32",
             0x13 => "DsMaxF32",
             0x20 => "DsAddRtnU32",
@@ -1471,6 +1476,9 @@ public static partial class Gen5ShaderTranslator
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
             0x39 => "DsReadI8",
+            0x3A => "DsReadU8",
+            0x3B => "DsReadI16",
+            0x3C => "DsReadU16",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
             // gfx10 groups the 64-bit LDS atomics at 0x40..0x4C, directly ahead
@@ -2555,7 +2563,7 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0 + 2),
                         Gen5Operand.Vector(vectorData0 + 3),
                     ],
-                    "DsWrite2B32" or "DsWrite2St64B32" => [
+                    "DsWrite2B32" or "DsWrite2St64B32" or "DsWrxchg2St64RtnB32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData1),
@@ -2601,11 +2609,11 @@ public static partial class Gen5ShaderTranslator
                     "DsAppend" or "DsConsume" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsReadB32" or "DsReadI8" or "DsReadAddtidB32" or
+                    "DsReadB32" or "DsReadI8" or "DsReadU8" or "DsReadI16" or "DsReadU16" or "DsReadAddtidB32" or
                     "DsSwizzleB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsReadB64" or "DsRead2B32" or "DsRead2St64B32" => [
+                    "DsReadB64" or "DsRead2B32" or "DsRead2St64B32" or "DsWrxchg2St64RtnB32" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
                     ],

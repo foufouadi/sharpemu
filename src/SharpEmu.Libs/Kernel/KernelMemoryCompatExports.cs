@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.HLE.GpuMemory;
+using SharpEmu.HLE.Host.Posix;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Ampr;
 using SharpEmu.Libs.Media;
@@ -108,7 +109,7 @@ public static partial class KernelMemoryCompatExports
     private static readonly object _ioTraceGate = new();
     private static readonly object _statCacheGate = new();
     private static readonly object _guestMountGate = new();
-    private static readonly DirectMemoryAllocationMap _directAllocations = new(GuestMemoryLayout.DirectBytes);
+    private static readonly DirectMemoryAllocationMap _directAllocations = new(GuestMemoryLayout.DirectBytes + GuestMemoryLayout.SlackBytes);
     private static readonly Dictionary<ulong, LibcHeapAllocation> _libcAllocations = new();
     // Keyed by (and kept sorted on) region base address so VirtualQuery can find a
     // containing/next region with a binary search instead of an O(n) scan. Every
@@ -160,9 +161,74 @@ public static partial class KernelMemoryCompatExports
     private static ulong _nextVirtualAddress;
     // Start the address search outside the host memory regions.
     // On macOS, also exclude the graphics memory region below 0x7000000000.
+    // HLE-data allocations use the probed Linux base (host reservations cover the
+    // classic one); GUEST kernel-placed mappings keep the platform default,
+    // because their backing only spans the pre-reserved guest arena — a probed
+    // base above the arena makes every kernel-placed MapDirectMemory fail with
+    // ENOSPC (the Scream audio pools die exactly there).
     private static readonly ulong DefaultMapSearchBase =
         OperatingSystem.IsWindows() ? 0x1_0000_0000UL :
+        OperatingSystem.IsMacOS() ? 0x70_0000_0000UL : LinuxFreeMapSearchBase();
+
+    private static readonly ulong GuestMapSearchBase =
+        OperatingSystem.IsWindows() ? 0x1_0000_0000UL :
         OperatingSystem.IsMacOS() ? 0x70_0000_0000UL : 0x20_0000_0000UL;
+
+    // Linux loads the NVIDIA userspace driver (via SDL/GLX) into huge fixed
+    // reservations that commonly cover the previous 0x20_0000_0000 base, so
+    // MAP_FIXED_NOREPLACE fails at every candidate. Probe /proc/self/maps for
+    // the first 1 GiB-aligned free gap at or above 0x10_0000_0000.
+    private static ulong LinuxFreeMapSearchBase()
+    {
+        var occupied = new List<(ulong Start, ulong End)>();
+        try
+        {
+            foreach (var line in File.ReadLines("/proc/self/maps"))
+            {
+                var dash = line.IndexOf('-');
+                var space = line.IndexOf(' ', dash);
+                if (dash <= 0 || space <= dash ||
+                    !ulong.TryParse(line[..dash].AsSpan().Trim(), System.Globalization.NumberStyles.HexNumber, null, out var start) ||
+                    !ulong.TryParse(line.AsSpan(dash + 1, space - dash - 1).Trim(), System.Globalization.NumberStyles.HexNumber, null, out var end))
+                {
+                    continue;
+                }
+                occupied.Add((start, end));
+            }
+        }
+        catch
+        {
+            return 0x100_0000_0000UL;
+        }
+        occupied.Sort((a, b) => a.Start.CompareTo(b.Start));
+        // Stay above GuestSpaceOwner's pre-reserved guest arena
+        // [0x10_0000_0000, 0xFC_0000_0000) and below the host library area.
+        const ulong probe = 0x100_0000_0000UL;
+        const ulong limit = 0x4000_0000_0000UL;
+        const ulong size = 0x4000_0000UL;
+        var candidate = probe;
+        var index = 0;
+        while (candidate + size <= limit)
+        {
+            while (index < occupied.Count && occupied[index].End <= candidate)
+            {
+                index++;
+            }
+            if (index >= occupied.Count || occupied[index].Start >= candidate + size)
+            {
+                return candidate;
+            }
+            candidate = Math.Max(candidate + 0x4000_0000UL, (occupied[index].End + 0x3FFF_FFFFUL) & ~0x3FFF_FFFFUL);
+        }
+        return 0x100_0000_0000UL;
+    }
+    // Extra allocator headroom beyond the reported direct-memory size; the report
+    // itself stays DirectBytes so the guest still sizes its pools like on console.
+    private static readonly ulong DirectMemorySlackBytes =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DIRECT_MEMORY_SLACK_MB"), out var slackMegabytes) &&
+        slackMegabytes > 0 && slackMegabytes <= 8192
+            ? slackMegabytes * 1024 * 1024
+            : 0UL;
     private static ulong _threadAtexitCountCallback;
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
@@ -325,7 +391,9 @@ public static partial class KernelMemoryCompatExports
         LibraryName = "libc")]
     public static int Memset(CpuContext ctx)
     {
+        var memsetEntryTraced = Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEMSET") == "1";
         var destination = ctx[CpuRegister.Rdi];
+
         var value = (byte)(ctx[CpuRegister.Rsi] & 0xFF);
         var length = ctx[CpuRegister.Rdx];
         if (length == 0)
@@ -381,6 +449,11 @@ public static partial class KernelMemoryCompatExports
 
         // Rent may hand back a larger array than requested; only the first chunkLength
         // bytes are filled, so the loop must cap at chunkLength rather than chunk.Length.
+        if (memsetEntryTraced)
+        {
+            Console.Error.WriteLine($"[memset] begin dst=0x{destination:X16} len=0x{length:X}");
+            Console.Error.Flush();
+        }
         var chunkLength = (int)Math.Min(length, (ulong)MemsetChunkSize);
         var chunk = value == 0 ? _zeroChunk : ArrayPool<byte>.Shared.Rent(chunkLength);
         if (value != 0)
@@ -395,7 +468,15 @@ public static partial class KernelMemoryCompatExports
             while (remaining > 0)
             {
                 var take = (int)Math.Min((ulong)chunkLength, remaining);
-                if (!TryWriteCompat(ctx, cursor, chunk.AsSpan(0, take)))
+                var chunkWatch = System.Diagnostics.Stopwatch.StartNew();
+                var writeOk = TryWriteCompat(ctx, cursor, chunk.AsSpan(0, take));
+                if (chunkWatch.ElapsedMilliseconds > 2000)
+                {
+                    Console.Error.WriteLine($"[memset] SLOW WRITE dst=0x{cursor:X16} take=0x{take:X} ms={chunkWatch.ElapsedMilliseconds}");
+                    Console.Error.WriteLine(Environment.StackTrace);
+                    Console.Error.Flush();
+                }
+                if (!writeOk)
                 {
                     // Clamp oversized clears to the valid mapped prefix. Small
                     // inaccessible writes are tolerated for compatibility with
@@ -409,7 +490,12 @@ public static partial class KernelMemoryCompatExports
                                 $"[LOADER][WARNING] memset inaccessible-dst recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} dst=0x{destination:X16} len=0x{length:X} val=0x{value:X2}");
                         }
 
-                        ctx[CpuRegister.Rax] = destination;
+                        if (memsetEntryTraced)
+            {
+                Console.Error.WriteLine("[memset] end ok");
+                Console.Error.Flush();
+            }
+            ctx[CpuRegister.Rax] = destination;
                         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                     }
 
@@ -1157,6 +1243,288 @@ public static partial class KernelMemoryCompatExports
             alignment: DefaultLibcHeapAlignment,
             resultAddress: ctx[CpuRegister.Rax]);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // ---- sceLibcMspace family ----------------------------------------------
+    // Ghost of Yotei's engine allocator is mspace-based. Every mspace allocation is
+    // served from the shared zero-filled libc heap; the per-block records give
+    // free, realloc and usable-size their sizes and let destroy release a space.
+
+    private static readonly object MspaceGate = new();
+    private static readonly Dictionary<ulong, (ulong Handle, ulong Size)> MspaceBlocks = new();
+    private static ulong _nextMspaceHandle = 0x10UL;
+
+    private static bool TryMspaceAllocate(ulong handle, ulong size, ulong alignment, out ulong address)
+    {
+        if (size == 0)
+        {
+            size = 1;
+        }
+        if (!TryAllocateLibcHeap(size, (nuint)(alignment == 0 ? 16UL : alignment), zeroFill: true, out address))
+        {
+            return false;
+        }
+        lock (MspaceGate)
+        {
+            MspaceBlocks[address] = (handle, size);
+        }
+        return true;
+    }
+
+    private static void MspaceFreeBlock(ulong address)
+    {
+        lock (MspaceGate)
+        {
+            if (address == 0 || !MspaceBlocks.Remove(address))
+            {
+                return;
+            }
+        }
+        FreeLibcHeap(address);
+    }
+
+    private static ulong LookupMspaceBlockSize(ulong address)
+    {
+        lock (MspaceGate)
+        {
+            return MspaceBlocks.TryGetValue(address, out var block) ? block.Size : 0;
+        }
+    }
+
+    // Moves a block to a fresh allocation, copying what both sizes hold, as realloc does.
+    private static bool TryMspaceMove(CpuContext ctx, ulong handle, ulong existing, ulong size, ulong alignment, out ulong moved)
+    {
+        var previous = LookupMspaceBlockSize(existing);
+        if (!TryMspaceAllocate(handle, size, alignment, out moved))
+        {
+            return false;
+        }
+        var copy = new byte[Math.Min(previous, size)];
+        if (copy.Length > 0 && TryReadCompat(ctx, existing, copy))
+        {
+            _ = TryWriteCompat(ctx, moved, copy);
+        }
+        MspaceFreeBlock(existing);
+        return true;
+    }
+
+    [SysAbiExport(
+        Nid = "-hn1tcVHq5Q",
+        ExportName = "sceLibcMspaceCreate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceCreate(CpuContext ctx)
+    {
+        var baseAddress = ctx[CpuRegister.Rsi];
+        var capacity = ctx[CpuRegister.Rdx];
+        if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_MSPACE") == "1")
+        {
+            Console.Error.WriteLine($"[mspace] create base=0x{baseAddress:X16} cap=0x{capacity:X}");
+            Console.Error.Flush();
+        }
+        ulong handle;
+        lock (MspaceGate)
+        {
+            handle = _nextMspaceHandle++;
+        }
+        ctx[CpuRegister.Rax] = handle;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "W6SiVSiCDtI",
+        ExportName = "sceLibcMspaceDestroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceDestroy(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        List<ulong> owned;
+        lock (MspaceGate)
+        {
+            owned = MspaceBlocks.Where(b => b.Value.Handle == handle).Select(b => b.Key).ToList();
+        }
+        foreach (var address in owned)
+        {
+            MspaceFreeBlock(address);
+        }
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "OJjm-QOIHlI",
+        ExportName = "sceLibcMspaceMalloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMalloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var size = ctx[CpuRegister.Rsi];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, 16, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_malloc", size, 16, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "Vla-Z+eXlxo",
+        ExportName = "sceLibcMspaceFree",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceFree(CpuContext ctx)
+    {
+        MspaceFreeBlock(ctx[CpuRegister.Rsi]);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "iF1iQHzxBJU",
+        ExportName = "sceLibcMspaceMemalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMemalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var alignment = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_memalign", size, alignment, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "qWESlyXMI3E",
+        ExportName = "sceLibcMspacePosixMemalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspacePosixMemalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var outPointer = ctx[CpuRegister.Rsi];
+        var alignment = ctx[CpuRegister.Rdx];
+        var size = ctx[CpuRegister.Rcx];
+        if (outPointer != 0 && TryMspaceAllocate(handle, size, alignment, out var address) &&
+            TryWriteUInt64Compat(ctx, outPointer, address))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+        ctx[CpuRegister.Rax] = 0x8001000c;
+        return unchecked((int)0x8001000c);
+    }
+
+    [SysAbiExport(
+        Nid = "ljkqMcC4-mk",
+        ExportName = "sceLibcMspaceAlignedAlloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceAlignedAlloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var alignment = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_aligned_alloc", size, alignment, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "LYo3GhIlB38",
+        ExportName = "sceLibcMspaceCalloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceCalloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var count = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        // The mspace heap zero-fills every block, so calloc needs no extra clear.
+        if (!TryMultiplyAllocationSize(count, size, out var total) ||
+            !TryMspaceAllocate(handle, total, 16, out var address))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = address;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "gigoVHZvVPE",
+        ExportName = "sceLibcMspaceRealloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceRealloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var existing = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        if (existing == 0)
+        {
+            ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, 16, out var fresh) ? fresh : 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        if (LookupMspaceBlockSize(existing) >= size)
+        {
+            ctx[CpuRegister.Rax] = existing;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = TryMspaceMove(ctx, handle, existing, size, 16, out var grown) ? grown : 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "p6lrRW8-MLY",
+        ExportName = "sceLibcMspaceReallocalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceReallocalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var existing = ctx[CpuRegister.Rsi];
+        var alignment = ctx[CpuRegister.Rdx];
+        var size = ctx[CpuRegister.Rcx];
+        if (existing == 0)
+        {
+            ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var fresh) ? fresh : 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = TryMspaceMove(ctx, handle, existing, size, alignment, out var moved) ? moved : 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "fEoW6BJsPt4",
+        ExportName = "sceLibcMspaceMallocUsableSize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMallocUsableSize(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rsi];
+        var size = LookupMspaceBlockSize(address);
+        if (size == 0)
+        {
+            size = LookupLibcAllocationSize(address);
+        }
+        ctx[CpuRegister.Rax] = size;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static ulong LookupLibcAllocationSize(ulong address)
+    {
+        if (address == 0)
+        {
+            return 0;
+        }
+        lock (_libcAllocations)
+        {
+            if (_libcAllocations.TryGetValue(address, out var allocation))
+            {
+                return allocation.Size;
+            }
+        }
+        return 0;
     }
 
     [SysAbiExport(
@@ -3042,6 +3410,14 @@ public static partial class KernelMemoryCompatExports
             {
                 searchEnd = limit;
             }
+            // The guest sizes its search window from the reported pool; under
+            // configured slack, widen a window that stops at the report so the
+            // extra headroom is addressable: the game can claim nearly the whole
+            // report with its boot pools and then still need tail allocations.
+            if (DirectMemorySlackBytes != 0 && searchEnd == GuestMemoryLayout.DirectBytes)
+            {
+                searchEnd = limit + DirectMemorySlackBytes;
+            }
         }
 
         if (searchStartRaw < 0)
@@ -3066,7 +3442,11 @@ public static partial class KernelMemoryCompatExports
         lock (_memoryGate)
         {
             _ = ResolveBackingSpace(ctx);
-            if (!TryAllocateDirectMemoryLocked(searchStart, searchEnd, length, align, memoryType, GuestMemoryLayout.DirectBytes, out selectedAddress))
+            // The console's 12.5 GiB report is a soft quota the game sizes itself to;
+            // late heap growth still draws past it. SHARPEMU_DIRECT_MEMORY_SLACK_MB adds
+            // unreported allocator headroom so those tail allocations fit.
+            var allocationLimit = GuestMemoryLayout.DirectBytes + DirectMemorySlackBytes;
+            if (!TryAllocateDirectMemoryLocked(searchStart, searchEnd, length, align, memoryType, allocationLimit, out selectedAddress))
             {
                 TraceDirectMemoryCall(
                     ctx,
@@ -6505,9 +6885,14 @@ public static partial class KernelMemoryCompatExports
 
     private static unsafe bool TryReadHostMemory(ulong address, Span<byte> destination)
     {
-        if (destination.IsEmpty || !IsHostRangeAccessible(address, (ulong)destination.Length, writeAccess: false))
+        if (destination.IsEmpty)
         {
             return false;
+        }
+
+        if (!IsHostRangeAccessible(address, (ulong)destination.Length, writeAccess: false))
+        {
+            return UntrackedHostMemory.TryRead(address, destination);
         }
 
         try
@@ -6868,9 +7253,14 @@ public static partial class KernelMemoryCompatExports
 
     private static unsafe bool TryWriteHostMemory(ulong address, ReadOnlySpan<byte> source)
     {
-        if (source.IsEmpty || !IsHostRangeAccessible(address, (ulong)source.Length, writeAccess: true))
+        if (source.IsEmpty)
         {
             return false;
+        }
+
+        if (!IsHostRangeAccessible(address, (ulong)source.Length, writeAccess: true))
+        {
+            return UntrackedHostMemory.TryWrite(address, source);
         }
 
         try

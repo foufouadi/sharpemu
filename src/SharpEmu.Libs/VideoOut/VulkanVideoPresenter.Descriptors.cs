@@ -522,7 +522,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
-                var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
+                if (!TryClampMappedSize(descriptor.Address, requested, out var size))
+                {
+                    // A descriptor pointing at unmapped memory (stale or not yet mapped by
+                    // the title) must not kill the host: bind nothing, like the null
+                    // descriptor above. The stage reads zeros for this buffer.
+                    LogUnmappedBufferOnce(descriptor.Address, program.Hash);
+                    sources[index] = (descriptor, default);
+                    continue;
+                }
+
                 var resource = prepared.Resources.Info.Buffers[index];
                 if (resource.Formatted && resource.Written)
                 {
@@ -535,6 +544,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
             prepared.BufferSources = sources;
         }
+
+    private static readonly System.Collections.Generic.HashSet<ulong> _unmappedBufferLogs = new();
+    private static void LogUnmappedBufferOnce(ulong address, ulong hash)
+    {
+        lock (_unmappedBufferLogs)
+        {
+            if (_unmappedBufferLogs.Add(address))
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][WARN] Buffer descriptor at unmapped address bound as null: address=0x{address:X16} hash=0x{hash:X16}");
+            }
+        }
+    }
 
         // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
         public void PrepareDeviceAddresses()
@@ -674,6 +696,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
 
+        private int _unmappedStorageBufferReports;
+
+        // SHARPEMU_BIND_UNMAPPED_NULL=1 binds the null buffer for a storage buffer that starts in
+        // unmapped memory instead of failing the dispatch. Off by default: in Ghost of Yotei the
+        // dispatches that then run hang the GPU queue at boot; the skipped dispatches reach the menus.
+        private static readonly bool BindUnmappedStorageAsNull =
+            Environment.GetEnvironmentVariable("SHARPEMU_BIND_UNMAPPED_NULL") == "1";
+
         // A storage buffer view on the cache buffer, aligned down with the adjustment carried in the memory offsets.
         private BufferView BindStorageBuffer(
             in BufferDescriptorWords descriptor,
@@ -693,7 +723,26 @@ internal static unsafe partial class VulkanVideoPresenter
                 return NullStorageBuffer();
             }
 
-            var size = ClampMappedSize(address, requested);
+            // A descriptor may name unmapped memory when the shader never reaches it: a branch
+            // that is not taken, or an indirect dispatch whose count is zero. One pass decides,
+            // as a guest thread can unmap the range between two separate checks.
+            if (!TryClampMappedSize(address, requested, out var size))
+            {
+                if (!BindUnmappedStorageAsNull)
+                {
+                    throw SubmissionScheduler.Fatal(
+                        $"The buffer range starts in unmapped memory: address=0x{address:X16} size=0x{requested:X16} buffer={slot} hash=0x{program.Hash:X16}.");
+                }
+
+                if (Interlocked.Increment(ref _unmappedStorageBufferReports) <= 16)
+                {
+                    Console.Error.WriteLine(
+                        $"[GPU][WARN] A storage buffer starts in unmapped memory; binding the null buffer: address=0x{address:X16} size=0x{requested:X} buffer={slot} hash=0x{program.Hash:X16}");
+                }
+
+                return NullStorageBuffer();
+            }
+
             var alignment = _minStorageBufferOffsetAlignment;
             var maxRange = _deviceInfo.MaxStorageBufferRange;
             if (alignment == 0 || size > maxRange)

@@ -14,7 +14,16 @@ public static class GuestMemoryLayout
             ? megabytes
             : 12800UL) * 1024 * 1024;
     public const ulong FlexibleBytes = 448UL * 1024 * 1024;
-    public static readonly ulong FlexibleOffset = DirectBytes;
-    public static readonly ulong BackingBytes = DirectBytes + FlexibleBytes;
+    // Flexible memory sits after the optional direct-memory slack so late direct
+    // allocations that draw past the reported pool never overlap it.
+    public static readonly ulong FlexibleOffset = DirectBytes + SlackBytes;
+    // Allocator headroom beyond the report (SHARPEMU_DIRECT_MEMORY_SLACK_MB): the guest
+    // still sees DirectBytes, but late heap growth can draw past it.
+    public static readonly ulong SlackBytes =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DIRECT_MEMORY_SLACK_MB"), out var slackMegabytes) &&
+        slackMegabytes > 0 && slackMegabytes <= 8192
+            ? slackMegabytes * 1024 * 1024
+            : 0UL;
+    public static readonly ulong BackingBytes = DirectBytes + SlackBytes + FlexibleBytes;
     public const ulong GuestPage = 0x4000;
 }

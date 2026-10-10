@@ -230,8 +230,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private ulong ClampMappedSize(ulong address, ulong size, PreparedStageBindings? prepared, int bufferIndex)
         {
-            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferMappedRangeValidation);
-            if (address == 0 || size == 0 || size > ulong.MaxValue - address || !_guestMemory.CanRead(address, 1))
+            if (address == 0 || size == 0 || size > ulong.MaxValue - address || !TryClampMappedSize(address, size, out var clamped))
             {
                 var context = string.Empty;
                 if (prepared is not null)
@@ -246,9 +245,24 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"The buffer range starts in unmapped memory: address=0x{address:X16} size=0x{size:X16}.{context}");
             }
 
+            return clamped;
+        }
+
+        // The mapped part of the range from its start, decided in one pass: a guest thread can
+        // unmap the range between two separate checks. False when the start is unmapped.
+        private bool TryClampMappedSize(ulong address, ulong size, out ulong mappedSize)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferMappedRangeValidation);
+            mappedSize = 0;
+            if (!_guestMemory.CanRead(address, 1))
+            {
+                return false;
+            }
+
             if (_guestMemory.CanRead(address, size))
             {
-                return size;
+                mappedSize = size;
+                return true;
             }
 
             // Keep the readable prefix only; a later mapping must not hide a gap.
@@ -272,7 +286,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 RenderTrace.Write($"Clamped a buffer range to its mapped part: address=0x{address:X16} size=0x{size:X16} clamped=0x{clamped:X16}");
             }
 
-            return clamped;
+            mappedSize = clamped;
+            return true;
         }
 
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)

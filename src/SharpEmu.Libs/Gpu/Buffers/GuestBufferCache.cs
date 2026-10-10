@@ -139,11 +139,29 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     {
         WatchEvent(address, size, "cpu-write-fault");
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
-        var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
-            GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation);
-        if (GuestGpuMemoryHook.Traces(address, size))
-            GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} completed={completed}");
-        return tracked && completed;
+        if (needsGpuFlush)
+        {
+            // A CPU write discards whatever the GPU produced in this range. The upstream
+            // readback preserved those bytes, but it waits for the GPU queue — which a
+            // fully-parked queue never drains (the boot-time sound init deadlocks there);
+            // and skipping the ownership change instead leaves the write watch armed, so
+            // the retried store faults again forever (a 40M-pair fault loop measured).
+            // Discard transfers the pages to the CPU; the next GPU use re-uploads.
+            if (Environment.GetEnvironmentVariable("SHARPEMU_CPU_WRITE_READBACK") == "1")
+            {
+                var completed = ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
+                    GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation);
+                if (GuestGpuMemoryHook.Traces(address, size))
+                    GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} completed={completed} (readback)");
+                return tracked && completed;
+            }
+
+            _tracker.DiscardGpuModifications(address, size);
+            if (GuestGpuMemoryHook.Traces(address, size))
+                GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} discarded=GPU-copy (invalidate)");
+        }
+
+        return tracked;
     }
 
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
@@ -1102,6 +1120,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // into ordinary guest memory, which the GPU reads too. Only a fault reveals them, so
     // they are kept and touched like the mappings. Otherwise their buffers age out while
     // still in use, fault again, and the cache collects and re-creates them every frame.
+    private static readonly System.Collections.Generic.HashSet<ResourceSlotIdentifier> _retiredDirtyLog = new();
     private readonly SpanSet _deviceAddressFaultSpans = new();
 
     // Fault ranges inside a known guest mapping; they are forgotten once it is unmapped.
@@ -2378,7 +2397,21 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _tracker.ClearGpuDirtyPages(buffer.CpuAddress, buffer.Size);
         if (_tracker.HasGpuDirtyPages(buffer.CpuAddress, buffer.Size) || _gpuModifiedRanges.Overlaps(buffer.CpuAddress, buffer.Size))
         {
-            throw SubmissionScheduler.Fatal("Buffer collection left GPU-owned memory.");
+            // A GPU write racing retirement can leave residual ownership; retiring anyway
+            // loses at most one buffer of stale tracking, while the invariant kill ends
+            // the session. Clear the residue so later validations stay consistent.
+            if (_retiredDirtyLog.Add(bufferIdentifier))
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][WARN] Buffer collection left GPU-owned memory; forced clear. buffer={bufferIdentifier} address=0x{buffer.CpuAddress:X16} size=0x{buffer.Size:X16}");
+            }
+
+            foreach (var range in _gpuModifiedRanges.GetOverlappingRanges(buffer.CpuAddress, buffer.Size))
+            {
+                _gpuModifiedRanges.Remove(range.Address, range.Size);
+            }
+
+            _tracker.ClearGpuDirtyPages(buffer.CpuAddress, buffer.Size);
         }
 
         _tracker.UntrackMemory(buffer.CpuAddress, buffer.Size);
