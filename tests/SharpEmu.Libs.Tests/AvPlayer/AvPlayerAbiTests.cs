@@ -366,12 +366,15 @@ public sealed class Videodec2PictureInfoAbiTests
         Assert.True(memory.TryWrite(address, initial));
         context[CpuRegister.Rdi] = ulong.MaxValue;
         context[flush ? CpuRegister.Rdx : CpuRegister.Rcx] = address;
+        // Both calls receive the frame buffer, whose accepted flag they clear.
+        context[flush ? CpuRegister.Rsi : CpuRegister.Rdx] = address + 0x60;
         Assert.Equal(0, flush
             ? SharpEmu.Libs.Codec.Videodec2Exports.Videodec2Flush(context)
             : SharpEmu.Libs.Codec.Videodec2Exports.Videodec2Decode(context));
         var actual = new byte[initial.Length];
         Assert.True(memory.TryRead(address, actual));
-        initial[8] = 0;
+        // No picture clears the ready flag, the error flag and the picture count.
+        initial.AsSpan(8, 4).Clear();
         Assert.Equal(initial, actual);
     }
 }
