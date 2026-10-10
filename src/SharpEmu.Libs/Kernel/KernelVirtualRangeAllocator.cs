@@ -65,12 +65,12 @@ internal static class KernelVirtualRangeAllocator
             mappedAddress = allocated;
             return true;
         }
-        catch
+        catch (Exception ex)
         {
             // Expected when a fixed-address request cannot be satisfied on
             // this host; the caller falls back or reports the failure.
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] {traceName}: no host mapping at 0x{desiredAddress:X16} len=0x{length:X}");
+                $"[LOADER][TRACE] {traceName}: no host mapping at 0x{desiredAddress:X16} len=0x{length:X} ex={ex.GetType().Name}: {ex.Message} {ex.StackTrace?.Split('\n').FirstOrDefault()}");
             return false;
         }
     }

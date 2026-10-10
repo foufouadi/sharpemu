@@ -273,6 +273,29 @@ public sealed class GuestPageTracker
         return tracked;
     }
 
+    // Drops GPU-dirty ownership for a range a CPU write is about to overwrite:
+    // the writer discards those bytes by definition, so downloading them first only
+    // adds latency — and stalls when the GPU queue is parked (the readback waits for
+    // work only the faulting thread's caller submits). The range becomes CPU-owned,
+    // the next GPU use re-uploads from the now-authoritative CPU pages.
+    public void DiscardGpuModifications(ulong vaddr, ulong size)
+    {
+        RejectUploadCallbackReentry();
+        ValidateRange(vaddr, size);
+        VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
+        {
+            using var _ = region.Lock.Hold();
+            var address = region.BaseAddress + offset;
+            if (region.IsModified(WriteOrigin.Gpu, offset, bytes))
+            {
+                region.ChangeState(WriteOrigin.Gpu, enable: false, address, bytes);
+            }
+
+            region.MarkCpuWrite(address, bytes);
+            return false;
+        });
+    }
+
     public void ForEachDownloadRange(ulong vaddr, ulong size, bool clear, Action<ulong, ulong>? preflight, Action<ulong, ulong> visit)
     {
         RejectUploadCallbackReentry();

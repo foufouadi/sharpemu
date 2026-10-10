@@ -1216,6 +1216,18 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         KernelModuleRegistry.RegisterModuleSymbols(handle, image.RuntimeSymbols);
         Console.Error.WriteLine(
             $"[RUNTIME] Registered module handle={handle} name={Path.GetFileName(modulePath)} base=0x{baseAddress:X16} size=0x{size:X16}");
+        if (isMain &&
+            Environment.GetEnvironmentVariable("SHARPEMU_KEEP_SCREAM") == "1" &&
+            baseAddress != 0 && size > 0x250d22)
+        {
+            // Ghost of Yotei tears its Scream tables down while worker threads still
+            // submit to them; keep them alive by neutering the teardown entry.
+            var teardown = baseAddress + 0x250c70;
+            if (_virtualMemory.TryWrite(teardown, new byte[] { 0xC3 }))
+            {
+                Console.Error.WriteLine($"[LOADER][INFO] keep-scream: ret at teardown 0x{teardown:X16}");
+            }
+        }
         return handle;
     }
 

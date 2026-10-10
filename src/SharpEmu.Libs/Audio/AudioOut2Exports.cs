@@ -912,10 +912,13 @@ public static class AudioOut2Exports
 
         Span<byte> state = stackalloc byte[PortStateSize];
         state.Clear();
-        //   +0x00 u16 output   = CONNECTED_PRIMARY (1)
-        //   +0x02 u8  channels = from port format when known, else 2
-        //   +0x03 u8  padding  = 0
-        //   +0x04 s16 volume   = 127 (full volume)
+        //   +0x00 u16 output       = CONNECTED_PRIMARY (1)
+        //   +0x02 u8  num_channels = from the port's data format when known, else 2.
+        //          Layout per Kyty's struct and the game's own reads: there is no
+        //          "active" byte — Ghost of Yōtei reads num_channels at +2 and uses
+        //          it to decide which Scream channel modes exist; anything other
+        //          than the channel count there makes sound init quit early.
+        //   +0x04 s16 volume       = 127 (full volume)
         byte channels = 2;
         if (Ports.TryGetValue(portHandle, out var port) &&
             TryDecodeDataFormat(port.DataFormat, out var decodedChannels, out _, out _))

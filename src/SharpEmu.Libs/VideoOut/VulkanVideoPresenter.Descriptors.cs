@@ -512,6 +512,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
+                if (!_guestMemory.CanRead(descriptor.Address, 1))
+                {
+                    // A descriptor pointing at unmapped memory (stale or not yet mapped by
+                    // the title) must not kill the host: bind nothing, like the null
+                    // descriptor above. The stage reads zeros for this buffer.
+                    LogUnmappedBufferOnce(descriptor.Address, program.Hash);
+                    sources[index] = (descriptor, default);
+                    continue;
+                }
+
                 var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
                 var resource = prepared.Resources.Info.Buffers[index];
                 if (resource.Formatted && resource.Written)
@@ -525,6 +535,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
             prepared.BufferSources = sources;
         }
+
+    private static readonly System.Collections.Generic.HashSet<ulong> _unmappedBufferLogs = new();
+    private static void LogUnmappedBufferOnce(ulong address, ulong hash)
+    {
+        lock (_unmappedBufferLogs)
+        {
+            if (_unmappedBufferLogs.Add(address))
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][WARN] Buffer descriptor at unmapped address bound as null: address=0x{address:X16} hash=0x{hash:X16}");
+            }
+        }
+    }
 
         // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
         public void PrepareDeviceAddresses()

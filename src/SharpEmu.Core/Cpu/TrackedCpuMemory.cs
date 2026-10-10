@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host.Posix;
 
 namespace SharpEmu.Core.Cpu;
 
@@ -20,9 +21,13 @@ public sealed class TrackedCpuMemory : ICpuMemory, ITrackedCpuMemory, IGuestMemo
 
     public string DescribeReadRange(ulong address, ulong size) => _inner.DescribeReadRange(address, size);
 
+    // Guest pointers can name the HLE libc/mspace heaps, which live in native host memory
+    // outside every guest region; UntrackedHostMemory serves those on hosts whose memory
+    // table cannot see them, as Win32 VirtualQuery does on Windows.
     public bool TryRead(ulong virtualAddress, Span<byte> destination)
     {
-        var result = _inner.TryRead(virtualAddress, destination);
+        var result = _inner.TryRead(virtualAddress, destination) ||
+            UntrackedHostMemory.TryRead(virtualAddress, destination);
         if (!result)
         {
             LastFailure = new CpuMemoryAccessFailure(virtualAddress, destination.Length, isWrite: false);
@@ -33,7 +38,8 @@ public sealed class TrackedCpuMemory : ICpuMemory, ITrackedCpuMemory, IGuestMemo
 
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
-        var result = _inner.TryWrite(virtualAddress, source);
+        var result = _inner.TryWrite(virtualAddress, source) ||
+            UntrackedHostMemory.TryWrite(virtualAddress, source);
         if (!result)
         {
             LastFailure = new CpuMemoryAccessFailure(virtualAddress, source.Length, isWrite: true);
@@ -45,8 +51,23 @@ public sealed class TrackedCpuMemory : ICpuMemory, ITrackedCpuMemory, IGuestMemo
     public bool TryCompare(
         ulong virtualAddress,
         ReadOnlySpan<byte> expected,
-        out bool equal) =>
-        _inner.TryCompare(virtualAddress, expected, out equal);
+        out bool equal)
+    {
+        if (_inner.TryCompare(virtualAddress, expected, out equal))
+        {
+            return true;
+        }
+
+        Span<byte> actual = expected.Length <= 256 ? stackalloc byte[expected.Length] : new byte[expected.Length];
+        if (!UntrackedHostMemory.TryRead(virtualAddress, actual))
+        {
+            equal = false;
+            return false;
+        }
+
+        equal = actual.SequenceEqual(expected);
+        return true;
+    }
 
     public bool TryCopy(ulong destinationAddress, ulong sourceAddress, ulong length) =>
         _inner.TryCopy(destinationAddress, sourceAddress, length);

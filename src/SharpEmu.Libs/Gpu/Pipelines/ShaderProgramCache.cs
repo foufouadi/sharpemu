@@ -171,7 +171,10 @@ internal sealed class ShaderProgramCache
         var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
         if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
         {
-            throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
+            // An unimplemented guest instruction must not kill the host: reject the
+            // program so non-strict callers skip the dispatch that wanted it.
+            throw new ShaderProgramRejectedException(
+                $"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
         _decoded.Add(key, program);
@@ -230,7 +233,7 @@ internal sealed class ShaderProgramCache
         }
     }
 
-    private sealed class ShaderProgramRejectedException(string message) : Exception(message);
+    internal sealed class ShaderProgramRejectedException(string message) : Exception(message);
 
     private ShaderProgram GetOrCompileCore(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage)
     {
@@ -292,9 +295,11 @@ internal sealed class ShaderProgramCache
                 // Set on this thread by the materialization that just failed; the cache only delegates to it.
                 if (ResourceMaterializer.LastFailureDetail is { } detail)
                     message = message[..^1] + $" detail={detail}.";
-                if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
-                    throw new ShaderProgramRejectedException(message);
-                throw SubmissionScheduler.Fatal(message);
+                // A shader whose resources cannot be constant-evaluated (dynamic descriptor
+                // indices through phis, data-dependent table reads) must not kill the host:
+                // reject the program so non-strict callers skip the draw. Ghost of Yōtei hits
+                // exactly this once minutes into its intro sequence (pixel hash 0xC3C05F72…).
+                throw new ShaderProgramRejectedException(message);
             }
 
             if (_host.RuntimeBufferStridesEnabled)
