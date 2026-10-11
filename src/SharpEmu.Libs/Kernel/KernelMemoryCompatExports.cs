@@ -1217,6 +1217,281 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // ---- sceLibcMspace family ----------------------------------------------
+    // Every mspace allocation is served from the shared zero-filled libc heap; the
+    // per-block records give free, realloc and usable-size their sizes and let destroy
+    // release a space. The caller's base and capacity are not needed for that.
+
+    private static readonly object MspaceGate = new();
+    private static readonly Dictionary<ulong, (ulong Handle, ulong Size)> MspaceBlocks = new();
+    private static ulong _nextMspaceHandle = 0x10UL;
+
+    private static bool TryMspaceAllocate(ulong handle, ulong size, ulong alignment, out ulong address)
+    {
+        if (size == 0)
+        {
+            size = 1;
+        }
+        if (!TryAllocateLibcHeap(size, (nuint)(alignment == 0 ? 16UL : alignment), zeroFill: true, out address))
+        {
+            return false;
+        }
+        lock (MspaceGate)
+        {
+            MspaceBlocks[address] = (handle, size);
+        }
+        return true;
+    }
+
+    private static void MspaceFreeBlock(ulong address)
+    {
+        lock (MspaceGate)
+        {
+            if (address == 0 || !MspaceBlocks.Remove(address))
+            {
+                return;
+            }
+        }
+        FreeLibcHeap(address);
+    }
+
+    private static ulong LookupMspaceBlockSize(ulong address)
+    {
+        lock (MspaceGate)
+        {
+            return MspaceBlocks.TryGetValue(address, out var block) ? block.Size : 0;
+        }
+    }
+
+    // Moves a block to a fresh allocation, copying what both sizes hold, as realloc does.
+    private static bool TryMspaceMove(CpuContext ctx, ulong handle, ulong existing, ulong size, ulong alignment, out ulong moved)
+    {
+        var previous = LookupMspaceBlockSize(existing);
+        if (!TryMspaceAllocate(handle, size, alignment, out moved))
+        {
+            return false;
+        }
+        var copy = new byte[Math.Min(previous, size)];
+        if (copy.Length > 0 && TryReadCompat(ctx, existing, copy))
+        {
+            _ = TryWriteCompat(ctx, moved, copy);
+        }
+        MspaceFreeBlock(existing);
+        return true;
+    }
+
+    [SysAbiExport(
+        Nid = "-hn1tcVHq5Q",
+        ExportName = "sceLibcMspaceCreate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceCreate(CpuContext ctx)
+    {
+        ulong handle;
+        lock (MspaceGate)
+        {
+            handle = _nextMspaceHandle++;
+        }
+        ctx[CpuRegister.Rax] = handle;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "W6SiVSiCDtI",
+        ExportName = "sceLibcMspaceDestroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceDestroy(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        List<ulong> owned;
+        lock (MspaceGate)
+        {
+            owned = MspaceBlocks.Where(b => b.Value.Handle == handle).Select(b => b.Key).ToList();
+        }
+        foreach (var address in owned)
+        {
+            MspaceFreeBlock(address);
+        }
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "OJjm-QOIHlI",
+        ExportName = "sceLibcMspaceMalloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMalloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var size = ctx[CpuRegister.Rsi];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, 16, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_malloc", size, 16, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "Vla-Z+eXlxo",
+        ExportName = "sceLibcMspaceFree",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceFree(CpuContext ctx)
+    {
+        MspaceFreeBlock(ctx[CpuRegister.Rsi]);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "iF1iQHzxBJU",
+        ExportName = "sceLibcMspaceMemalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMemalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var alignment = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_memalign", size, alignment, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "qWESlyXMI3E",
+        ExportName = "sceLibcMspacePosixMemalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspacePosixMemalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var outPointer = ctx[CpuRegister.Rsi];
+        var alignment = ctx[CpuRegister.Rdx];
+        var size = ctx[CpuRegister.Rcx];
+        if (outPointer != 0 && TryMspaceAllocate(handle, size, alignment, out var address) &&
+            TryWriteUInt64Compat(ctx, outPointer, address))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+        ctx[CpuRegister.Rax] = 0x8001000c;
+        return unchecked((int)0x8001000c);
+    }
+
+    [SysAbiExport(
+        Nid = "ljkqMcC4-mk",
+        ExportName = "sceLibcMspaceAlignedAlloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceAlignedAlloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var alignment = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var address) ? address : 0;
+        TraceLibcAllocation(ctx, "mspace_aligned_alloc", size, alignment, resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "LYo3GhIlB38",
+        ExportName = "sceLibcMspaceCalloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceCalloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var count = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        // The mspace heap zero-fills every block, so calloc needs no extra clear.
+        if (!TryMultiplyAllocationSize(count, size, out var total) ||
+            !TryMspaceAllocate(handle, total, 16, out var address))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = address;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "gigoVHZvVPE",
+        ExportName = "sceLibcMspaceRealloc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceRealloc(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var existing = ctx[CpuRegister.Rsi];
+        var size = ctx[CpuRegister.Rdx];
+        if (existing == 0)
+        {
+            ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, 16, out var fresh) ? fresh : 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        if (LookupMspaceBlockSize(existing) >= size)
+        {
+            ctx[CpuRegister.Rax] = existing;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = TryMspaceMove(ctx, handle, existing, size, 16, out var grown) ? grown : 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "p6lrRW8-MLY",
+        ExportName = "sceLibcMspaceReallocalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceReallocalign(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var existing = ctx[CpuRegister.Rsi];
+        var alignment = ctx[CpuRegister.Rdx];
+        var size = ctx[CpuRegister.Rcx];
+        if (existing == 0)
+        {
+            ctx[CpuRegister.Rax] = TryMspaceAllocate(handle, size, alignment, out var fresh) ? fresh : 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        ctx[CpuRegister.Rax] = TryMspaceMove(ctx, handle, existing, size, alignment, out var moved) ? moved : 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "fEoW6BJsPt4",
+        ExportName = "sceLibcMspaceMallocUsableSize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int MspaceMallocUsableSize(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rsi];
+        var size = LookupMspaceBlockSize(address);
+        if (size == 0)
+        {
+            size = LookupLibcAllocationSize(address);
+        }
+        ctx[CpuRegister.Rax] = size;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static ulong LookupLibcAllocationSize(ulong address)
+    {
+        if (address == 0)
+        {
+            return 0;
+        }
+        lock (_libcAllocations)
+        {
+            if (_libcAllocations.TryGetValue(address, out var allocation))
+            {
+                return allocation.Size;
+            }
+        }
+        return 0;
+    }
+
     [SysAbiExport(
         Nid = "tIhsqj0qsFE",
         ExportName = "free",
