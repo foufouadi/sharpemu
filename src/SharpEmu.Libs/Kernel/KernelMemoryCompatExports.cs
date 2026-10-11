@@ -161,9 +161,66 @@ public static partial class KernelMemoryCompatExports
     private static ulong _nextVirtualAddress;
     // Start the address search outside the host memory regions.
     // On macOS, also exclude the graphics memory region below 0x7000000000.
+    // HLE-data allocations use the probed Linux base, since host reservations can cover
+    // the classic one. Kernel-placed guest mappings keep GuestMapSearchBase: their backing
+    // only spans the pre-reserved guest arena, and a base above it makes every
+    // kernel-placed MapDirectMemory fail with ENOSPC.
     private static readonly ulong DefaultMapSearchBase =
         OperatingSystem.IsWindows() ? 0x1_0000_0000UL :
+        OperatingSystem.IsMacOS() ? 0x70_0000_0000UL : LinuxFreeMapSearchBase();
+
+    private static readonly ulong GuestMapSearchBase =
+        OperatingSystem.IsWindows() ? 0x1_0000_0000UL :
         OperatingSystem.IsMacOS() ? 0x70_0000_0000UL : 0x20_0000_0000UL;
+
+    // Linux loads the NVIDIA userspace driver (via SDL/GLX) into huge fixed
+    // reservations that commonly cover the previous 0x20_0000_0000 base, so
+    // MAP_FIXED_NOREPLACE fails at every candidate. Probe /proc/self/maps for
+    // the first 1 GiB-aligned free gap at or above 0x100_0000_0000.
+    private static ulong LinuxFreeMapSearchBase()
+    {
+        var occupied = new List<(ulong Start, ulong End)>();
+        try
+        {
+            foreach (var line in File.ReadLines("/proc/self/maps"))
+            {
+                var dash = line.IndexOf('-');
+                var space = line.IndexOf(' ', dash);
+                if (dash <= 0 || space <= dash ||
+                    !ulong.TryParse(line[..dash].AsSpan().Trim(), System.Globalization.NumberStyles.HexNumber, null, out var start) ||
+                    !ulong.TryParse(line.AsSpan(dash + 1, space - dash - 1).Trim(), System.Globalization.NumberStyles.HexNumber, null, out var end))
+                {
+                    continue;
+                }
+                occupied.Add((start, end));
+            }
+        }
+        catch
+        {
+            return 0x100_0000_0000UL;
+        }
+        occupied.Sort((a, b) => a.Start.CompareTo(b.Start));
+        // Stay above GuestSpaceOwner's pre-reserved guest arena
+        // [0x10_0000_0000, 0xFC_0000_0000) and below the host library area.
+        const ulong probe = 0x100_0000_0000UL;
+        const ulong limit = 0x4000_0000_0000UL;
+        const ulong size = 0x4000_0000UL;
+        var candidate = probe;
+        var index = 0;
+        while (candidate + size <= limit)
+        {
+            while (index < occupied.Count && occupied[index].End <= candidate)
+            {
+                index++;
+            }
+            if (index >= occupied.Count || occupied[index].Start >= candidate + size)
+            {
+                return candidate;
+            }
+            candidate = Math.Max(candidate + 0x4000_0000UL, (occupied[index].End + 0x3FFF_FFFFUL) & ~0x3FFF_FFFFUL);
+        }
+        return 0x100_0000_0000UL;
+    }
     private static ulong _threadAtexitCountCallback;
     private static ulong _threadAtexitReportCallback;
     private static ulong _threadDtorsCallback;
