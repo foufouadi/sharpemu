@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.HLE.GpuMemory;
+using SharpEmu.HLE.Host.Posix;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Ampr;
 using SharpEmu.Libs.Media;
@@ -6505,9 +6506,14 @@ public static partial class KernelMemoryCompatExports
 
     private static unsafe bool TryReadHostMemory(ulong address, Span<byte> destination)
     {
-        if (destination.IsEmpty || !IsHostRangeAccessible(address, (ulong)destination.Length, writeAccess: false))
+        if (destination.IsEmpty)
         {
             return false;
+        }
+
+        if (!IsHostRangeAccessible(address, (ulong)destination.Length, writeAccess: false))
+        {
+            return UntrackedHostMemory.TryRead(address, destination);
         }
 
         try
@@ -6868,9 +6874,14 @@ public static partial class KernelMemoryCompatExports
 
     private static unsafe bool TryWriteHostMemory(ulong address, ReadOnlySpan<byte> source)
     {
-        if (source.IsEmpty || !IsHostRangeAccessible(address, (ulong)source.Length, writeAccess: true))
+        if (source.IsEmpty)
         {
             return false;
+        }
+
+        if (!IsHostRangeAccessible(address, (ulong)source.Length, writeAccess: true))
+        {
+            return UntrackedHostMemory.TryWrite(address, source);
         }
 
         try
