@@ -2344,6 +2344,45 @@ public static partial class Gen5SpirvTranslator
                     StoreV(instruction.Destinations[0].Value, Bitcast(_uintType, signedByte));
                     return true;
                 }
+                case "DsReadU8":
+                case "DsReadI16":
+                case "DsReadU16":
+                {
+                    // Narrow LDS loads share the I8 path; only the extract width and
+                    // signedness differ (U8/I16/U16 were unimplemented DS opcodes).
+                    if (instruction.Destinations.Count < 1 || instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS narrow read operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var byteAddress = control.SingleOffsetBytes == 0
+                        ? address
+                        : IAdd(address, UInt(control.SingleOffsetBytes));
+                    var word = Load(_uintType, LdsPointer(address, control.SingleOffsetBytes));
+                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+                    var packed = ShiftRightLogical(word, shift);
+                    var signed = instruction.Opcode is "DsReadI16";
+                    var width = instruction.Opcode is "DsReadI16" or "DsReadU16" ? 16u : 8u;
+                    var extracted = signed
+                        ? Bitcast(
+                            _uintType,
+                            _module.AddInstruction(
+                                SpirvOp.BitFieldSExtract,
+                                _intType,
+                                Bitcast(_intType, packed),
+                                UInt(0),
+                                UInt(width)))
+                        : _module.AddInstruction(
+                            SpirvOp.BitFieldUExtract,
+                            _uintType,
+                            packed,
+                            UInt(0),
+                            UInt(width));
+                    StoreV(instruction.Destinations[0].Value, extracted);
+                    return true;
+                }
                 case "DsReadB64":
                 case "DsReadB96":
                 case "DsReadB128":
@@ -2394,6 +2433,83 @@ public static partial class Gen5SpirvTranslator
                             EffectiveDsPairOffsetBytes(control.Offset1, st64)));
                     StoreV(instruction.Destinations[0].Value, first);
                     StoreV(instruction.Destinations[1].Value, second);
+                    return true;
+                }
+                case "DsWriteB16":
+                {
+                    // MEM[ADDR][15:0] = DATA[15:0]. LDS is an array of dwords, and neighboring
+                    // lanes often write the two halves of one dword, so the half is replaced
+                    // with two atomics on its dword (clear, then set) instead of a load and
+                    // store that would lose the other lane's half. The address is 2-byte aligned.
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = "missing LDS write source";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var pointer = LdsPointer(address, control.SingleOffsetBytes);
+                    var byteAddress = control.SingleOffsetBytes == 0
+                        ? address
+                        : IAdd(address, UInt(control.SingleOffsetBytes));
+                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(2)), UInt(3));
+                    var mask = ShiftLeftLogical(UInt(0xFFFF), shift);
+                    var half = ShiftLeftLogical(BitwiseAnd(GetRawSource(instruction, 1), UInt(0xFFFF)), shift);
+                    EmitExecConditional(() =>
+                    {
+                        EmitAtomic(
+                            SpirvOp.AtomicAnd,
+                            _uintType,
+                            pointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => _module.AddInstruction(SpirvOp.Not, _uintType, mask),
+                            comparator: () => mask);
+                        EmitAtomic(
+                            SpirvOp.AtomicOr,
+                            _uintType,
+                            pointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => half,
+                            comparator: () => half);
+                    });
+                    return true;
+                }
+                case "DsWrxchg2St64RtnB32":
+                {
+                    // Exchanges two dwords 64 dwords apart (offset * 256 bytes) and returns
+                    // both previous values: RETURN_DATA = {tmp2, tmp1}.
+                    if (instruction.Destinations.Count < 2 || instruction.Sources.Count < 3)
+                    {
+                        error = "missing LDS wrxchg2 operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var firstPointer = LdsPointer(address, EffectiveDsPairOffsetBytes(control.Offset0, st64: true));
+                    var secondPointer = LdsPointer(address, EffectiveDsPairOffsetBytes(control.Offset1, st64: true));
+                    EmitExecConditional(() =>
+                    {
+                        var firstOld = EmitAtomic(
+                            SpirvOp.AtomicExchange,
+                            _uintType,
+                            firstPointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => GetRawSource(instruction, 1),
+                            comparator: () => GetRawSource(instruction, 1));
+                        var secondOld = EmitAtomic(
+                            SpirvOp.AtomicExchange,
+                            _uintType,
+                            secondPointer,
+                            scope: 2,
+                            semantics: 0x108,
+                            value: () => GetRawSource(instruction, 2),
+                            comparator: () => GetRawSource(instruction, 2));
+                        StoreV(instruction.Destinations[0].Value, firstOld);
+                        StoreV(instruction.Destinations[1].Value, secondOld);
+                    });
                     return true;
                 }
                 default:

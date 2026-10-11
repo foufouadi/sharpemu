@@ -242,6 +242,33 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(3u, control.SingleOffsetBytes);
     }
 
+    [Fact]
+    public void DsWriteB16_IsOpcode31()
+    {
+        // DS_WRITE_B16 v7, v9 offset:2 (opcode 31, RDNA2 ISA 13.5)
+        var instruction = DecodeSingle(0xD87C0002, 0x00000907);
+
+        Assert.Equal("DsWriteB16", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(7), Gen5Operand.Vector(9) }, instruction.Sources);
+        Assert.Empty(instruction.Destinations);
+        var control = Assert.IsType<Gen5DataShareControl>(instruction.Control);
+        Assert.Equal(2u, control.SingleOffsetBytes);
+    }
+
+    [Fact]
+    public void DsWrxchg2St64RtnB32_IsOpcode47AndReturnsBothDwords()
+    {
+        // DS_WRXCHG2ST64_RTN_B32 v[5:6], v7, v8, v9 offset0:1 offset1:2 (opcode 47)
+        var instruction = DecodeSingle(0xD8BC0201, 0x05090807);
+
+        Assert.Equal("DsWrxchg2St64RtnB32", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(7), Gen5Operand.Vector(8), Gen5Operand.Vector(9) }, instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(5), Gen5Operand.Vector(6) }, instruction.Destinations);
+        var control = Assert.IsType<Gen5DataShareControl>(instruction.Control);
+        Assert.Equal(1u, control.Offset0);
+        Assert.Equal(2u, control.Offset1);
+    }
+
     [Theory]
     [InlineData(0xD8F83412u, "DsAppend", false)]
     [InlineData(0xD8FA3412u, "DsAppend", true)]
