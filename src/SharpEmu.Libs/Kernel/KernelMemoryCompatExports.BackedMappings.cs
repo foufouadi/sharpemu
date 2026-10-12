@@ -297,7 +297,7 @@ public static partial class KernelMemoryCompatExports
             address = requested;
             return true;
         }
-        var desired = requested != 0 ? requested : DefaultMapSearchBase;
+        var desired = requested != 0 ? requested : GuestMapSearchBase;
         while (true)
         {
             var hintedRegions = reuseReservation && desired == requested && requested != 0

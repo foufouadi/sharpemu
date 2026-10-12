@@ -1456,6 +1456,11 @@ public static partial class Gen5SpirvTranslator
                 case "VPkSubI16":
                     result = EmitPackedI16Arithmetic(instruction, subtract: true);
                     break;
+                case "VPkLshlrevB16":
+                case "VPkLshrrevB16":
+                case "VPkAshrrevI16":
+                    result = EmitPackedI16Shift(instruction);
+                    break;
                 case "VPkFmacF16":
                     result = EmitPackedF16Fmac(instruction, destination);
                     break;
@@ -1469,6 +1474,7 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 case "VAddNcI16":
+                case "VMulLoU16":
                 case "VSubNcU16":
                 case "VSubNcI16":
                 case "VLshrrevB16":
@@ -1498,6 +1504,11 @@ public static partial class Gen5SpirvTranslator
                         case "VSubNcU16":
                         case "VSubNcI16":
                             value = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                            break;
+                        case "VMulLoU16":
+                            // 16-bit operands already zero-extended by GetInt16Source;
+                            // EmitInt16Result truncates the product to the low half.
+                            value = _module.AddInstruction(SpirvOp.IMul, _uintType, left, right);
                             break;
                         case "VLshrrevB16":
                             value = ShiftRightLogical(right, BitwiseAnd(left, UInt(15)));
@@ -1732,6 +1743,51 @@ public static partial class Gen5SpirvTranslator
         // src1. The packed integer result is modulo 16 bits in each lane; the
         // signed and unsigned forms therefore share the same bit-level
         // implementation.
+        // V_PK_LSHLREV_B16 / V_PK_LSHRREV_B16 / V_PK_ASHRREV_I16: per-half shifts of source 1
+        // by source 0's half, masked to 4 bits (the REV forms take the count first). OP_SEL
+        // and OP_SEL_HI pick each source's half: bit 0 for source 0, bit 1 for source 1.
+        private uint EmitPackedI16Shift(Gen5ShaderInstruction instruction)
+        {
+            var control = (Gen5Vop3pControl)instruction.Control!;
+            var left = GetRawSource(instruction, 0);
+            var right = GetRawSource(instruction, 1);
+
+            uint SelectHalf(uint value, uint mask, int source)
+            {
+                return ((mask >> source) & 1) != 0
+                    ? ShiftRightLogical(value, UInt(16))
+                    : value;
+            }
+
+            uint Shift(uint lane, uint amount)
+            {
+                var masked = BitwiseAnd(amount, UInt(15));
+                return instruction.Opcode switch
+                {
+                    "VPkLshlrevB16" => ShiftLeftLogical(lane, masked),
+                    "VPkLshrrevB16" => ShiftRightLogical(lane, masked),
+                    // The half is zero-extended in 32 bits; sign-extend it from bit 15 first.
+                    _ => Bitcast(
+                        _uintType,
+                        ShiftRightArithmetic(
+                            _module.AddInstruction(SpirvOp.BitFieldSExtract, _intType, Bitcast(_intType, lane), UInt(0), UInt(16)),
+                            masked)),
+                };
+            }
+
+            var low = BitwiseAnd(
+                Shift(
+                    BitwiseAnd(SelectHalf(right, control.OpSelMask, 1), UInt(0xFFFF)),
+                    BitwiseAnd(SelectHalf(left, control.OpSelMask, 0), UInt(0xFFFF))),
+                UInt(0xFFFF));
+            var high = BitwiseAnd(
+                Shift(
+                    BitwiseAnd(SelectHalf(right, control.OpSelHiMask, 1), UInt(0xFFFF)),
+                    BitwiseAnd(SelectHalf(left, control.OpSelHiMask, 0), UInt(0xFFFF))),
+                UInt(0xFFFF));
+            return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+        }
+
         private uint EmitPackedI16Arithmetic(Gen5ShaderInstruction instruction, bool subtract)
         {
             var control = (Gen5Vop3pControl)instruction.Control!;
