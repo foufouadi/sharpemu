@@ -115,7 +115,8 @@ public sealed class Ps5Package : IGamePackage
         long progressStepBytes,
         long? availableBytes,
         long chunkBytes,
-        int maxParallelism)
+        int maxParallelism,
+        bool? sparseVolume = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkBytes, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxParallelism, 1);
@@ -131,7 +132,21 @@ public sealed class Ps5Package : IGamePackage
             .Select(file => (Path: PkgPackage.ResolveSafe(destination, file.Components), File: file))
             .ToList();
 
-        var needed = total + _cnt.FilesSize;
+        // Sparse regions stay holes on a volume with sparse files, so only the stored bytes need room.
+        // Elsewhere SetLength allocates the whole file.
+        var needed = _cnt.FilesSize;
+        if (sparseVolume ?? SupportsSparseFiles(destination))
+        {
+            foreach (var (_, file) in targets)
+            {
+                needed += image.StoredBytes(file.Logical, file.Size);
+            }
+        }
+        else
+        {
+            needed += total;
+        }
+
         if (availableBytes is { } available && available < needed)
         {
             throw new IOException(string.Create(
@@ -157,7 +172,7 @@ public sealed class Ps5Package : IGamePackage
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             using (var created = File.OpenHandle(path, FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                MarkSparse(created);
+                _ = MarkSparse(created);
                 RandomAccess.SetLength(created, file.Size);
             }
 
@@ -202,11 +217,24 @@ public sealed class Ps5Package : IGamePackage
         cancellation.ThrowIfCancellationRequested();
         using var output = File.OpenHandle(item.Path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
         var position = item.Offset;
+        // Zero data is never written: SetLength already made the file read as zeros there, on NTFS
+        // as a hole and on any other volume (FAT32 zero-fills the extension, exFAT keeps a valid
+        // data length below the new size and returns zeros past it, POSIX ftruncate reads zeros).
+        // So skipping is correct even when MarkSparse failed; it only saves space where sparse.
         reader.CopyTo(item.Logical + item.Offset, item.Length, chunk =>
         {
-            RandomAccess.Write(output, chunk, position);
+            if (chunk.IndexOfAnyExcept((byte)0) >= 0)
+            {
+                RandomAccess.Write(output, chunk, position);
+            }
+
             position += chunk.Length;
             tracker.Add(chunk.Length, item.Relative);
+            cancellation.ThrowIfCancellationRequested();
+        }, count =>
+        {
+            position += count;
+            tracker.Add(count, item.Relative);
             cancellation.ThrowIfCancellationRequested();
         });
     }
@@ -231,15 +259,45 @@ public sealed class Ps5Package : IGamePackage
 
     // Workers write the ranges of one file out of order. NTFS zero-fills everything between the
     // last written byte and a write past it, so a non-sparse file would get most of its bytes
-    // written twice; a sparse file skips that fill. The file ends fully written, so no hole is
-    // left. Volumes without sparse support (FAT, exFAT) just keep the zero fill.
-    private static void MarkSparse(Microsoft.Win32.SafeHandles.SafeFileHandle handle)
+    // written twice; a sparse file skips that fill and keeps the zero ranges we never write as
+    // holes. Volumes without sparse support (FAT, exFAT) fail here and just keep the zero fill.
+    private static bool MarkSparse(Microsoft.Win32.SafeHandles.SafeFileHandle handle) =>
+        OperatingSystem.IsWindows() && DeviceIoControl(handle, FsctlSetSparse, 0, 0, 0, 0, out _, 0);
+
+    // Whether the volume of `destination` can hold sparse files (FILE_SUPPORTS_SPARSE_FILES).
+    // Only Windows is probed; elsewhere the free-space check stays conservative.
+    private static bool SupportsSparseFiles(string destination)
     {
-        if (OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows())
         {
-            _ = DeviceIoControl(handle, FsctlSetSparse, 0, 0, 0, 0, out _, 0);
+            return false;
+        }
+
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(destination));
+            return !string.IsNullOrEmpty(root)
+                && GetVolumeInformation(root, null, 0, out _, out _, out var flags, null, 0)
+                && (flags & FileSupportsSparseFiles) != 0;
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
         }
     }
+
+    private const uint FileSupportsSparseFiles = 0x40;
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumeInformation(
+        string rootPathName,
+        char[]? volumeNameBuffer,
+        uint volumeNameSize,
+        out uint serialNumber,
+        out uint maximumComponentLength,
+        out uint fileSystemFlags,
+        char[]? fileSystemNameBuffer,
+        uint fileSystemNameSize);
 
     private const uint FsctlSetSparse = 0x000900C4;
 

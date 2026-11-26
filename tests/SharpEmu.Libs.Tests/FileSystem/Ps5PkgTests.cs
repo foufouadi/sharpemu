@@ -138,6 +138,52 @@ public sealed class Ps5PkgTests
     }
 
     [Fact]
+    public void ASparseRegionExtractsAsZerosAndStaysAHoleOnNtfs()
+    {
+        var built = BuildPackage(new Spec());
+        WithPackage(built.Bytes, (package, destination) =>
+        {
+            var reports = new List<PkgExtractProgress>();
+            package.Extract(destination, new CollectingProgress<PkgExtractProgress>(reports.Add), default, 1, null);
+
+            var path = Path.Combine(destination, "assets", "sparse.bin");
+            Assert.All(File.ReadAllBytes(path), b => Assert.Equal(0, b));
+            Assert.Equal((built.GameBytes, built.GameBytes), (reports[^1].BytesDone, reports[^1].BytesTotal));
+
+            var root = Path.GetPathRoot(Path.GetFullPath(destination))!;
+            if (OperatingSystem.IsWindows() && string.Equals(new DriveInfo(root).DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
+            {
+                var low = GetCompressedFileSizeW(path, out var high);
+                var onDisk = ((long)high << 32) | low;
+                Assert.True(onDisk < new FileInfo(path).Length, $"{onDisk} bytes allocated");
+            }
+        });
+    }
+
+    [Fact]
+    public void TheFreeSpaceCheckCountsOnlyStoredBytesOnASparseVolume()
+    {
+        var built = BuildPackage(new Spec());
+        WithPackage(built.Bytes, (package, destination) =>
+        {
+            var metadata = package.GetInstalledSize() - built.GameBytes;
+            var stored = built.GameBytes - 0x2000 + metadata;
+
+            Assert.Throws<IOException>(() => package.Extract(
+                destination, null, default, PkgPackage.ProgressStepBytes, stored - 1, 0x8000, 2, sparseVolume: true));
+            Assert.False(Directory.Exists(destination));
+
+            // The same space is too little for a volume that allocates the whole file.
+            Assert.Throws<IOException>(() => package.Extract(
+                destination, null, default, PkgPackage.ProgressStepBytes, stored, 0x8000, 2, sparseVolume: false));
+            Assert.False(Directory.Exists(destination));
+
+            package.Extract(destination, null, default, PkgPackage.ProgressStepBytes, stored, 0x8000, 2, sparseVolume: true);
+            Assert.True(File.Exists(Path.Combine(destination, "eboot.bin")));
+        });
+    }
+
+    [Fact]
     public void ExtractReportsProgressInsideAFile()
     {
         WithPackage(BuildPackage(new Spec()).Bytes, (package, destination) =>
@@ -194,10 +240,11 @@ public sealed class Ps5PkgTests
         WithPackage(BuildPackage(new Spec()).Bytes, (package, destination) =>
         {
             var needed = package.GetInstalledSize();
-            Assert.Throws<IOException>(() => package.Extract(destination, null, default, PkgPackage.ProgressStepBytes, needed - 1));
+            // A volume without sparse files allocates the whole logical size.
+            Assert.Throws<IOException>(() => package.Extract(destination, null, default, PkgPackage.ProgressStepBytes, needed - 1, 0x8000, 2, sparseVolume: false));
             Assert.False(Directory.Exists(destination));
 
-            package.Extract(destination, null, default, PkgPackage.ProgressStepBytes, needed);
+            package.Extract(destination, null, default, PkgPackage.ProgressStepBytes, needed, 0x8000, 2, sparseVolume: false);
             Assert.True(File.Exists(Path.Combine(destination, "eboot.bin")));
         });
     }
@@ -998,6 +1045,9 @@ public sealed class Ps5PkgTests
             }
         }
     }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetCompressedFileSizeW(string fileName, out uint fileSizeHigh);
 
     private sealed class CollectingProgress<T>(Action<T> handler) : IProgress<T>
     {

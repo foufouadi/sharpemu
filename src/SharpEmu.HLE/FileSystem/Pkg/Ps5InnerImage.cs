@@ -35,7 +35,11 @@ internal sealed class Ps5InnerImage
     // Reader behind ReadAt and CopyTo; not shared with the parallel extraction workers.
     private readonly BlockReader _defaultReader;
 
-    internal readonly record struct UBlock(long Logical, long OnDisk, uint Compressed, uint Uncompressed, bool Kraken, uint EvenComp, uint Flags);
+    internal readonly record struct UBlock(long Logical, long OnDisk, uint Compressed, uint Uncompressed, bool Kraken, uint EvenComp, uint Flags)
+    {
+        // Only AppendSparse makes a block with no stored payload; it reads as zeros.
+        public bool IsSparse => Compressed == 0;
+    }
 
     private Ps5InnerImage(Ps5OuterFile image, UBlock[] blocks, ulong[] boundaries, long mount)
     {
@@ -236,6 +240,32 @@ internal sealed class Ps5InnerImage
 
     public delegate void SpanAction(ReadOnlySpan<byte> chunk);
 
+    // Bytes of [logical, logical + size) that are stored, i.e. not inside a sparse region.
+    public long StoredBytes(long logical, long size)
+    {
+        if (logical < 0 || size < 0 || size > long.MaxValue - logical)
+        {
+            throw new InvalidDataException("A logical range of the inner image overflows.");
+        }
+
+        long stored = 0;
+        var position = logical;
+        var end = logical + size;
+        while (position < end)
+        {
+            var block = _blocks[FindBlock(position)];
+            var count = Math.Min(block.Logical + block.Uncompressed - position, end - position);
+            if (!block.IsSparse)
+            {
+                stored += count;
+            }
+
+            position += count;
+        }
+
+        return stored;
+    }
+
     private int PartitionPoint(Func<UBlock, bool> predicate)
     {
         int low = 0, high = _blocks.Length;
@@ -276,8 +306,9 @@ internal sealed class Ps5InnerImage
 
         internal BlockReader(Ps5InnerImage owner) => _owner = owner;
 
-        // Streams logical bytes to `sink` one block at a time.
-        public void CopyTo(long logical, long size, SpanAction sink)
+        // Streams logical bytes to `sink` one block at a time. With `skipSparse`, a sparse block is
+        // reported by its length instead of being produced as zeros.
+        public void CopyTo(long logical, long size, SpanAction sink, Action<int>? skipSparse = null)
         {
             if (logical < 0 || size < 0 || size > long.MaxValue - logical)
             {
@@ -292,6 +323,13 @@ internal sealed class Ps5InnerImage
                 var block = _owner._blocks[index];
                 var within = (int)(position - block.Logical);
                 var count = (int)Math.Min(block.Uncompressed - within, end - position);
+                if (skipSparse is not null && block.IsSparse)
+                {
+                    skipSparse(count);
+                    position += count;
+                    continue;
+                }
+
                 LoadBlock(index);
                 sink(_decoded.AsSpan(within, count));
                 position += count;
