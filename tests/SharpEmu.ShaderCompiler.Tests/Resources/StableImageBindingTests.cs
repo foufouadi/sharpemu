@@ -78,6 +78,47 @@ public sealed class StableImageBindingTests
         Assert.False(ExtractWith(1).StableImageBindings);
     }
 
+    // A plan the stable policy rejects (here: no sampler budget) whose images still fit with a binding each keeps one per
+    // slot, so equal descriptors coming and going do not compile another variant.
+    [Fact]
+    public void AliasPartitionChangesKeepUngroupedSpecializationsEqual()
+    {
+        var plan = Plan(new StableImageDescriptorLimits(64, 64, 0, 64, 256));
+        Assert.False(plan.StableImageBindings);
+        Assert.True(plan.UngroupedImageBindings);
+        var memory = new TestWordMemory { Words = new uint[0x10000 / 4] };
+        uint[][] partitions =
+        [
+            [0, 1, 2, 1, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2],
+            [0, 1, 1, 1, 4, 1, 1, 1, 8, 8, 8, 8, 8, 8, 8, 8],
+        ];
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        var versions = new List<ResourceSpecialization>();
+        foreach (var partition in partitions)
+        {
+            for (var index = 0; index < partition.Length; index++)
+            {
+                var image = ResourceTrackerTests.ImageDescriptor();
+                image[0] += partition[index];
+                ResourceTrackerTests.WriteImage(memory, 0x1000 + (ulong)index * 32, image);
+            }
+            Assert.True(ResourceMaterializer.Materialize(plan, Inputs([0x1000, 0], memory.Read, memory.Read),
+                ref snapshot, ref specialization));
+            Assert.Empty(specialization.ImageDescriptorGroups);
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            var layout = BindingLayout.Allocate(resources.Info, [0, 1], false, true, false);
+            Assert.Equal(16, layout.Descriptors
+                .Where(binding => ImageDescriptorBinding.ResourceClass(binding.Kind) == ImageResourceClass.Sampled)
+                .Sum(binding => binding.Resources.Count));
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout),
+                out _, out var error), error);
+            versions.Add(specialization.Clone());
+        }
+        Assert.Equal(versions[0].ImageDescriptorGroups, versions[1].ImageDescriptorGroups);
+        Assert.Equal(versions[0].Images, versions[1].Images);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

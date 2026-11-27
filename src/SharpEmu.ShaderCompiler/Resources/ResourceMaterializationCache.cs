@@ -2371,7 +2371,7 @@ public sealed partial class ResourceMaterializationCache
             current[image] = patched;
         }
 
-        return DescriptorBindingAliases.Group(current, entry.Specialization.Images).SequenceEqual(entry.Specialization.ImageDescriptorGroups);
+        return DescriptorBindingAliases.GroupImages(entry.Plan, current, entry.Specialization.Images).SequenceEqual(entry.Specialization.ImageDescriptorGroups);
     }
 
     private static ResourceSnapshot WithMipStatistics(ResourceSnapshot snapshot, uint[] statistics) => new()

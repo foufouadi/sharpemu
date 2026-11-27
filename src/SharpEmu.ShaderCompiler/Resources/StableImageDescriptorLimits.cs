@@ -37,4 +37,25 @@ public readonly record struct StableImageDescriptorLimits(
         return sampled <= SampledImages && storage <= StorageImages && samplers <= Samplers &&
             buffers <= StorageBuffers && sampled + storage + buffers <= Resources;
     }
+
+    // Whether a plan that is not stable can still give each of its own images a binding instead of grouping equal
+    // descriptors. Indirect candidates and runtime tables are not known yet: they keep their own bindings either way,
+    // so the plan's own images, a binding per mip where a mip is chosen at run time, take at most half of each limit.
+    internal bool FitsEachImage(ShaderResourcePlan plan)
+    {
+        var info = plan.Info;
+        if (Resources == 0 || info.Images.Count < 2 || Gen5ShaderCallLinker.IsLinked(plan.Graph.Program)) return false;
+        ulong sampled = 0, storage = 0;
+        foreach (var image in info.Images)
+        {
+            if (image.IndirectRoot != DescriptorConstants.NoIndex) continue;
+            ulong descriptors = image.MipMode == ImageMipMode.None ? 1UL : Math.Max(1UL, image.MipCount);
+            if (image.ResourceClass == ImageResourceClass.Sampled) sampled += descriptors;
+            else storage += descriptors;
+        }
+
+        ulong buffers = (ulong)info.Buffers.Count + 6;
+        return sampled <= SampledImages / 2 && storage <= StorageImages / 2 &&
+            sampled + storage + buffers <= Resources / 2;
+    }
 }

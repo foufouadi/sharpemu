@@ -475,7 +475,7 @@ public static partial class ResourceMaterializer
             {
                 if (candidate is SpecializationMemo entry && MatchesOutput(entry, output, bufferCount, imageCount, samplerCount, out statisticsDiffer) &&
                     (!statisticsDiffer || entry.Specialization.ImageDescriptorGroups.SequenceEqual(
-                        OutputImageGroups(output, bufferCount, imageCount, entry.Specialization.Images))))
+                        OutputImageGroups(plan, output, bufferCount, imageCount, entry.Specialization.Images))))
                 {
                     memo = entry;
                     break;
@@ -541,7 +541,7 @@ public static partial class ResourceMaterializer
         return SpecializeAndRemember(plan, inputs, materialized, ranges, memos, ref snapshot, ref specialization, out failure);
     }
 
-    private static List<uint> OutputImageGroups(MaterializationProgram.Output output, int bufferCount, int imageCount,
+    private static List<uint> OutputImageGroups(ShaderResourcePlan plan, MaterializationProgram.Output output, int bufferCount, int imageCount,
         IReadOnlyList<ImageSpecialization> views)
     {
         var images = new uint[imageCount][];
@@ -550,7 +550,7 @@ public static partial class ResourceMaterializer
             images[index] = output.Source(bufferCount + index).ToArray();
         }
 
-        return DescriptorBindingAliases.Group(images, views);
+        return DescriptorBindingAliases.GroupImages(plan, images, views);
     }
 
     private static bool MatchesOutput(SpecializationMemo memo, MaterializationProgram.Output output, int bufferCount, int imageCount, int samplerCount,
@@ -637,7 +637,7 @@ public static partial class ResourceMaterializer
             {
                 if (candidate is SpecializationMemo entry && MatchesMemo(entry, materialized, out statisticsDiffer) &&
                     (!statisticsDiffer || entry.Specialization.ImageDescriptorGroups.SequenceEqual(
-                        DescriptorBindingAliases.Group(materialized.Images, entry.Specialization.Images))))
+                        DescriptorBindingAliases.GroupImages(plan, materialized.Images, entry.Specialization.Images))))
                 {
                     memo = entry;
                     break;
@@ -2357,7 +2357,7 @@ public static partial class ResourceMaterializer
             Buffers = buffers,
             Images = images,
             BufferCandidateTables = candidateTables,
-            ImageDescriptorGroups = plan.StableImageBindings ? [] : DescriptorBindingAliases.Group(snapshot.Images, images),
+            ImageDescriptorGroups = DescriptorBindingAliases.GroupImages(plan, snapshot.Images, images),
             SamplerDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Samplers.Take(info.Samplers.Count).ToArray()),
         };
         specializedSnapshot = snapshot;

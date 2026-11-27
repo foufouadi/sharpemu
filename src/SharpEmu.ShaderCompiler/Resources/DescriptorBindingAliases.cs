@@ -20,6 +20,14 @@ internal static class DescriptorBindingAliases
         }
     }
 
+    // The image groups of a plan's specialization. Grouping equal descriptors only saves bindings, and it keys the program
+    // on which slots happen to hold the same image: a pass that leaves a few slots null or points two at one texture
+    // compiles another variant of a shader that can take seconds to build. A plan whose images all fit the host's
+    // limits with a binding each therefore keeps one per slot, like a stable plan.
+    public static List<uint> GroupImages(ShaderResourcePlan plan, IReadOnlyList<uint[]> descriptors,
+        IReadOnlyList<ImageSpecialization> images) =>
+        plan.StableImageBindings || plan.UngroupedImageBindings ? [] : Group(descriptors, images);
+
     // Images of an indirect table keep their own bindings (see Apply), so they take no part in a group: a table that pads
     // its candidates with null images does not change the specialization of its program.
     public static List<uint> Group(IReadOnlyList<uint[]> descriptors, IReadOnlyList<ImageSpecialization>? images = null)

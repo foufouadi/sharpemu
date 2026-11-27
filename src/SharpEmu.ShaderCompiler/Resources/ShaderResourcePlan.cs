@@ -60,6 +60,9 @@ public sealed partial class ShaderResourcePlan
 
     public bool StableImageBindings { get; private set; }
 
+    // Not stable, yet every image fits the host's limits with its own binding: equal descriptors form no group.
+    public bool UngroupedImageBindings { get; private set; }
+
     internal RawReadPrefetchPlan? RawReadPrefetch { get; set; }
     private readonly object _compileGate = new();
     private CompiledResourceEvaluator? _compiledEvaluator;
@@ -399,6 +402,7 @@ public sealed partial class ShaderResourcePlan
 
         plan.WrittenRangeSlotByHandle = writtenSlots;
         plan.StableImageBindings = stableImageLimits.Fits(plan);
+        plan.UngroupedImageBindings = !plan.StableImageBindings && stableImageLimits.FitsEachImage(plan);
         return plan;
     }
 
