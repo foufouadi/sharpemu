@@ -23,9 +23,9 @@ public sealed class Gen5NonTessellationSpirvStabilityTests
     [InlineData("lds-staging-export", ShaderStage.Vertex, 32u, "EE5C38C25315D90F")]
     [InlineData("lds-barrier", ShaderStage.Compute, 64u, "FFD7904E27D5566C")]
     [InlineData("lds-barrier", ShaderStage.Compute, 32u, "5315B95DBA904C3A")]
-    [InlineData("divergent", ShaderStage.Vertex, 64u, "98635A5D60464A2B")]
-    [InlineData("divergent", ShaderStage.Pixel, 32u, "3DC9BF439D0CDC0B")]
-    [InlineData("divergent", ShaderStage.Compute, 64u, "BE3B17CDE203BC05")]
+    [InlineData("divergent", ShaderStage.Vertex, 64u, "55C431A591F8A4E5")]
+    [InlineData("divergent", ShaderStage.Pixel, 32u, "B168A563BB422052")]
+    [InlineData("divergent", ShaderStage.Compute, 64u, "A53C66AA68ABDAA5")]
     [InlineData("image-load", ShaderStage.Pixel, 64u, "D093219EBDF3135D")]
     [InlineData("image-load", ShaderStage.Compute, 32u, "C4882A0E0C6FC215")]
     public void SpirvIsUnchanged(string name, ShaderStage stage, uint waveSize, string expected)

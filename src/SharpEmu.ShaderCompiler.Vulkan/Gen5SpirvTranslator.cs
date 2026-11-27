@@ -385,7 +385,7 @@ public static partial class Gen5SpirvTranslator
                     if (!TryEmitDirectMeshBlocks(blocks, out error)) return false;
                 }
                 else if (_stage != Gen5SpirvStage.Mesh && StructuredControlFlow && blocks.Count > 0 &&
-                    TryStructureRange(blocks, 0, blocks.Count, blocks.Count, emit: false, out _))
+                    TryStructureProgram(blocks, emit: false, out _))
                 {
                     // As the dispatcher does before its first block: an out-of-bounds invocation runs nothing.
                     var runLabel = _module.AllocateId();
@@ -394,7 +394,7 @@ public static partial class Gen5SpirvTranslator
                     _module.AddStatement(SpirvOp.SelectionMerge, doneLabel, 0);
                     _module.AddStatement(SpirvOp.BranchConditional, isActive, runLabel, doneLabel);
                     _module.AddLabel(runLabel);
-                    if (!TryStructureRange(blocks, 0, blocks.Count, blocks.Count, emit: true, out error))
+                    if (!TryStructureProgram(blocks, emit: true, out error))
                     {
                         return false;
                     }
@@ -1970,6 +1970,7 @@ public static partial class Gen5SpirvTranslator
         // the PC-dispatch loop: a loop around a switch keeps every register live across iterations,
         // blocks cannot be optimized together, and the Metal compiler spills. SHARPEMU_STRUCTURED_CF=0
         // keeps the dispatcher for every program.
+        // Temporary diagnostic, not for commit: prints why the structurer rejected the program.
         private static readonly bool StructuredControlFlow =
             Environment.GetEnvironmentVariable("SHARPEMU_STRUCTURED_CF") != "0";
 
@@ -2009,15 +2010,63 @@ public static partial class Gen5SpirvTranslator
             out string error,
             int latch = -1)
         {
+            _structuredRangeStack.Add(++_structuredRangeCount);
+            try
+            {
+                return TryStructureRangeCore(blocks, begin, end, leave, emit, out error, latch);
+            }
+            finally
+            {
+                _structuredRangeStack.RemoveAt(_structuredRangeStack.Count - 1);
+            }
+        }
+
+        private bool TryStructureRangeCore(
+            IReadOnlyList<ShaderBlock> blocks,
+            int begin,
+            int end,
+            int leave,
+            bool emit,
+            out string error,
+            int latch)
+        {
             error = string.Empty;
             var instructions = _request.Program.Instructions;
             var index = begin;
             while (index < end)
             {
+                // A skipped range ends at its target, which must be reached in a range that holds the skip.
+                for (var skip = _pendingSkips.Count - 1; skip >= 0; skip--)
+                {
+                    if (_pendingSkips[skip].Target != index)
+                    {
+                        continue;
+                    }
+
+                    if (!_pendingSkips[skip].Ranges.Contains(_structuredRangeStack[^1]))
+                    {
+                        error = $"skip target 0x{blocks[index].StartPc:X} inside another construct";
+                        return false;
+                    }
+
+                    if (emit)
+                    {
+                        Store(_pendingSkips[skip].Flag, UInt(0));
+                    }
+
+                    _pendingSkips.RemoveAt(skip);
+                }
+
                 // A loop body starts at its own header, which must not open the loop again.
                 if (!(latch >= 0 && index == begin) && index != latch &&
                     TryFindLoopLatch(blocks, index, end, out var loopLatch))
                 {
+                    if (_pendingSkips.Count != 0)
+                    {
+                        error = $"loop at 0x{blocks[index].StartPc:X} inside a skipped range";
+                        return false;
+                    }
+
                     if (!TryStructureLoop(blocks, index, loopLatch, emit, out error))
                     {
                         return false;
@@ -2027,7 +2076,7 @@ public static partial class Gen5SpirvTranslator
                     continue;
                 }
 
-                if (emit && !TryEmitBlockBody(blocks, index, out error))
+                if (emit && !TryEmitGuardedBlockBody(blocks, index, out error))
                 {
                     error = $"block=0x{blocks[index].StartPc:X}: {error}";
                     return false;
@@ -2042,7 +2091,7 @@ public static partial class Gen5SpirvTranslator
                 var next = index + 1;
                 if (terminator.Opcode == "SEndpgm")
                 {
-                    if (next != blocks.Count)
+                    if (next != blocks.Count || _pendingSkips.Count != 0)
                     {
                         error = "s_endpgm before the last block";
                         return false;
@@ -2059,6 +2108,32 @@ public static partial class Gen5SpirvTranslator
 
                 if (terminator.Opcode == "SBranch")
                 {
+                    if (TryResolveBranchBlock(blocks, terminator, out var loopTarget) &&
+                        !(loopTarget == next || (next == end && loopTarget == leave)) &&
+                        TryClassifyLoopJump(loopTarget, out var isBreak))
+                    {
+                        // break; or continue; out of the innermost loop from inside its body.
+                        if (emit)
+                        {
+                            EmitLoopJump(_module.ConstantBool(true), isBreak);
+                        }
+
+                        index = next;
+                        continue;
+                    }
+
+                    if (TryResolveBranchBlock(blocks, terminator, out var skipTarget) && skipTarget > next &&
+                        !(next == end && skipTarget == leave) && TryBeginSkip(blocks, skipTarget, 0, emit, out error))
+                    {
+                        index = next;
+                        continue;
+                    }
+
+                    if (error.Length != 0)
+                    {
+                        return false;
+                    }
+
                     if (!TryResolveBranchBlock(blocks, terminator, out var branchTarget) ||
                         !(branchTarget == next || (next == end && branchTarget == leave)))
                     {
@@ -2081,6 +2156,21 @@ public static partial class Gen5SpirvTranslator
                     continue;
                 }
 
+                if (IsStructuredCondition(terminator.Opcode) &&
+                    TryResolveBranchBlock(blocks, terminator, out var continueTarget) &&
+                    _structuredLoopHeader >= 0 && continueTarget == _structuredLoopHeader)
+                {
+                    // if (taken) continue; -- back to the innermost loop's header.
+                    if (emit)
+                    {
+                        TryGetBranchCondition(terminator.Opcode, out var takeContinue);
+                        EmitLoopJump(takeContinue, isBreak: false);
+                    }
+
+                    index = next;
+                    continue;
+                }
+
                 if (!IsStructuredCondition(terminator.Opcode) ||
                     !TryResolveBranchBlock(blocks, terminator, out var target) || target <= index)
                 {
@@ -2094,17 +2184,31 @@ public static partial class Gen5SpirvTranslator
                     if (emit)
                     {
                         TryGetBranchCondition(terminator.Opcode, out var leaveLoop);
-                        var breakLabel = _module.AllocateId();
-                        var stayLabel = _module.AllocateId();
-                        _module.AddStatement(SpirvOp.SelectionMerge, stayLabel, 0);
-                        _module.AddStatement(SpirvOp.BranchConditional, leaveLoop, breakLabel, stayLabel);
-                        _module.AddLabel(breakLabel);
-                        _module.AddStatement(SpirvOp.Branch, _structuredLoopMerge);
-                        _module.AddLabel(stayLabel);
+                        EmitLoopJump(leaveLoop, isBreak: true);
                     }
 
                     index = next;
                     continue;
+                }
+
+                if (target > end && !(latch >= 0 && target == end))
+                {
+                    uint skipWhen = 0;
+                    if (emit)
+                    {
+                        TryGetBranchCondition(terminator.Opcode, out skipWhen);
+                    }
+
+                    if (TryBeginSkip(blocks, target, skipWhen, emit, out error))
+                    {
+                        index = next;
+                        continue;
+                    }
+
+                    if (error.Length != 0)
+                    {
+                        return false;
+                    }
                 }
 
                 if (target > end || (latch >= 0 && target == end))
@@ -2162,6 +2266,48 @@ public static partial class Gen5SpirvTranslator
                     continue;
                 }
 
+                // if/else where the skipped range jumps to where this range leaves: the taken range runs
+                // to the range end, which continues at the same place.
+                if (latch < 0 && target < end && target - 1 > index && leave > end && thenLast.Opcode == "SBranch" &&
+                    TryResolveBranchBlock(blocks, thenLast, out var leaveTarget) && leaveTarget == leave)
+                {
+                    if (!emit)
+                    {
+                        if (!TryStructureRange(blocks, next, target, leave, emit: false, out error) ||
+                            !TryStructureRange(blocks, target, end, leave, emit: false, out error))
+                        {
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        TryGetBranchCondition(terminator.Opcode, out var taken);
+                        var thenLabel = _module.AllocateId();
+                        var elseLabel = _module.AllocateId();
+                        var joinLabel = _module.AllocateId();
+                        _module.AddStatement(SpirvOp.SelectionMerge, joinLabel, 0);
+                        _module.AddStatement(SpirvOp.BranchConditional, taken, elseLabel, thenLabel);
+                        _module.AddLabel(thenLabel);
+                        if (!TryStructureRange(blocks, next, target, leave, emit: true, out error))
+                        {
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, joinLabel);
+                        _module.AddLabel(elseLabel);
+                        if (!TryStructureRange(blocks, target, end, leave, emit: true, out error))
+                        {
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, joinLabel);
+                        _module.AddLabel(joinLabel);
+                    }
+
+                    index = end;
+                    continue;
+                }
+
                 // if (!taken) { skipped range }
                 if (!emit)
                 {
@@ -2193,9 +2339,137 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        // A forward branch past the end of its construct: blocks up to its target run only while its flag is
+        // clear, and the target clears it. Ranges are the structured ranges that held the branch.
+        private sealed record PendingSkip(int Target, uint Flag, int[] Ranges);
+
+        private readonly List<PendingSkip> _pendingSkips = [];
+        private readonly List<int> _structuredRangeStack = [];
+        private int _structuredRangeCount;
+
+        private bool TryStructureProgram(IReadOnlyList<ShaderBlock> blocks, bool emit, out string error)
+        {
+            _pendingSkips.Clear();
+            _structuredRangeStack.Clear();
+            if (!TryStructureRange(blocks, 0, blocks.Count, blocks.Count, emit, out error))
+            {
+                return false;
+            }
+
+            // A skip to the end of the program needs no clearing.
+            var open = _pendingSkips.Find(skip => skip.Target != blocks.Count);
+            _pendingSkips.Clear();
+            if (open is not null)
+            {
+                error = $"skip to block {open.Target} never reached";
+                return false;
+            }
+
+            return true;
+        }
+
+        // Starts skipping to target when taken (0 for always). A skip may not leave the innermost loop.
+        private bool TryBeginSkip(IReadOnlyList<ShaderBlock> blocks, int target, uint taken, bool emit, out string error)
+        {
+            error = string.Empty;
+            if (target > blocks.Count || (_structuredLoopExit >= 0 && target >= _structuredLoopExit))
+            {
+                return false;
+            }
+
+            uint flag = 0;
+            if (emit)
+            {
+                flag = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
+                _interfaces.Add(flag);
+                var skipNow = taken == 0 ? _module.ConstantBool(true) : taken;
+                if (_pendingSkips.Count != 0)
+                {
+                    skipNow = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, skipNow, NotSkipping());
+                }
+
+                Store(flag, _module.AddInstruction(SpirvOp.Select, _uintType, skipNow, UInt(1), UInt(0)));
+            }
+
+            _pendingSkips.Add(new PendingSkip(target, flag, [.. _structuredRangeStack]));
+            return true;
+        }
+
+        private uint NotSkipping()
+        {
+            uint skipping = 0;
+            foreach (var skip in _pendingSkips)
+            {
+                var set = _module.AddInstruction(SpirvOp.INotEqual, _boolType, Load(_uintType, skip.Flag), UInt(0));
+                skipping = skipping == 0 ? set : _module.AddInstruction(SpirvOp.LogicalOr, _boolType, skipping, set);
+            }
+
+            return _module.AddInstruction(SpirvOp.LogicalNot, _boolType, skipping);
+        }
+
+        private bool TryEmitGuardedBlockBody(IReadOnlyList<ShaderBlock> blocks, int index, out string error)
+        {
+            if (_pendingSkips.Count == 0)
+            {
+                return TryEmitBlockBody(blocks, index, out error);
+            }
+
+            var emitted = true;
+            var bodyError = string.Empty;
+            EmitConditional(NotSkipping(), () => emitted = TryEmitBlockBody(blocks, index, out bodyError));
+            error = bodyError;
+            return emitted;
+        }
+
         // The innermost structured loop's exit block and merge label, for its breaks; -1 outside loops.
         private int _structuredLoopExit = -1;
         private uint _structuredLoopMerge;
+
+        // The innermost structured loop's header block and continue label, and the flag a continue
+        // from inside the body sets so the continue block repeats the loop whatever the latch says.
+        private int _structuredLoopHeader = -1;
+        private uint _structuredLoopContinue;
+        private uint _structuredLoopContinueFlag;
+
+        private bool TryClassifyLoopJump(int target, out bool isBreak)
+        {
+            isBreak = _structuredLoopExit >= 0 && target == _structuredLoopExit;
+            return isBreak || (_structuredLoopHeader >= 0 && target == _structuredLoopHeader);
+        }
+
+        // if (taken) { break; } or if (taken) { continue; } inside a selection, so the blocks after it
+        // stay structured even when taken is constant true.
+        private void EmitLoopJump(uint taken, bool isBreak)
+        {
+            if (_pendingSkips.Count != 0)
+            {
+                taken = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, taken, NotSkipping());
+            }
+
+            var jumpLabel = _module.AllocateId();
+            var stayLabel = _module.AllocateId();
+            _module.AddStatement(SpirvOp.SelectionMerge, stayLabel, 0);
+            _module.AddStatement(SpirvOp.BranchConditional, taken, jumpLabel, stayLabel);
+            _module.AddLabel(jumpLabel);
+            if (isBreak)
+            {
+                _module.AddStatement(SpirvOp.Branch, _structuredLoopMerge);
+            }
+            else
+            {
+                if (_structuredLoopContinueFlag == 0)
+                {
+                    _structuredLoopContinueFlag = _module.AddGlobalVariable(
+                        _privateUintPointer, SpirvStorageClass.Private, _module.Constant(_uintType, 0));
+                    _interfaces.Add(_structuredLoopContinueFlag);
+                }
+
+                Store(_structuredLoopContinueFlag, UInt(1));
+                _module.AddStatement(SpirvOp.Branch, _structuredLoopContinue);
+            }
+
+            _module.AddLabel(stayLabel);
+        }
 
         // The last block in [header, end) that branches back to header, unconditionally or on a
         // wave-uniform condition.
@@ -2223,6 +2497,9 @@ public static partial class Gen5SpirvTranslator
         {
             var outerExit = _structuredLoopExit;
             var outerMerge = _structuredLoopMerge;
+            var outerHeader = _structuredLoopHeader;
+            var outerContinue = _structuredLoopContinue;
+            var outerContinueFlag = _structuredLoopContinueFlag;
             try
             {
                 return TryStructureLoopCore(blocks, header, latch, emit, out error);
@@ -2231,16 +2508,32 @@ public static partial class Gen5SpirvTranslator
             {
                 _structuredLoopExit = outerExit;
                 _structuredLoopMerge = outerMerge;
+                _structuredLoopHeader = outerHeader;
+                _structuredLoopContinue = outerContinue;
+                _structuredLoopContinueFlag = outerContinueFlag;
             }
         }
 
         private bool TryStructureLoopCore(IReadOnlyList<ShaderBlock> blocks, int header, int latch, bool emit, out string error)
         {
             _structuredLoopExit = latch + 1;
+            _structuredLoopHeader = header;
+            _structuredLoopContinueFlag = 0;
             if (!emit)
             {
                 _structuredLoopMerge = 0;
-                return TryStructureRange(blocks, header, latch + 1, latch + 1, emit: false, out error, latch);
+                if (!TryStructureRange(blocks, header, latch + 1, latch + 1, emit: false, out error, latch))
+                {
+                    return false;
+                }
+
+                if (_pendingSkips.Count != 0)
+                {
+                    error = $"skip out of the loop at 0x{blocks[header].StartPc:X}";
+                    return false;
+                }
+
+                return true;
             }
 
             var headerLabel = _module.AllocateId();
@@ -2248,6 +2541,7 @@ public static partial class Gen5SpirvTranslator
             var continueLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
             _structuredLoopMerge = mergeLabel;
+            _structuredLoopContinue = continueLabel;
             var loopGuard = _maxDispatcherSteps > 0 ? NewLoopGuard() : 0u;
             if (loopGuard != 0)
             {
@@ -2265,6 +2559,12 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (_pendingSkips.Count != 0)
+            {
+                error = $"skip out of the loop at 0x{blocks[header].StartPc:X}";
+                return false;
+            }
+
             _module.AddStatement(SpirvOp.Branch, continueLabel);
             _module.AddLabel(continueLabel);
             var terminator = _request.Program.Instructions[blocks[latch].EndIndex - 1];
@@ -2272,6 +2572,14 @@ public static partial class Gen5SpirvTranslator
             if (terminator.Opcode != "SBranch")
             {
                 TryGetBranchCondition(terminator.Opcode, out again);
+            }
+
+            if (_structuredLoopContinueFlag != 0)
+            {
+                var continued = _module.AddInstruction(
+                    SpirvOp.INotEqual, _boolType, Load(_uintType, _structuredLoopContinueFlag), UInt(0));
+                Store(_structuredLoopContinueFlag, UInt(0));
+                again = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, again, continued);
             }
 
             if (_maxDispatcherSteps > 0)
