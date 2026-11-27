@@ -582,6 +582,7 @@ public sealed unsafe partial class GuestImageCache
                 var backingBytes = SnapshotVolumeBacking(image);
                 var readSize = GuestReadSize(image, request);
                 image.GuestReadSize = readSize;
+                _tiler.RelieveScratchPressure();
                 var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, readSize);
                 sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 UploadFromBuffer(image, request, source, sourceOffset, backingBytes, firstLayer);

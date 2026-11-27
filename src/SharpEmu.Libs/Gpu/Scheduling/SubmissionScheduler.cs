@@ -153,6 +153,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public ulong CompletedTick => _timeline.CompletedTick;
 
+    // Polls the GPU for the latest completed tick without running any completion action.
+    public ulong RefreshCompletedTick()
+    {
+        _timeline.RefreshCompletedTick();
+        return _timeline.CompletedTick;
+    }
+
     public Action<nint, MemoryBarrierRequest>? MemoryBarrierRecorder { get; set; }
 
     public TickTimeline Timeline => _timeline;

@@ -163,6 +163,10 @@ public sealed unsafe class GpuTiler : IDisposable
 
             _scratchPool.Clear();
             _scratchPooledBytes = 0;
+            while (_scratchInUse.Count != 0)
+            {
+                _scratchInUse.Dequeue().Buffer.Dispose();
+            }
         }
 
         vk.DestroyPipelineLayout(_device.Device, _pipelineLayout, null);
@@ -200,6 +204,93 @@ public sealed unsafe class GpuTiler : IDisposable
     private readonly Dictionary<int, List<(GpuBuffer Buffer, long ReturnedAt)>> _scratchPool = new();
     private ulong _scratchPooledBytes;
 
+    // Scratches out of the pool wait for their tick to complete, so a burst of tiled uploads (a bindless heap seen
+    // for the first time: ten thousand textures) held all their scratches at once: gigabytes of VRAM. Submitting
+    // the tick alone does not bound them, as the recording runs ahead of the GPU. Past this many bytes in flight,
+    // the image cache submits the tick between two uploads and waits for the oldest ticks until half are free.
+    private const ulong ScratchInFlightBudget = 1UL << 30;
+    // The tiler reclaims its own scratches by tick instead of through completion actions: those wait for every render
+    // slice cut so far to join, so a burst inside one slice kept them all, and running the scheduler's other actions
+    // from the middle of an upload re-enters locks the upload holds.
+    private ulong _scratchInFlightBytes;
+    private readonly Queue<(ulong Tick, int Shift, GpuBuffer Buffer)> _scratchInUse = new();
+
+
+    // Called between two uploads, when no scratch of the tick being recorded is still waiting to be read.
+    public void RelieveScratchPressure()
+    {
+        bool currentHoldsScratch;
+        lock (_scratchGate)
+        {
+            if (_scratchInFlightBytes <= ScratchInFlightBudget)
+            {
+                return;
+            }
+
+        }
+
+        ReclaimScratch(_scheduler.RefreshCompletedTick());
+        lock (_scratchGate)
+        {
+            if (_scratchInFlightBytes <= ScratchInFlightBudget)
+            {
+                return;
+            }
+
+            currentHoldsScratch = _scratchInUse.Count != 0 && _scratchInUse.Last().Tick == _scheduler.CurrentTick;
+        }
+
+        if (!_scheduler.Active || _scheduler.InsideTickCallback || SubmissionScheduler.ReadOnlyThread)
+        {
+            return;
+        }
+
+        if (currentHoldsScratch)
+        {
+            _scheduler.Flush();
+        }
+
+        for (;;)
+        {
+            ReclaimScratch(_scheduler.RefreshCompletedTick());
+            ulong oldest;
+            lock (_scratchGate)
+            {
+                if (_scratchInFlightBytes <= ScratchInFlightBudget / 2 || _scratchInUse.Count == 0)
+                {
+                    return;
+                }
+
+                oldest = _scratchInUse.Peek().Tick;
+            }
+
+            if (oldest >= _scheduler.CurrentTick)
+            {
+                return;
+            }
+
+            _scheduler.Wait(oldest);
+        }
+    }
+
+    private void ReclaimScratch(ulong completed)
+    {
+        List<(ulong Tick, int Shift, GpuBuffer Buffer)>? done = null;
+        lock (_scratchGate)
+        {
+            while (_scratchInUse.Count != 0 && _scratchInUse.Peek().Tick <= completed)
+            {
+                (done ??= []).Add(_scratchInUse.Dequeue());
+            }
+        }
+
+        if (done is null) return;
+        foreach (var scratch in done)
+        {
+            ReturnScratch(scratch.Shift, scratch.Buffer);
+        }
+    }
+
     // The scratch stays alive through the current tick; the caller sees exactly `size` bytes.
     private TilerBufferSpan AllocateScratch(ulong size)
     {
@@ -209,6 +300,7 @@ public sealed unsafe class GpuTiler : IDisposable
         }
 
         var shift = Math.Max(ScratchMinimumShift, 64 - BitOperations.LeadingZeroCount(size - 1));
+        ReclaimScratch(_scheduler.CompletedTick);
         GpuBuffer? buffer = null;
         lock (_scratchGate)
         {
@@ -224,7 +316,12 @@ public sealed unsafe class GpuTiler : IDisposable
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
             shift >= 63 ? size : 1UL << shift);
         buffer.Residency?.Use(GpuResidency.Role.Scratch);
-        _scheduler.QueueCompletionAction(() => ReturnScratch(shift, buffer));
+        lock (_scratchGate)
+        {
+            _scratchInFlightBytes += buffer.Size;
+            _scratchInUse.Enqueue((_scheduler.CurrentTick, shift, buffer));
+        }
+
         return new TilerBufferSpan(buffer.Handle, 0, size);
     }
 
@@ -232,6 +329,8 @@ public sealed unsafe class GpuTiler : IDisposable
     {
         lock (_scratchGate)
         {
+            _scratchInFlightBytes -= Math.Min(_scratchInFlightBytes, buffer.Size);
+
             if (!_scratchDisposed && _scratchPooledBytes + buffer.Size <= ScratchPoolBudget)
             {
                 if (!_scratchPool.TryGetValue(shift, out var pooled))
@@ -257,6 +356,7 @@ public sealed unsafe class GpuTiler : IDisposable
     {
         if (target == 0 || limit <= 0)
             return 0;
+        ReclaimScratch(_scheduler.RefreshCompletedTick());
         ulong freed = 0;
         lock (_scratchGate)
         {
