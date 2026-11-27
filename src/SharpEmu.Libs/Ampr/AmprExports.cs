@@ -1957,7 +1957,8 @@ public static partial class AmprExports
     private static bool IsWaitConditionSatisfied(ulong value, ulong reference, uint compare) => compare switch
     {
         0 => value == reference,
-        1 => value > reference,
+        // Greater or equal: a queue waits for a counter to reach the value a write sets it to.
+        1 => value >= reference,
         2 => value < reference,
         3 => value != reference,
         4 => unchecked((long)(value - reference)) >= 0,
