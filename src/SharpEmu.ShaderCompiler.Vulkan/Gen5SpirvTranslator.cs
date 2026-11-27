@@ -4541,6 +4541,15 @@ public static partial class Gen5SpirvTranslator
                     return true;
                 }
 
+                // A formatted store has no such fallback. The runtime V# sits in its SGPRs when the store runs, as on
+                // the hardware, so the store reads it there and goes through the device-address table, which every
+                // runtime descriptor's program binds.
+                if (instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal) &&
+                    !instruction.Opcode.Contains("D16", StringComparison.Ordinal) && _pageTable != 0)
+                {
+                    return TryEmitDeviceDescriptorBufferMemory(instruction, control, out error);
+                }
+
                 error = $"runtime buffer descriptor has no candidate table for {instruction.Opcode}";
                 return false;
             }
