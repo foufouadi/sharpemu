@@ -876,6 +876,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 ShaderClipDistance = supportedFeatures.ShaderClipDistance,
                 ShaderCullDistance = supportedFeatures.ShaderCullDistance,
                 ShaderImageGatherExtended = supportedFeatures.ShaderImageGatherExtended,
+                ShaderSampledImageArrayDynamicIndexing = supportedFeatures.ShaderSampledImageArrayDynamicIndexing,
                 ShaderStorageImageExtendedFormats = supportedFeatures.ShaderStorageImageExtendedFormats,
                 ShaderStorageImageReadWithoutFormat = supportedFeatures.ShaderStorageImageReadWithoutFormat,
                 ShaderStorageImageWriteWithoutFormat = supportedFeatures.ShaderStorageImageWriteWithoutFormat,

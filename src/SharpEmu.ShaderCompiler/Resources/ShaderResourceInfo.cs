@@ -188,6 +188,10 @@ public sealed class ShaderResourceInfo
     // Some image access reads its image or sampler from a bindless heap through descriptor set 1.
     public bool UsesBindlessHeap { get; set; }
 
+    // The host indexes sampled image arrays with a non-uniform index, so an access over several candidate
+    // descriptors of one class can pick its element at run time instead of one case per candidate.
+    public bool NonUniformImageIndexing { get; set; }
+
     // The heap views of those accesses (ShaderResourcePlan.HeapRecordSources); the layout carries where each one's
     // elements are as shader data (BindingLayout.HeapViewsDword).
     public uint HeapViewCount { get; set; }
@@ -227,6 +231,7 @@ public sealed class ShaderResourceInfo
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
         UsesBindlessHeap = UsesBindlessHeap,
+        NonUniformImageIndexing = NonUniformImageIndexing,
         HeapViewCount = HeapViewCount,
         UsesCallRecords = UsesCallRecords,
         UsesCallMarks = UsesCallMarks,

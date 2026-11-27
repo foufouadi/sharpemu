@@ -2405,6 +2405,85 @@ public static partial class Gen5SpirvTranslator
             return false;
         }
 
+        // An indirect access whose candidates all share one sampled class and the same conversion reads one
+        // element picked at run time (a constant table maps the selector to the class element), instead of
+        // repeating the operation once per candidate. handled is true when it tried and failed.
+        private bool TryEmitImageOverRuntimeElement(
+            Gen5ShaderInstruction instruction,
+            Gen5ImageControl image,
+            uint selector,
+            IReadOnlyList<(uint Resource, uint Element)> elements,
+            out bool handled,
+            out string error)
+        {
+            handled = false;
+            error = string.Empty;
+            var info = _request.Resources.Info;
+            if (!info.NonUniformImageIndexing || elements.Count < 2 || instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" ||
+                (_mipStatistics != 0 && _stage == Gen5SpirvStage.Pixel))
+            {
+                return false;
+            }
+
+            var first = info.Images[(int)elements[0].Resource];
+            var firstKind = ImageDescriptorBinding.ForImage(first);
+            if (firstKind is null || !_imageClasses.TryGetValue(firstKind.Value, out var firstClass) || firstClass.IsStorage)
+            {
+                return false;
+            }
+
+            foreach (var (candidateResource, _) in elements)
+            {
+                var candidate = info.Images[(int)candidateResource];
+                if (ImageDescriptorBinding.ForImage(candidate) != firstKind ||
+                    candidate.ConversionFormat != first.ConversionFormat ||
+                    candidate.ShaderSwizzle != first.ShaderSwizzle ||
+                    candidate.EmulatedCompareFunction != first.EmulatedCompareFunction ||
+                    candidate.DepthCompare != first.DepthCompare)
+                {
+                    return false;
+                }
+            }
+
+            handled = true;
+            _module.AddCapability(SpirvCapability.ShaderNonUniform);
+            _module.AddCapability(SpirvCapability.SampledImageArrayNonUniformIndexing);
+            uint runtimeElement;
+            var consecutive = true;
+            for (var index = 1; index < elements.Count && consecutive; index++)
+            {
+                consecutive = elements[index].Element == elements[0].Element + (uint)index;
+            }
+
+            if (consecutive)
+            {
+                runtimeElement = IAdd(selector, UInt(elements[0].Element));
+            }
+            else
+            {
+                var tableType = _module.TypeArray(_uintType, (uint)elements.Count);
+                var table = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, tableType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantComposite(tableType, elements.Select(element => UInt(element.Element)).ToArray()));
+                _interfaces.Add(table);
+                var slot = _module.AddInstruction(
+                    SpirvOp.AccessChain, _module.TypePointer(SpirvStorageClass.Private, _uintType), table, selector);
+                runtimeElement = Load(_uintType, slot);
+            }
+
+            if (!TryResolveLayoutImage(instruction, image, out var resource, out var imageObject, out var dstSelect, out error,
+                    elements[0], runtimeElement: runtimeElement))
+            {
+                return false;
+            }
+
+            var mipLevel = instruction.Opcode == "ImageLoadMip"
+                ? LoadImageIntegerAddress(image, (int)ImageCoordinateComponentCount(resource))
+                : UInt(0);
+            return EmitImageOperation(instruction, image, resource, imageObject, dstSelect, mipLevel, out error);
+        }
+
         private bool HasFlattenedTable => _flattenedTable != 0 || _request.Bindings is { UsesTableBlock: true, UsesFlattenedTable: true };
 
         // Resolves the image an instruction reads through its class array, joined with
@@ -2418,7 +2497,8 @@ public static partial class Gen5SpirvTranslator
             out string error,
             (uint Resource, uint Element)? fixedElement = null,
             bool heapVolumeLayers = false,
-            ImageNumericClass heapNumericClass = ImageNumericClass.Float)
+            ImageNumericClass heapNumericClass = ImageNumericClass.Float,
+            uint runtimeElement = 0)
         {
             error = string.Empty;
             resource = default;
@@ -2507,9 +2587,16 @@ public static partial class Gen5SpirvTranslator
             }
             else
             {
-                var elementIndex = UInt(fixedElement?.Element ?? (uint)element);
+                var elementIndex = runtimeElement != 0 ? runtimeElement : UInt(fixedElement?.Element ?? (uint)element);
                 elementPointer = _module.AddInstruction(SpirvOp.AccessChain, imageClass.ElementPointer, imageClass.Variable, elementIndex);
                 imageValue = Load(imageClass.ImageType, elementPointer);
+                if (runtimeElement != 0)
+                {
+                    // The candidate key can differ per lane.
+                    _module.AddDecoration(elementPointer, SpirvDecoration.NonUniform);
+                    _module.AddDecoration(imageValue, SpirvDecoration.NonUniform);
+                    fromHeap = true;
+                }
             }
 
             uint objectType;

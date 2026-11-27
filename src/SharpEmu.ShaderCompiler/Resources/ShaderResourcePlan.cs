@@ -300,6 +300,7 @@ public sealed partial class ShaderResourcePlan
         var tracked = ResourceTracker.Track(plan, bindlessNullDescriptors, bindlessHeap, callRecords, preferHeapRecords);
         plan.DescriptorSources = tracked.Sources;
         plan.Info = tracked.Info;
+        plan.Info.NonUniformImageIndexing = bindlessHeap;
         plan.NullBindlessDescriptorPcs = tracked.NullBindlessDescriptorPcs;
         plan.PreferredHeapRecords = preferHeapRecords && bindlessHeap;
         plan.HeapRecords = tracked.HeapRecords;

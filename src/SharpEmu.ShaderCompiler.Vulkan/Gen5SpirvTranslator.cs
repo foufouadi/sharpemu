@@ -6660,6 +6660,12 @@ public static partial class Gen5SpirvTranslator
             {
                 if (TryGetImageElementCases(instruction, image, out var selector, out var elements, out error))
                 {
+                    if (TryEmitImageOverRuntimeElement(instruction, image, selector, elements, out var runtimeHandled, out error) ||
+                        runtimeHandled)
+                    {
+                        return error.Length == 0;
+                    }
+
                     // One case per descriptor over a constant element, like a switch on the selector.
                     var emitted = true;
                     var caseError = string.Empty;
