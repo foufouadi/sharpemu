@@ -134,6 +134,10 @@ internal static unsafe partial class VulkanVideoPresenter
             (7, 0, _) => Format.B10G11R11UfloatPack32,
             (12, 0, _) => Format.R16G16B16A16Unorm,
             (16, 0, _) => Format.B5G6R5UnormPack16,
+            // The 16-bit packed formats with alpha, as the image path backs them (TextureTransferLayout.RenderTargetHostFormat).
+            (17, 0, _) => Format.A1R5G5B5UnormPack16,
+            (18, 0, _) => Format.R5G5B5A1UnormPack16,
+            (19, 0, _) => Format.R4G4B4A4UnormPack16,
             (13, 0, _) or (14, 0, _) => Format.R32G32B32A32Sfloat,
             (22, 0, _) or (71, 0, _) => Format.R16G16B16A16Sfloat,
             (56, 0, _) or (62, 0, _) or (64, 0, _) => Format.R8G8B8A8Unorm,
@@ -168,6 +172,8 @@ internal static unsafe partial class VulkanVideoPresenter
             9 when componentSwap == 1 => new Gen5ColorComponentMapping(0xC6),
             10 when componentSwap == 1 && numberType is 0 or 6 or 9 =>
                 new Gen5ColorComponentMapping(0xC6),
+            17 => new Gen5ColorComponentMapping(0xC6),
+            18 or 19 => new Gen5ColorComponentMapping(0x1B),
             _ => Gen5ColorComponentMapping.Identity,
         };
         result = new VulkanRenderTargetFormat(
@@ -186,7 +192,7 @@ internal static unsafe partial class VulkanVideoPresenter
             1 or 2 or 4 or 20 or 29 or 36 or 49 => 1,
             3 or 5 or 11 or 75 => 2,
             6 or 7 or 16 => 3,
-            9 or 10 or 12 or 13 or 14 or 22 or 56 or 62 or 64 or 71 => 4,
+            9 or 10 or 12 or 13 or 14 or 17 or 18 or 19 or 22 or 56 or 62 or 64 or 71 => 4,
             _ => 0,
         };
         return componentCount != 0;

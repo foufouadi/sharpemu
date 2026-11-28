@@ -195,6 +195,25 @@ public sealed class TextureTransferLayoutTests
         Assert.True(checkedCount > 30);
     }
 
+    // The 16-bit packed formats with alpha are bindable color targets: the pixel output writes the same
+    // host channels the image path stores, in every channel order.
+    [Theory]
+    [InlineData(ChannelLayout.Bits5_5_5_1)]
+    [InlineData(ChannelLayout.Bits1_5_5_5)]
+    [InlineData(ChannelLayout.Bits4_4_4_4)]
+    public void PackedAlphaTargets_HaveAPixelOutputMatchingTheImage(ChannelLayout layout)
+    {
+        for (var order = 0u; order < 4; order++)
+        {
+            var target = TextureTransferLayout.RenderTargetFormat(layout, ChannelType.UNorm, (ChannelOrder)order);
+            Assert.True(SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                (uint)layout, (uint)ChannelType.UNorm, order, out var output));
+            Assert.Equal(target.HostFormat, output.Format);
+            Assert.Equal(SharpEmu.ShaderCompiler.Gen5PixelOutputKind.Float, output.OutputKind);
+            Assert.Equal(target.ExportMapping, new ColorComponentMap(output.ExportMapping.Packed));
+        }
+    }
+
     [Fact]
     public void RenderTargetFormats_CombineHostSwizzleAndOrder()
     {
