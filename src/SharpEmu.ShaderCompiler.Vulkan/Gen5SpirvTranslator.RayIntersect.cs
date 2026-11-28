@@ -47,21 +47,105 @@ public static partial class Gen5SpirvTranslator
             return result;
         }
 
+        // SHARPEMU_SHARED_RAY_INTERSECT (on by default; =0 turns it off): every BVH intersect of a program tests its node in
+        // one DontInline function instead of repeating the triangle and both box tests at each instruction. A ray-tracing
+        // world program holds dozens of these instructions; inline they were the largest part of its module and of the
+        // driver's compile time. Tests may set it.
+        public static bool SharedRayIntersect { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_SHARED_RAY_INTERSECT"), "0", StringComparison.Ordinal);
+
+        private uint _rayIntersectFunction;
+        private uint _rayIntersectResultType;
+
+        // The instruction's inputs: node pointer, BVH T#, extent, origin, direction and inverse direction.
         private void EmitRayIntersectActive(Gen5RayIntersectControl ray, bool bvh64)
         {
-            var result = _rayResult!;
             var nodeLow = LoadV(ray.GetAddressRegister(0));
             var nodePointer = bvh64 ? Pair64(nodeLow, LoadV(ray.GetAddressRegister(1))) : Widen(nodeLow);
+            uint[] words = [LoadS(ray.ScalarResource), LoadS(ray.ScalarResource + 1),
+                LoadS(ray.ScalarResource + 2), LoadS(ray.ScalarResource + 3)];
+            var extent = Bitcast(_floatType, LoadV(ray.GetAddressRegister(bvh64 ? 2 : 1)));
+            var origin = new uint[3];
+            for (var axis = 0; axis < 3; axis++)
+                origin[axis] = Bitcast(_floatType, LoadV(ray.GetAddressRegister((bvh64 ? 3 : 2) + axis)));
+            var direction = LoadRayVector(ray, bvh64, inverse: false);
+            var inverseDirection = LoadRayVector(ray, bvh64, inverse: true);
+
+            uint[] values;
+            if (SharedRayIntersect)
+            {
+                if (_rayIntersectFunction == 0)
+                {
+                    _rayIntersectFunction = _module.AllocateId();
+                    _rayIntersectResultType = _module.TypeArrayDistinct(_uintType, Gen5RayIntersectControl.ResultDwords);
+                }
+
+                var result = _module.AddInstruction(SpirvOp.FunctionCall, _rayIntersectResultType,
+                    [_rayIntersectFunction, nodeLow, nodePointer, .. words, extent, .. origin, .. direction, .. inverseDirection]);
+                values = new uint[Gen5RayIntersectControl.ResultDwords];
+                for (var component = 0; component < values.Length; component++)
+                    values[component] = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, result, (uint)component);
+            }
+            else
+            {
+                values = EmitRayIntersectBody(nodeLow, nodePointer, words, extent, origin, direction, inverseDirection);
+            }
+
+            for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
+                StoreV(ray.VectorData + component, values[component]);
+        }
+
+        // After every function that may call it.
+        private void EmitRayIntersectFunction()
+        {
+            if (_rayIntersectFunction == 0)
+            {
+                return;
+            }
+
+            const uint dontInline = 2;
+            var functionType = _module.TypeFunction(_rayIntersectResultType,
+            [
+                _uintType, _ulongType, _uintType, _uintType, _uintType, _uintType, _floatType,
+                .. Enumerable.Repeat(_floatType, 9),
+            ]);
+            _module.BeginFunction(_rayIntersectResultType, functionType, dontInline, _rayIntersectFunction);
+            _module.AddName(_rayIntersectFunction, "rayIntersect");
+            var nodeLow = _module.AddFunctionParameter(_uintType);
+            var nodePointer = _module.AddFunctionParameter(_ulongType);
+            var words = new uint[4];
+            for (var index = 0; index < words.Length; index++)
+                words[index] = _module.AddFunctionParameter(_uintType);
+            var extent = _module.AddFunctionParameter(_floatType);
+            var origin = new uint[3];
+            var direction = new uint[3];
+            var inverseDirection = new uint[3];
+            for (var axis = 0; axis < 3; axis++) origin[axis] = _module.AddFunctionParameter(_floatType);
+            for (var axis = 0; axis < 3; axis++) direction[axis] = _module.AddFunctionParameter(_floatType);
+            for (var axis = 0; axis < 3; axis++) inverseDirection[axis] = _module.AddFunctionParameter(_floatType);
+            _module.AddLabel();
+            InitializeDeviceAddressFallback();
+            var values = EmitRayIntersectBody(nodeLow, nodePointer, words, extent, origin, direction, inverseDirection);
+            _module.AddStatement(SpirvOp.ReturnValue,
+                _module.AddInstruction(SpirvOp.CompositeConstruct, _rayIntersectResultType, values));
+            _module.EndFunction();
+        }
+
+        // One node test on loaded inputs; the result dwords are returned, not written to registers.
+        private uint[] EmitRayIntersectBody(uint nodeLow, uint nodePointer, uint[] words, uint extent,
+            uint[] origin, uint[] direction, uint[] inverseDirection)
+        {
+            var result = _rayResult!;
             var nodeType = BitwiseAnd(nodeLow, UInt(7));
             var nodeIndex = ShiftRightLogical64(nodePointer, ULong(3));
 
             // The BVH T#: base_address[39:0] in 256-byte units, box_grow_value [62:55],
             // box_sort_en [63], size [105:64] (the last valid 64-byte node index),
             // triangle_return_mode [120].
-            var word0 = LoadS(ray.ScalarResource);
-            var word1 = LoadS(ray.ScalarResource + 1);
-            var word2 = LoadS(ray.ScalarResource + 2);
-            var word3 = LoadS(ray.ScalarResource + 3);
+            var word0 = words[0];
+            var word1 = words[1];
+            var word2 = words[2];
+            var word3 = words[3];
             var baseUnits = Pair64(word0, BitwiseAnd(word1, UInt(0xFF)));
             var bvhBase = ShiftLeftLogical64(baseUnits, ULong(8));
             var lastNode = Pair64(word2, BitwiseAnd(word3, UInt(0x3FF)));
@@ -89,13 +173,6 @@ public static partial class Gen5SpirvTranslator
             var isBox16 = LogicalAnd(valid, _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat16)));
             var isBox32 = LogicalAnd(LogicalAnd(present, wideInRange),
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat32)));
-
-            var extent = Bitcast(_floatType, LoadV(ray.GetAddressRegister(bvh64 ? 2 : 1)));
-            var origin = new uint[3];
-            for (var axis = 0; axis < 3; axis++)
-                origin[axis] = Bitcast(_floatType, LoadV(ray.GetAddressRegister((bvh64 ? 3 : 2) + axis)));
-            var direction = LoadRayVector(ray, bvh64, inverse: false);
-            var inverseDirection = LoadRayVector(ray, bvh64, inverse: true);
 
             // User nodes and out-of-range nodes do not load node memory.
             foreach (var variable in result)
@@ -134,8 +211,10 @@ public static partial class Gen5SpirvTranslator
             EmitConditional(isBox16, () => EmitBoxes(fp16: true));
             EmitConditional(isBox32, () => EmitBoxes(fp16: false));
 
-            for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
-                StoreV(ray.VectorData + component, Load(_uintType, result[component]));
+            var values = new uint[Gen5RayIntersectControl.ResultDwords];
+            for (var component = 0; component < values.Length; component++)
+                values[component] = Load(_uintType, result[component]);
+            return values;
         }
 
         // Direction and inverse direction follow the origin; A16 packs both as six halves

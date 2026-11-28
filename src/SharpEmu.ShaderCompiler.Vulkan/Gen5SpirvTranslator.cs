@@ -175,6 +175,9 @@ public static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
         private (uint First, uint Last) _dynamicVectorRange;
+        // Most selects a program's relative VGPR accesses may emit before the register file becomes an indexed array.
+        private const long MaxRelativeMoveSelects = 8192;
+        private bool _indexedVectorFile;
         private uint _packedHalfRegisters;
         private uint _scc;
         private uint _vcc;
@@ -504,6 +507,7 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 // After every function that may call it.
+                EmitRayIntersectFunction();
                 EmitTypedElementDecoder();
                 EmitCallRecordSearch();
                 EmitDeviceRangeFunctions();
@@ -661,6 +665,21 @@ public static partial class Gen5SpirvTranslator
                 // (Octopath's instanced vertex shader: 112 ms per draw). Keep one variable per
                 // register and resolve V_MOVREL* with a select over the registers the program uses.
                 _dynamicVectorRange = DynamicVectorRange(_request.Program);
+
+                // The selects grow with the registers a relative access can reach times the number of accesses: a
+                // program with hundreds of each becomes hundreds of thousands of selects that take the driver minutes
+                // to compile. Past that size the VGPR file is one indexed array instead, which costs a memory access
+                // per VGPR access where the driver cannot keep it in registers, but compiles in seconds.
+                var relativeAccesses = _request.Program.Instructions.Count(static instruction =>
+                    instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal));
+                var reachable = _dynamicVectorRange.Last - _dynamicVectorRange.First + 1;
+                if (_stage != Gen5SpirvStage.Mesh && (long)relativeAccesses * reachable > MaxRelativeMoveSelects)
+                {
+                    var file = _module.TypeArray(_uintType, VectorRegisterCount);
+                    _vectorRegisters = _module.AddGlobalVariable(
+                        _module.TypePointer(SpirvStorageClass.Private, file), SpirvStorageClass.Private, _module.ConstantNull(file));
+                    _indexedVectorFile = true;
+                }
             }
 
             // Keep scalar state in uint variables, matching upstream's flag load/store conversion.
@@ -10068,8 +10087,17 @@ public static partial class Gen5SpirvTranslator
             return (Math.Min(first, last), last);
         }
 
+        private uint IndexedVectorPointer(uint registerIndex) =>
+            _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, _vectorRegisters,
+                BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+
         private uint LoadVDynamic(uint registerIndex)
         {
+            if (_indexedVectorFile)
+            {
+                return Load(_uintType, IndexedVectorPointer(registerIndex));
+            }
+
             var result = UInt(0);
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
@@ -10089,6 +10117,16 @@ public static partial class Gen5SpirvTranslator
             _savedLaneValues.Clear();
             // With EXEC known to be all ones the write needs no EXEC test.
             var exec = _execKnownFull ? 0 : Load(_boolType, _exec);
+            if (_indexedVectorFile)
+            {
+                var pointer = IndexedVectorPointer(registerIndex);
+                var current = Load(_uintType, pointer);
+                var next = exec != 0 ? _module.AddInstruction(SpirvOp.Select, _uintType, exec, value, current) : value;
+                if (_executingWave != 0) next = GuardCooperativeUint(next, current);
+                Store(pointer, next);
+                return;
+            }
+
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
                 var pointer = VectorPointer(register);
