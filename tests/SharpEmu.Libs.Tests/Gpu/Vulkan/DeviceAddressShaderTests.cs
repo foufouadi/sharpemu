@@ -215,6 +215,41 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(LinkedCalls_PartialWaveRunsTheCallBody));
     }
 
+    // A partial wave64 whose lane pairs share a host lane: the pairs past the thread count keep running beside the others,
+    // their lanes out of EXEC, so a call body's branches stay uniform across the host subgroup. Pairs that skipped the
+    // call body's blocks left the driver's warp syncs inside them waiting, and the dispatch never finished.
+    [Fact]
+    public void LinkedCalls_PartialPairedWave64RunsTheCallBody()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var caller = Program(MoveScalar(0, 14, 0x2000), MoveScalar(4, 15, 0), MoveScalar(8, 16, 10), MoveScalar(12, 17, 0),
+            Sop1(16, "SSwappcB64", 14, Gen5Operand.Scalar(14)),
+            Vop2(20, "VLshlrevB32", 4, Operand(2), Gen5Operand.Vector(0)),
+            BufferAccess(24, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 1, offsetEnabled: true, vectorAddress: 4),
+            EndProgram(32));
+        // The lanes below 8 keep the argument; the others take the number of lanes below 8, a count over the whole wave.
+        var function = Program(Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
+            Vopc(4, "VCmpGtU32", Operand(8), 0),
+            Sop1(8, "SBcnt1I32B64", 20, Gen5Operand.Scalar(106)),
+            Vop2(12, "VCndmaskB32", 1, Gen5Operand.Scalar(20), Gen5Operand.Vector(1)),
+            Sop1(16, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
+        var linked = Gen5ShaderCallLinker.Link(caller,
+            [new(16, 14, 16, 14, caller.Address + 20, [new(0x2000, 10, function), new(0x2000, 11, function)])]);
+        var run = new Run(vulkan, linked, threadCount: 13, localSize: 64, pairedWave64: true);
+        // The call body is outlined into a function, the case whose active flag is made uniform.
+        Assert.True(HasInstruction(run.Spirv, SpirvOp.FunctionCall));
+        Assert.True(HasInstruction(run.Spirv, SpirvOp.GroupNonUniformAny));
+        run.Dispatch(GuestBase);
+        for (uint lane = 0; lane < 64; lane++)
+        {
+            Assert.Equal(lane >= 13 ? 0u : lane < 8 ? 10u : 8u, run.ResultWord(lane * 4));
+        }
+
+        Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
+        run.Finish(output, nameof(LinkedCalls_PartialPairedWave64RunsTheCallBody));
+    }
+
     // A site finds its caller's record among several callees' records once and runs that callee; a target and argument
     // that no record holds still faults.
     [Theory]
@@ -280,6 +315,16 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         else Assert.Equal(new uint[] { 2, (uint)run.Request.Hash, (uint)(run.Request.Hash >> 32),
             16, address, 0, (uint)ShaderStage.Compute, 1 }, run.FaultWords()[^8..]);
         run.Finish(output, nameof(LinkedCalls_MovedTableKeepsTheModule));
+    }
+
+    private static bool HasInstruction(uint[] spirv, SpirvOp opcode)
+    {
+        for (var index = 5; index < spirv.Length && spirv[index] >> 16 != 0; index += (int)(spirv[index] >> 16))
+        {
+            if ((spirv[index] & 0xFFFF) == (uint)opcode) return true;
+        }
+
+        return false;
     }
 
     private static byte[] Translate(Gen5ShaderProgram program)
@@ -1054,16 +1099,19 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         private GpuBuffer? _pageTable;
 
         public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries,
-            uint localSize = 0)
+            uint localSize = 0, bool pairedWave64 = false)
         {
             var (plan, resources, layout) = Prepare(program);
             Plan = plan;
             Request = new ShaderCompileRequest(plan, resources, layout)
             {
                 LocalSizeX = localSize == 0 ? threadCount : localSize, ThreadCountX = threadCount, ScratchDwords = 32,
+                WaveSize = pairedWave64 ? 64u : 32u, HostComputeSubgroup32 = pairedWave64,
             };
             Assert.True(resources.Info.UsesDeviceAddresses);
             Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request, out var shader, out var error), error);
+            Spirv = new uint[shader.Spirv.Length / sizeof(uint)];
+            System.Buffer.BlockCopy(shader.Spirv, 0, Spirv, 0, shader.Spirv.Length);
             _harness = new ImageTestHarness(vulkan);
             _runner = new LayoutComputeRunner(_harness, Request, shader.Spirv);
             _result = _runner.CreateBuffer(ResultBytes);
@@ -1076,6 +1124,8 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         public ShaderResourcePlan Plan { get; }
 
         public ShaderCompileRequest Request { get; }
+
+        public uint[] Spirv { get; }
 
         public byte[] MapPage(ulong guestPage, byte[] bytes)
         {

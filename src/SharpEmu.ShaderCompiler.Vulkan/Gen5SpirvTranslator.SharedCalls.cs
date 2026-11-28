@@ -708,8 +708,10 @@ public static partial class Gen5SpirvTranslator
 
         // Before main's first block of a module with outlined bodies: the invocations past the dispatch's thread count end
         // here, so the active flag the block guards test is the same for every lane that runs; the program's other lane
-        // branches go through DivergentCondition. Paired and emulated wave64 lanes keep theirs, since their host lanes
-        // work together.
+        // branches go through DivergentCondition. Paired lanes keep running, since their host lanes work together: a pair
+        // past the thread count runs while any pair of its wave does, its two lanes left out of EXEC as a partial wave's
+        // lanes are. A pair that skipped the blocks would leave the warp syncs inside them waiting for it, and the
+        // dispatch would never finish. Emulated wave64 lanes keep theirs.
         private void BeginOutlinedCallBodies()
         {
             if (_outlinedBodies.Count == 0 || _subgroupInvocationIdInput == 0)
@@ -718,7 +720,15 @@ public static partial class Gen5SpirvTranslator
             }
 
             _divergentConditions = true;
-            if (_pairedLanes || _waveLowering is EmulatedWave64Lowering)
+            if (_pairedLanes)
+            {
+                _module.AddCapability(SpirvCapability.GroupNonUniformVote);
+                Store(_programActive, _module.AddInstruction(
+                    SpirvOp.GroupNonUniformAny, _boolType, UInt(3), Load(_boolType, _programActive)));
+                return;
+            }
+
+            if (_waveLowering is EmulatedWave64Lowering)
             {
                 return;
             }
