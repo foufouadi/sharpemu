@@ -20,9 +20,12 @@ public static partial class ResourceMaterializer
     private const int MaxSharedCandidates = 256;
     private const int MinSharedKeyCapacity = 32;
     private const int MaxSharedKeyCapacity = 1024;
+    // The smallest layout of any other indirect image table; its largest is the table's own limit (see FitVariableImageTables).
+    private const int MinVariableCandidates = 4;
 
     // Written to standard error like every specialization refusal; the host turns it
     // into its fatal.
+
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
 
     private sealed class IndirectImageTable
@@ -36,6 +39,10 @@ public static partial class ResourceMaterializer
         public uint SelectorStride;
         public uint SelectorOffset;
         public bool Shared;
+        // A table whose candidates the shader can index at run time (FitVariableImageTables): not selected by a loop counter.
+        public bool Variable;
+        // The table keeps the plan's fixed layout (KeyCapacity key slots, a padded candidate list).
+        public bool FixedLayout;
         public int KeyCapacity;
         public IndirectSelectorDiagnostic? SelectorDiagnostic;
     }
@@ -946,6 +953,7 @@ public static partial class ResourceMaterializer
                     if (waveTable.Descriptors.Count > 1)
                     {
                         waveTable.Resource = (uint)imageIndex;
+                        waveTable.Variable = true;
                         snapshot.IndirectImages.Add(waveTable);
                     }
                     continue;
@@ -961,6 +969,7 @@ public static partial class ResourceMaterializer
                     if (denseTable.Descriptors.Count > 1)
                     {
                         denseTable.Resource = (uint)imageIndex;
+                        denseTable.Variable = true;
                         snapshot.IndirectImages.Add(denseTable);
                     }
                     continue;
@@ -985,6 +994,7 @@ public static partial class ResourceMaterializer
                 {
                     indirectTable.Resource = (uint)imageIndex;
                     indirectTable.Shared = indirect.SharedSelector;
+                    indirectTable.Variable = !indirect.SharedSelector;
                     snapshot.IndirectImages.Add(indirectTable);
                 }
             }
@@ -1001,6 +1011,7 @@ public static partial class ResourceMaterializer
         }
 
         FitSharedImageTables(plan, snapshot);
+        FitVariableImageTables(plan, snapshot);
         snapshot.Samplers = new uint[plan.Info.Samplers.Count][];
         for (var index = 0; index < snapshot.Samplers.Length; index++)
             snapshot.Samplers[index] = values[cursor++].Dwords;
@@ -1250,6 +1261,20 @@ public static partial class ResourceMaterializer
         }
     }
 
+    private static readonly HashSet<(uint, uint)> MaterialStrideMismatches = new();
+
+    private static void ReportMaterialStrideMismatch(uint descriptorStride, uint selectorStride)
+    {
+        lock (MaterialStrideMismatches)
+        {
+            if (MaterialStrideMismatches.Add((descriptorStride, selectorStride)))
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][WARN] An indirect image's material table V# has stride {descriptorStride}; the shader steps its records by {selectorStride}.");
+            }
+        }
+    }
+
     private static readonly HashSet<(uint Format, bool Wide)> NulledAtomicFormats = new();
 
     private static void ReportNulledAtomicFormat(uint format, bool wide)
@@ -1458,10 +1483,13 @@ public static partial class ResourceMaterializer
             return false;
         }
 
+        // The shader addresses its material records with its own stride (selector * stride + offset through a scalar
+        // byte offset), which the V# stride field does not take part in: a table whose V# names another stride is
+        // still read with the shader's.
         var materialStride = (material.Dwords[1] >> 16) & 0x3FFF;
         if (materialStride != indirect.SelectorStride)
         {
-            return false;
+            ReportMaterialStrideMismatch(materialStride, indirect.SelectorStride);
         }
 
         var period = 1ul << 32;
@@ -1815,6 +1843,102 @@ public static partial class ResourceMaterializer
         }
     }
 
+    // The tables the loop-selected layout does not cover (a clamped, masked, dense or wave-indexed selector) name the
+    // candidates the heap holds at the time: a frame that binds a few more textures used to give the shader another
+    // image count, another key count and so another variant, each a driver compile. When the translator picks the
+    // candidate at run time (NonUniformImageIndexing: every candidate of the table shares one binding class,
+    // conversion and swizzle), the candidate count does not shape the module, so such a table keeps a layout per
+    // table, the most candidates and keys it has needed so far rounded up to powers of two and never shrinking, and
+    // pads the candidate list with null images. A padded candidate is never mapped to by a key, so no access reads it;
+    // it takes the class of the typed candidates (BuildSpecialization), so it does not add a case or a class. No key
+    // and no candidate is dropped: a table that outgrows the largest layout, or whose candidates mix classes (those
+    // are compiled one case per candidate, where a padded candidate would only add a dead case), keeps its exact shape.
+    private static void FitVariableImageTables(ShaderResourcePlan plan, MaterializedSnapshot snapshot)
+    {
+        if (!plan.Info.NonUniformImageIndexing)
+        {
+            return;
+        }
+
+        foreach (var table in snapshot.IndirectImages)
+        {
+            if (!table.Variable || table.Resource >= plan.Info.Images.Count || table.Keys.Count > MaxSharedKeyCapacity ||
+                table.Descriptors.Count > ShaderResourceInfo.MaxIndirectImageCandidates ||
+                !RunTimeIndexable(plan, plan.Info.Images[(int)table.Resource], table))
+            {
+                continue;
+            }
+
+            var layout = LayoutOf(plan);
+            var resource = (int)table.Resource;
+            var candidateCapacity = Grow(ref layout.Candidates[resource], SizeClass(
+                table.Descriptors.Count - 1, MinVariableCandidates, ShaderResourceInfo.MaxIndirectImageCandidates - 1));
+            var keyCapacity = Grow(ref layout.Keys[resource], SizeClass(table.Keys.Count, MinSharedKeyCapacity, MaxSharedKeyCapacity));
+            table.KeyCapacity = keyCapacity;
+            table.FixedLayout = true;
+            while (table.Descriptors.Count < candidateCapacity + 1)
+            {
+                table.Descriptors.Add(DescriptorWords.Empty(8));
+            }
+        }
+    }
+
+    // The per-table layouts of a plan, created on first use for every image resource.
+    private static ShaderResourcePlan.ImageTableLayout LayoutOf(ShaderResourcePlan plan)
+    {
+        var layout = Volatile.Read(ref plan.VariableImageLayout);
+        if (layout is null)
+        {
+            Interlocked.CompareExchange(ref plan.VariableImageLayout, new ShaderResourcePlan.ImageTableLayout(plan.Info.Images.Count), null);
+            layout = plan.VariableImageLayout!;
+        }
+
+        return layout;
+    }
+
+    // Whether the translator can index the table's candidates at run time: a sampled color image whose usable
+    // candidates agree on everything the module is built from (dimension, cube, numeric class and, when converted,
+    // the format and swizzle). Mirrors the specialization of BuildSpecialization and the check of
+    // Gen5SpirvTranslator.TryEmitImageOverRuntimeElement.
+    private static bool RunTimeIndexable(ShaderResourcePlan plan, ImageResource baseImage, IndirectImageTable table)
+    {
+        if (baseImage.ResourceClass != ImageResourceClass.Sampled || baseImage.Atomic || baseImage.DepthCompare ||
+            (RecordMipStatistics && plan.Stage == ShaderStage.Pixel))
+        {
+            return false;
+        }
+
+        (ImageDimension Dimension, bool Cube, ImageNumericClass Class, uint Conversion, uint Swizzle)? first = null;
+        foreach (var candidate in table.Descriptors)
+        {
+            var words = candidate.Dwords;
+            if (NullImageDescriptor(words))
+            {
+                continue;
+            }
+
+            var format = GuestImageFormat.FormatOf(words);
+            var numericClass = GuestImageFormat.SampledNumericClass(format);
+            var dimension = DescriptorDimension(words, baseImage);
+            if (numericClass == ImageNumericClass.Unsupported || dimension == ImageDimension.Unknown)
+            {
+                return false;
+            }
+
+            var conversion = ImageConversionFormat(format);
+            var signature = (dimension, GuestImageFormat.ImageTypeOf(words) == GuestImageFormat.ImageTypeCube, numericClass,
+                conversion, conversion != GuestImageFormat.Invalid ? words[3] & 0xFFF : baseImage.ShaderSwizzle);
+            if (first is { } expected && expected != signature)
+            {
+                return false;
+            }
+
+            first = signature;
+        }
+
+        return first is not null;
+    }
+
     // The power of two that holds count, between minimum and maximum.
     private static int SizeClass(int count, int minimum, int maximum) =>
         Math.Clamp((int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(count, 1)), minimum, maximum);
@@ -1837,10 +1961,10 @@ public static partial class ResourceMaterializer
         return current;
     }
 
-    // The words a table's key mapping reserves: a loop-selected table reserves its size class, so neither its search
+    // The words a table's key mapping reserves: a loop-selected or fixed-layout table reserves its size class, so neither its search
     // depth nor the offsets of the tables after it move with each key.
     private static int MappingCapacity(IndirectImageTable table) =>
-        table.Shared ? Math.Max(table.KeyCapacity, table.Keys.Count) : table.Keys.Count;
+        table.Shared || table.FixedLayout ? Math.Max(table.KeyCapacity, table.Keys.Count) : table.Keys.Count;
 
     // ---- specialization ----
 
@@ -1999,6 +2123,16 @@ public static partial class ResourceMaterializer
             }
 
             var formatted = info.Buffers[index].Formatted;
+            if (formatted && TypedOnlyFormatted(plan)[index])
+            {
+                // Every formatted access names its own format; the module reads only whether the descriptor is bound
+                // (IsDescriptorBound), so a real format and swizzle do not shape it: one bound specialization.
+                buffers.Add(new BufferSpecialization(
+                    ((words[3] >> 12) & 0x7F) != DescriptorConstants.InvalidFormat ? BoundTypedBufferFormat : DescriptorConstants.InvalidFormat,
+                    DescriptorConstants.IdentityDestinationSelect));
+                continue;
+            }
+
             buffers.Add(new BufferSpecialization(
                 formatted ? (words[3] >> 12) & 0x7F : DescriptorConstants.InvalidFormat,
                 formatted ? words[3] & 0xFFF : DescriptorConstants.IdentityDestinationSelect));
@@ -2362,6 +2496,50 @@ public static partial class ResourceMaterializer
         };
         specializedSnapshot = snapshot;
         return true;
+    }
+
+    // The format a bound buffer is specialized with when only typed accesses read it; any valid format does, since the
+    // module does not decode it.
+    private const uint BoundTypedBufferFormat = 1;
+
+    // The buffers whose formatted accesses are all typed (TBUFFER_*: the instruction carries the format) and so read
+    // nothing of the descriptor's format and swizzle but whether it is bound. An untyped formatted load or store
+    // (BUFFER_*_FORMAT_*) converts with the descriptor's format and swizzle, and drops its store on format 0, so a buffer
+    // with one keeps its exact specialization. A buffer no access names stays exact too.
+    private static bool[] TypedOnlyFormatted(ShaderResourcePlan plan)
+    {
+        var cached = Volatile.Read(ref plan.TypedOnlyFormattedBuffers);
+        if (cached is not null)
+        {
+            return cached;
+        }
+
+        var typed = new bool[plan.Info.Buffers.Count];
+        var untyped = new bool[typed.Length];
+        foreach (var memory in plan.Memory.Entries)
+        {
+            if (memory.Kind != MemoryResourceKind.Buffer || !memory.Formatted || memory.Resource >= (uint)typed.Length)
+            {
+                continue;
+            }
+
+            if (memory.Typed)
+            {
+                typed[memory.Resource] = true;
+            }
+            else
+            {
+                untyped[memory.Resource] = true;
+            }
+        }
+
+        for (var index = 0; index < typed.Length; index++)
+        {
+            typed[index] &= !untyped[index];
+        }
+
+        Interlocked.CompareExchange(ref plan.TypedOnlyFormattedBuffers, typed, null);
+        return typed;
     }
 
     private sealed class SamplerPlan

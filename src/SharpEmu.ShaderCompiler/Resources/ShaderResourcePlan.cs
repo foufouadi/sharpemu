@@ -39,6 +39,19 @@ public sealed partial class ShaderResourcePlan
     // them has needed so far (see ResourceMaterializer.FitSharedImageTables).
     internal int SharedImageCandidates;
     internal int SharedImageKeys;
+
+    // The layout of each other indirect image table of this plan, by image resource: the candidates and keys it has
+    // needed so far (see ResourceMaterializer.FitVariableImageTables).
+    internal sealed class ImageTableLayout(int resources)
+    {
+        public readonly int[] Candidates = new int[resources];
+        public readonly int[] Keys = new int[resources];
+    }
+
+    internal ImageTableLayout? VariableImageLayout;
+
+    // Per buffer, whether its formatted accesses are all typed (see ResourceMaterializer.TypedOnlyFormatted).
+    internal bool[]? TypedOnlyFormattedBuffers;
     public uint UserDataBase => Graph.UserDataBase;
     public uint UserDataCount => Graph.UserDataCount;
     public MemoryAccessTable Memory => Graph.Memory;
