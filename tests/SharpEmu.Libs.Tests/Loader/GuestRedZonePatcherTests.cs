@@ -331,7 +331,7 @@ public sealed class GuestRedZonePatcherTests
     [InlineData(0, 63)]
     public unsafe void ExtractRewriteRunsRelocatedWithoutAFault(int length, int index)
     {
-        if (RuntimeInformation.ProcessArchitecture != Architecture.X64 || !Sse4aExtractRewrite.IsRequired) return;
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64 || !Sse4aRewrite.IsRequired) return;
         var loadDestination = OperatingSystem.IsWindows() ? (byte)0x91 : (byte)0x97;
         var loadControl = OperatingSystem.IsWindows() ? (byte)0xA9 : (byte)0xAF;
         byte[] function =
@@ -349,10 +349,10 @@ public sealed class GuestRedZonePatcherTests
         using var image = PatchedImage.Create(function,
             [(0x2000, unchecked((uint)low)), (0x2004, (uint)(low >> 32)), (0x2008, unchecked((uint)high)), (0x200C, (uint)(high >> 32)),
              (0x2010, control), (0x2028, 0xFFFF_FFFFu)]);
-        if (Sse4aExtractRewrite.IsRequired)
+        if (Sse4aRewrite.IsRequired)
         {
-            Assert.Equal(1, image.Result.ExtractRewrites);
-            Assert.Equal(1, image.Result.ExtractCandidates);
+            Assert.Equal(1, image.Result.Sse4aRewrites);
+            Assert.Equal(1, image.Result.Sse4aCandidates);
             Assert.Equal(0, image.Result.ShaInstructionCount);
             Assert.Equal(0xE9, image.ReadByte(16));
         }
@@ -365,11 +365,11 @@ public sealed class GuestRedZonePatcherTests
     [Fact]
     public void ExtractCountersIncludeEveryInstructionInAGroupedSpan()
     {
-        if (!Sse4aExtractRewrite.IsRequired) return;
+        if (!Sse4aRewrite.IsRequired) return;
         byte[] function = [0x66, 0x0F, 0x79, 0xD5, 0x66, 0x0F, 0x79, 0xD5, 0xC3];
         using var image = PatchedImage.Create(function, []);
-        Assert.Equal(2, image.Result.ExtractCandidates);
-        Assert.Equal(2, image.Result.ExtractRewrites);
+        Assert.Equal(2, image.Result.Sse4aCandidates);
+        Assert.Equal(2, image.Result.Sse4aRewrites);
         Assert.Equal(0, image.Result.ShaInstructionCount);
         Assert.Equal(1, image.Result.PatchedSites);
     }
