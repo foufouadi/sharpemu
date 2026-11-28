@@ -706,12 +706,14 @@ public static partial class Gen5SpirvTranslator
             return IsNotZero(BitwiseAnd(ShiftRightLogical(word, BitwiseAnd(lane, UInt(31))), UInt(1)));
         }
 
-        // Before main's first block of a module with outlined bodies: the invocations past the dispatch's thread count end
-        // here, so the active flag the block guards test is the same for every lane that runs; the program's other lane
-        // branches go through DivergentCondition. Paired lanes keep running, since their host lanes work together: a pair
-        // past the thread count runs while any pair of its wave does, its two lanes left out of EXEC as a partial wave's
-        // lanes are. A pair that skipped the blocks would leave the warp syncs inside them waiting for it, and the
-        // dispatch would never finish. Emulated wave64 lanes keep theirs.
+        // Before main's first block of a module with outlined bodies: the active flag the block guards test must be the same
+        // for every invocation of a host subgroup that runs them; the program's other lane branches go through
+        // DivergentCondition. An invocation that skipped the blocks would leave the warp syncs inside them waiting for it,
+        // and the dispatch would never finish. Where host lanes work together (lane pairs, the halves of an emulated wave64,
+        // which meet at exchanges and barriers), an invocation past the dispatch's thread count keeps running while any
+        // invocation of its subgroup does, its lanes left out of EXEC as a partial wave's lanes are; a subgroup without a
+        // running invocation skips the blocks, as the rendezvous of an emulated wave64 counts it. Elsewhere the invocations
+        // past the thread count end here. A module without subgroup operations has no warp syncs to wait.
         private void BeginOutlinedCallBodies()
         {
             if (_outlinedBodies.Count == 0 || _subgroupInvocationIdInput == 0)
@@ -720,16 +722,11 @@ public static partial class Gen5SpirvTranslator
             }
 
             _divergentConditions = true;
-            if (_pairedLanes)
+            if (_pairedLanes || _waveLowering is EmulatedWave64Lowering)
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 Store(_programActive, _module.AddInstruction(
                     SpirvOp.GroupNonUniformAny, _boolType, UInt(3), Load(_boolType, _programActive)));
-                return;
-            }
-
-            if (_waveLowering is EmulatedWave64Lowering)
-            {
                 return;
             }
 

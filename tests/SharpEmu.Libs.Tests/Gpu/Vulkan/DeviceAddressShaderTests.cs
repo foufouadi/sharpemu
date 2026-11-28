@@ -186,69 +186,125 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(LinkedCalls_CallerReadsItsOwnProgramAddressAfterACall));
     }
 
-    // A partial wave: the lanes past the dispatch's thread count do not run, and the others run a call body whose comparison
-    // is a wave operation over the running lanes.
-    [Fact]
-    public void LinkedCalls_PartialWaveRunsTheCallBody()
+    // A partial wave: the lanes past the dispatch's thread count do not run, and the others run a call body, with or without
+    // a wave operation over the running lanes. The lanes past the thread count end before main's first block, so none
+    // skips a block whose warp syncs would wait for it.
+    [Theory]
+    [InlineData(1u, true)]
+    [InlineData(13u, true)]
+    [InlineData(20u, true)]
+    [InlineData(31u, true)]
+    [InlineData(1u, false)]
+    [InlineData(13u, false)]
+    [InlineData(20u, false)]
+    [InlineData(31u, false)]
+    public void LinkedCalls_PartialWaveRunsTheCallBody(uint threads, bool waveOperation)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
-        var caller = Program(MoveScalar(0, 14, 0x2000), MoveScalar(4, 15, 0), MoveScalar(8, 16, 10), MoveScalar(12, 17, 0),
-            Sop1(16, "SSwappcB64", 14, Gen5Operand.Scalar(14)),
-            Vop2(20, "VLshlrevB32", 4, Operand(2), Gen5Operand.Vector(0)),
-            BufferAccess(24, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 1, offsetEnabled: true, vectorAddress: 4),
-            EndProgram(32));
-        var function = Program(Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
-            Vopc(4, "VCmpGtU32", Operand(8), 0),
-            Vop2(8, "VCndmaskB32", 1, Operand(99), Gen5Operand.Vector(1)),
-            Sop1(12, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
-        var linked = Gen5ShaderCallLinker.Link(caller,
-            [new(16, 14, 16, 14, caller.Address + 20, [new(0x2000, 10, function), new(0x2000, 11, function)])]);
-        var run = new Run(vulkan, linked, threadCount: 20, localSize: 32);
+        var run = new Run(vulkan, PartialWaveCall(waveOperation ? WaveCountCallBody() : LaneLocalCallBody()),
+            threadCount: threads, localSize: 32);
+        Assert.True(HasOutlinedBody(run.Spirv));
+        Assert.True(ReturnsBeforeOutlinedCall(run.Spirv));
         run.Dispatch(GuestBase);
         for (uint lane = 0; lane < 32; lane++)
         {
-            Assert.Equal(lane >= 20 ? 0u : lane < 8 ? 10u : 99u, run.ResultWord(lane * 4));
+            Assert.Equal(lane >= threads ? 0u : lane < 8 ? 10u : waveOperation ? 8u : 99u, run.ResultWord(lane * 4));
         }
 
         Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
         run.Finish(output, nameof(LinkedCalls_PartialWaveRunsTheCallBody));
     }
 
-    // A partial wave64 whose lane pairs share a host lane: the pairs past the thread count keep running beside the others,
-    // their lanes out of EXEC, so a call body's branches stay uniform across the host subgroup. Pairs that skipped the
-    // call body's blocks left the driver's warp syncs inside them waiting, and the dispatch never finished.
-    [Fact]
-    public void LinkedCalls_PartialPairedWave64RunsTheCallBody()
+    // A partial wave64 whose host lanes work together, two guest lanes to a host lane or the two halves of a wave meeting
+    // in workgroup memory: the invocations past the thread count keep running beside the others while any invocation of
+    // their host subgroup runs, their lanes out of EXEC, so a call body's branches stay uniform across the subgroup.
+    // Invocations that skipped the call body's blocks left the driver's warp syncs inside them waiting, and the dispatch
+    // never finished; the module is checked for the uniform flag before it is dispatched.
+    [Theory]
+    [InlineData(1u, true)]
+    [InlineData(13u, true)]
+    [InlineData(31u, true)]
+    [InlineData(33u, true)]
+    [InlineData(45u, true)]
+    [InlineData(1u, false)]
+    [InlineData(13u, false)]
+    [InlineData(31u, false)]
+    [InlineData(33u, false)]
+    [InlineData(45u, false)]
+    public void LinkedCalls_PartialWave64RunsTheCallBody(uint threads, bool pairedLanes)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var run = new Run(vulkan, PartialWaveCall(WaveCountCallBody()), threadCount: threads, localSize: 64, waveSize: 64,
+            hostSubgroup32: pairedLanes);
+        // Paired lanes run a wave64 in 32 invocations, an emulated wave64 in 64.
+        Assert.Equal(pairedLanes ? 32u : 64u, LocalSizeX(run.Spirv));
+        Assert.True(HasOutlinedBody(run.Spirv));
+        Assert.True(HasInstruction(run.Spirv, SpirvOp.GroupNonUniformAny));
+        run.Dispatch(GuestBase);
+        for (uint lane = 0; lane < 64; lane++)
+        {
+            Assert.Equal(lane >= threads ? 0u : lane < 8 ? 10u : 8u, run.ResultWord(lane * 4));
+        }
+
+        Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
+        run.Finish(output, nameof(LinkedCalls_PartialWave64RunsTheCallBody));
+    }
+
+    // A partial wave64 of lane-local halves, each guest lane an invocation of its own: as in a wave32, the invocations past
+    // the thread count end before main's first block.
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(13u)]
+    [InlineData(31u)]
+    [InlineData(33u)]
+    [InlineData(45u)]
+    public void LinkedCalls_PartialLaneLocalWave64RunsTheCallBody(uint threads)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var run = new Run(vulkan, PartialWaveCall(LaneLocalCallBody()), threadCount: threads, localSize: 64, waveSize: 64);
+        Assert.Equal(64u, LocalSizeX(run.Spirv));
+        Assert.True(HasOutlinedBody(run.Spirv));
+        Assert.True(ReturnsBeforeOutlinedCall(run.Spirv));
+        run.Dispatch(GuestBase);
+        for (uint lane = 0; lane < 64; lane++)
+        {
+            Assert.Equal(lane >= threads ? 0u : lane < 8 ? 10u : 99u, run.ResultWord(lane * 4));
+        }
+
+        Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
+        run.Finish(output, nameof(LinkedCalls_PartialLaneLocalWave64RunsTheCallBody));
+    }
+
+    // A caller that calls 0x2000 with argument 10 and stores v1 at its lane's slot; two records share the function, so its
+    // body is outlined.
+    private static Gen5ShaderProgram PartialWaveCall(Gen5ShaderProgram function)
+    {
         var caller = Program(MoveScalar(0, 14, 0x2000), MoveScalar(4, 15, 0), MoveScalar(8, 16, 10), MoveScalar(12, 17, 0),
             Sop1(16, "SSwappcB64", 14, Gen5Operand.Scalar(14)),
             Vop2(20, "VLshlrevB32", 4, Operand(2), Gen5Operand.Vector(0)),
             BufferAccess(24, "BufferStoreDword", ResultRegister, 0, 1, vectorData: 1, offsetEnabled: true, vectorAddress: 4),
             EndProgram(32));
-        // The lanes below 8 keep the argument; the others take the number of lanes below 8, a count over the whole wave.
-        var function = Program(Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
+        return Gen5ShaderCallLinker.Link(caller,
+            [new(16, 14, 16, 14, caller.Address + 20, [new(0x2000, 10, function), new(0x2000, 11, function)])]);
+    }
+
+    // The lanes below 8 keep the argument; the others take the number of lanes below 8, a count over the whole wave.
+    private static Gen5ShaderProgram WaveCountCallBody() =>
+        Program(Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
             Vopc(4, "VCmpGtU32", Operand(8), 0),
             Sop1(8, "SBcnt1I32B64", 20, Gen5Operand.Scalar(106)),
             Vop2(12, "VCndmaskB32", 1, Gen5Operand.Scalar(20), Gen5Operand.Vector(1)),
             Sop1(16, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
-        var linked = Gen5ShaderCallLinker.Link(caller,
-            [new(16, 14, 16, 14, caller.Address + 20, [new(0x2000, 10, function), new(0x2000, 11, function)])]);
-        var run = new Run(vulkan, linked, threadCount: 13, localSize: 64, pairedWave64: true);
-        // The call body is outlined into a function, the case whose active flag is made uniform.
-        Assert.True(HasInstruction(run.Spirv, SpirvOp.FunctionCall));
-        Assert.True(HasInstruction(run.Spirv, SpirvOp.GroupNonUniformAny));
-        run.Dispatch(GuestBase);
-        for (uint lane = 0; lane < 64; lane++)
-        {
-            Assert.Equal(lane >= 13 ? 0u : lane < 8 ? 10u : 8u, run.ResultWord(lane * 4));
-        }
 
-        Assert.All(run.FaultWords(), word => Assert.Equal(0u, word));
-        run.Finish(output, nameof(LinkedCalls_PartialPairedWave64RunsTheCallBody));
-    }
+    // The lanes below 8 keep the argument, the others take 99.
+    private static Gen5ShaderProgram LaneLocalCallBody() =>
+        Program(Vop1(0, "VMovB32", 1, Gen5Operand.Scalar(16)),
+            Vopc(4, "VCmpGtU32", Operand(8), 0),
+            Vop2(8, "VCndmaskB32", 1, Operand(99), Gen5Operand.Vector(1)),
+            Sop1(12, "SSetpcB64", 0, Gen5Operand.Scalar(14)));
 
     // A site finds its caller's record among several callees' records once and runs that callee; a target and argument
     // that no record holds still faults.
@@ -317,15 +373,50 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(LinkedCalls_MovedTableKeepsTheModule));
     }
 
-    private static bool HasInstruction(uint[] spirv, SpirvOp opcode)
+    private static IEnumerable<uint[]> Instructions(uint[] spirv)
     {
         for (var index = 5; index < spirv.Length && spirv[index] >> 16 != 0; index += (int)(spirv[index] >> 16))
         {
-            if ((spirv[index] & 0xFFFF) == (uint)opcode) return true;
+            yield return spirv[index..(index + (int)(spirv[index] >> 16))];
+        }
+    }
+
+    private static bool HasInstruction(uint[] spirv, SpirvOp opcode) =>
+        Instructions(spirv).Any(instruction => (instruction[0] & 0xFFFF) == (uint)opcode);
+
+    // A call body's DontInline function: the only one that returns nothing.
+    private static bool HasOutlinedBody(uint[] spirv)
+    {
+        var voidType = Instructions(spirv).Single(instruction => (instruction[0] & 0xFFFF) == (uint)SpirvOp.TypeVoid)[1];
+        return Instructions(spirv).Any(instruction => (instruction[0] & 0xFFFF) == (uint)SpirvOp.Function &&
+            instruction[1] == voidType && (instruction[3] & 2) != 0);
+    }
+
+    // Whether main returns before it first calls a call body's function: the lanes past the thread count end there.
+    private static bool ReturnsBeforeOutlinedCall(uint[] spirv)
+    {
+        var voidType = Instructions(spirv).Single(instruction => (instruction[0] & 0xFFFF) == (uint)SpirvOp.TypeVoid)[1];
+        var bodies = Instructions(spirv)
+            .Where(instruction => (instruction[0] & 0xFFFF) == (uint)SpirvOp.Function && instruction[1] == voidType &&
+                (instruction[3] & 2) != 0)
+            .Select(instruction => instruction[2])
+            .ToHashSet();
+        var functions = 0;
+        foreach (var instruction in Instructions(spirv))
+        {
+            var opcode = (SpirvOp)(instruction[0] & 0xFFFF);
+            if (opcode == SpirvOp.Function && ++functions > 1) break;
+            if (functions == 0) continue;
+            if (opcode == SpirvOp.Return) return true;
+            if (opcode == SpirvOp.FunctionCall && bodies.Contains(instruction[3])) return false;
         }
 
         return false;
     }
+
+    private static uint LocalSizeX(uint[] spirv) =>
+        Instructions(spirv).Single(instruction =>
+            (instruction[0] & 0xFFFF) == (uint)SpirvOp.ExecutionMode && instruction[2] == 17)[3];
 
     private static byte[] Translate(Gen5ShaderProgram program)
     {
@@ -1099,14 +1190,14 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         private GpuBuffer? _pageTable;
 
         public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries,
-            uint localSize = 0, bool pairedWave64 = false)
+            uint localSize = 0, uint waveSize = 32, bool hostSubgroup32 = true)
         {
             var (plan, resources, layout) = Prepare(program);
             Plan = plan;
             Request = new ShaderCompileRequest(plan, resources, layout)
             {
                 LocalSizeX = localSize == 0 ? threadCount : localSize, ThreadCountX = threadCount, ScratchDwords = 32,
-                WaveSize = pairedWave64 ? 64u : 32u, HostComputeSubgroup32 = pairedWave64,
+                WaveSize = waveSize, HostComputeSubgroup32 = waveSize == 64 && hostSubgroup32,
             };
             Assert.True(resources.Info.UsesDeviceAddresses);
             Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request, out var shader, out var error), error);
