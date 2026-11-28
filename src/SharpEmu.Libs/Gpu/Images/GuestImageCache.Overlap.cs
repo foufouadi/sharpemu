@@ -493,7 +493,11 @@ public sealed partial class GuestImageCache
             // another resource over its range replaces it; a request for resident levels over
             // another image is a separate texture (the lookup took the whole chain when that image
             // holds GPU contents).
-            if (cachedInfo.FirstLevel != 0 && !cached.IsGpuModified)
+            // A texture over the same streamed area as another texture is a second read-only copy of the same guest
+            // bytes, so both stay coherent side by side: replacing one at each lookup of the other recreated and
+            // reuploaded streamed textures tens of thousands of times a frame. A target or storage image writes the
+            // range, so the copy goes.
+            if (cachedInfo.FirstLevel != 0 && !cached.IsGpuModified && role != ImageRole.Texture)
             {
                 cached.Binding.NeedsRebind |= cached.Binding.IsBound || cached.Binding.IsTarget;
                 ReleaseImage(cachedImageIdentifier);
